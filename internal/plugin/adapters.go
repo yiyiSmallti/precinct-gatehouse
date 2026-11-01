@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -23,8 +24,9 @@ func Unavailable(name string) func(context.Context, []byte) (*http.Response, err
 }
 
 // ProviderChat adapts a provider plugin to provider.Provider's Chat: the
-// streamed messages become an *http.Response body.
-func ProviderChat(s *Started) func(context.Context, []byte) (*http.Response, error) {
+// streamed messages become an *http.Response body. timeout bounds the whole
+// call, like providers[].timeout does for HTTP providers.
+func ProviderChat(s *Started, timeout time.Duration) func(context.Context, []byte) (*http.Response, error) {
 	pc := s.Impl.(*sdk.ProviderClient)
 	return func(ctx context.Context, body []byte) (*http.Response, error) {
 		if s.Exited() {
@@ -35,7 +37,7 @@ func ProviderChat(s *Started) func(context.Context, []byte) (*http.Response, err
 		}
 		_ = json.Unmarshal(body, &head)
 		parent := ctx
-		ctx, cancel := context.WithCancel(ctx)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		stream, err := pc.Chat(ctx, &sdk.ChatRequest{Model: head.Model, Body: body})
 		if err != nil {
 			cancel()
@@ -72,7 +74,9 @@ func ProviderChat(s *Started) func(context.Context, []byte) (*http.Response, err
 					return
 				}
 				if err != nil {
-					pw.CloseWithError(err)
+					// only the status code: plugin error text may echo the request
+					st, _ := status.FromError(err)
+					pw.CloseWithError(fmt.Errorf("provider plugin: %s", st.Code()))
 					return
 				}
 				if _, err := pw.Write(m.GetData()); err != nil {
@@ -90,6 +94,9 @@ func ProviderChat(s *Started) func(context.Context, []byte) (*http.Response, err
 
 func grpcUpstream(ctx context.Context, err error) error {
 	st, _ := status.FromError(err)
+	if st.Code() == codes.DeadlineExceeded && ctx.Err() == nil {
+		return &provider.UpstreamError{Err: fmt.Errorf("provider plugin: timeout"), Retryable: true}
+	}
 	if ctx.Err() != nil {
 		return &provider.UpstreamError{Err: fmt.Errorf("provider plugin: %s", st.Code())}
 	}

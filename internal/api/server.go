@@ -86,7 +86,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		fn := plugin.Unavailable(pc.Plugin)
 		for _, pp := range provPlugins {
 			if pp.Name == pc.Plugin {
-				fn = plugin.ProviderChat(pp)
+				fn = plugin.ProviderChat(pp, pc.Timeout.D(300*time.Second))
 			}
 		}
 		reg.SetPlugin(pc.Name, fn)

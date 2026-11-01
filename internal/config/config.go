@@ -434,8 +434,8 @@ func (c *Config) Validate() []string {
 		plugins[pl.Name] = true
 	}
 	for _, d := range c.Redaction.Detectors {
-		if !plugins[d] {
-			add("redaction.detectors: %q is not declared under plugins", d)
+		if !c.hasPlugin(d, "detector") {
+			add("redaction.detectors: %q is not declared under plugins with kind detector", d)
 		}
 	}
 	if c.Meter.OTLP != nil && c.Meter.OTLP.Endpoint == "" {

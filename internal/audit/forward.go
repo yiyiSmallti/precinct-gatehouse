@@ -29,7 +29,8 @@ type fwdSink struct {
 	w       BatchWriter
 	mu      sync.Mutex
 	queue   [][]byte
-	dropped int
+	dropped int    // overflow drops not yet logged
+	shifted uint64 // total records removed from the front by overflow
 	wake    chan struct{}
 	done    chan struct{}
 	stopped chan struct{}
@@ -68,6 +69,7 @@ func (f *Forwarder) Write(r Record) error {
 		if len(s.queue) >= QueueLimit {
 			s.queue = s.queue[1:]
 			s.dropped++
+			s.shifted++
 		}
 		s.queue = append(s.queue, b)
 		s.mu.Unlock()
@@ -132,6 +134,7 @@ func (s *fwdSink) flushOnce(log *slog.Logger) bool {
 		batch := append([][]byte(nil), s.queue[:n]...)
 		dropped := s.dropped
 		s.dropped = 0
+		shiftedAt := s.shifted
 		s.mu.Unlock()
 		if dropped > 0 {
 			log.Warn("audit sink queue full; oldest records dropped (still in the local audit file)", "sink", s.name, "dropped", dropped)
@@ -147,12 +150,10 @@ func (s *fwdSink) flushOnce(log *slog.Logger) bool {
 			return false
 		}
 		s.mu.Lock()
-		// drop exactly what was sent (the queue may have shifted if it overflowed)
-		if len(s.queue) >= n {
-			s.queue = s.queue[n:]
-		} else {
-			s.queue = s.queue[:0]
-		}
+		// remove what was sent; records of the batch that overflow already
+		// removed from the front while the write was in flight are not removed twice
+		sent := n - int(min(s.shifted-shiftedAt, uint64(n)))
+		s.queue = s.queue[min(sent, len(s.queue)):]
 		s.mu.Unlock()
 	}
 }

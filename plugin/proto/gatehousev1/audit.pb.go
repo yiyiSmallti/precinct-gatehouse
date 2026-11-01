@@ -77,8 +77,12 @@ func (x *AuditWriteRequest) GetRecordsJson() [][]byte {
 }
 
 type AuditWriteResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Accepted      int32                  `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Records newly stored. Duplicates of records already stored (a retry) are
+	// not counted, so accepted < len(records) is not a failure: a sink that
+	// could not store records must return an error, and Gatehouse then retries
+	// the whole batch.
+	Accepted      int32 `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
