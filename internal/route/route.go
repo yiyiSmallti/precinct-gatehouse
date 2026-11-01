@@ -232,6 +232,9 @@ func ruleName(rule *config.Rule, i int) string {
 }
 
 // expand turns a model ref or group name into model refs.
+// Members lists every provider/model a group (or nested group) can reach.
+func (r *Router) Members(group string) []string { return r.expand(group) }
+
 func (r *Router) expand(ref string) []string {
 	g, ok := r.cfg.RoutingGroups[ref]
 	if !ok {

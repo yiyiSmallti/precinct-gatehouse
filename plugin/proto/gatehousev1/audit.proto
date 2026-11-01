@@ -1,0 +1,27 @@
+// Gatehouse plugin interface v1: AuditSink extension point.
+//
+// Gatehouse sends every audit record to each AuditSink plugin in addition to
+// its local file sink. Records are JSON objects in Gatehouse's audit record
+// format (docs/SPEC.md 3.6): they carry the decision path and redaction
+// category counts only, never prompt or response text. Write is called in
+// batches from a background queue; a failing sink is retried and never
+// blocks a request.
+syntax = "proto3";
+
+package gatehouse.plugin.v1;
+
+option go_package = "github.com/yiyiSmallti/precinct-gatehouse/plugin/proto/gatehousev1";
+
+service AuditSink {
+  rpc Write(AuditWriteRequest) returns (AuditWriteResponse);
+}
+
+message AuditWriteRequest {
+  // Each entry is one JSON-encoded record; request_id is unique per record,
+  // so sinks can deduplicate retries.
+  repeated bytes records_json = 1;
+}
+
+message AuditWriteResponse {
+  int32 accepted = 1;
+}

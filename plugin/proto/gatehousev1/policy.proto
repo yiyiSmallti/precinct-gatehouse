@@ -1,0 +1,62 @@
+// Gatehouse plugin interface v1: AuthPolicy extension point.
+//
+// In org mode every request is authorised by the AuthPolicy plugin: the
+// gateway token is opaque to Gatehouse and is resolved into a tenant context.
+// The fields mirror Cloister's GatewayContext (contracts/v1/
+// gateway-context.schema.json) so gatehouse-cloister maps them 1:1.
+//
+// Errors use gRPC status codes: UNAUTHENTICATED -> 401, PERMISSION_DENIED ->
+// 403; any other error, a timeout or a dead plugin process -> 503 (org mode
+// fails closed).
+syntax = "proto3";
+
+package gatehouse.plugin.v1;
+
+option go_package = "github.com/yiyiSmallti/precinct-gatehouse/plugin/proto/gatehousev1";
+
+service AuthPolicy {
+  rpc Resolve(ResolveRequest) returns (GatewayContext);
+}
+
+message RequestMeta {
+  string model = 1;        // model as requested by the client ("auto", a group or provider/model)
+  string route_group = 2;  // resolved routing group, empty for a direct model
+  string client_ip = 3;
+  string request_id = 4;
+  string source = 5;       // X-Gatehouse-Source
+}
+
+message ResolveRequest {
+  string token = 1;  // bearer token presented to Gatehouse
+  RequestMeta request_meta = 2;
+}
+
+message ByoApi {
+  bool enabled = 1;
+  string max_class = 2;
+}
+
+message Budget {
+  // has_* distinguish "0 remaining" from "not limited".
+  bool has_tokens_remaining = 1;
+  int64 tokens_remaining = 2;
+  string period = 3;  // day | month
+  bool has_department_tokens_remaining = 4;
+  int64 department_tokens_remaining = 5;
+}
+
+message GatewayContext {
+  string tenant = 1;
+  string user = 2;
+  string department = 3;
+  string on_behalf_of = 4;
+  string instance_id = 5;
+  string workspace_id = 6;
+  string data_class = 7;               // public | internal | confidential (floor for the request)
+  repeated string allowed_groups = 8;  // routing groups the user may call
+  repeated string models = 9;          // direct provider/model allowlist; empty = models of allowed_groups only
+  ByoApi byo_api = 10;
+  Budget budget = 11;
+  int64 policy_version = 12;
+  int64 expires_at_unix = 13;          // Gatehouse caches the context until then (capped by policy_cache)
+}

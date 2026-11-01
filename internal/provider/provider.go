@@ -35,6 +35,14 @@ type Provider struct {
 	Pricing map[string]config.Pricing
 	key     string
 	client  *http.Client
+	plug    func(ctx context.Context, body []byte) (*http.Response, error)
+}
+
+// SetPlugin routes a provider's calls to a provider plugin.
+func (r *Registry) SetPlugin(name string, fn func(ctx context.Context, body []byte) (*http.Response, error)) {
+	if p := r.byName[name]; p != nil {
+		p.plug = fn
+	}
 }
 
 // NewRegistry resolves keys and builds HTTP clients.
@@ -118,6 +126,9 @@ func (e *UpstreamError) Error() string {
 // Chat posts body to <base_url>/chat/completions. On success the caller owns
 // resp.Body. Any non-2xx is returned as *UpstreamError with the body read.
 func (p *Provider) Chat(ctx context.Context, body []byte) (*http.Response, error) {
+	if p.plug != nil {
+		return p.plug(ctx, body)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, &UpstreamError{Err: err}

@@ -4,9 +4,9 @@
 // hashicorp/go-plugin handshake: the magic cookie below must be present in
 // the plugin's environment and the protocol version must match.
 //
-// This release implements the Detector extension point. AuthPolicy,
-// AuditSink, Provider and Hooks join the same protocol version with the org
-// mode.
+// Five extension points share protocol version 1: Detector, AuthPolicy,
+// AuditSink, Provider and Hooks. A plugin serves one (or several) of them
+// with Serve; ServeDetector remains for detector-only plugins.
 package plugin
 
 import (

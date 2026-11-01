@@ -46,6 +46,23 @@ go build -o gatehouse ./cmd/gatehouse   # Go 1.26+，无 cgo，单二进制
 
 端到端验收：`go test -v ./e2e/`，报告写到 [`e2e/report/`](e2e/report/)。
 
+## org 模式
+
+`mode: org` 时令牌交给一个 `auth_policy` 插件解析（租户、用户、部门、数据分级、允许的路由组、预算），插件不可用就对所有请求返回 503。最小配置：
+
+```yaml
+mode: org
+plugins:
+  - name: cloister
+    kind: auth_policy
+    path: /opt/gatehouse/plugins/gatehouse-cloister
+  - name: cloister-audit          # 可选：审计记录同时送往组织平台
+    kind: audit_sink
+    path: /opt/gatehouse/plugins/gatehouse-cloister
+```
+
+插件用同仓库 `plugin` 包写：`plugin.Serve(plugin.Set{AuthPolicy: impl})`。五类扩展点与宿主行为见 [SPEC 3.6](docs/SPEC.md)。
+
 ## 状态
 
-首期个人模式已实现：G1 路由、G2 脱敏、G3 fail-closed、G4 令牌、G6 计量。org 模式与其余四类插件扩展点（G5）在下一步。参考实现：magpie（路由组、意图路由、脱敏）。许可：MIT。
+首期已实现：G1 路由、G2 脱敏、G3 fail-closed、G4 令牌、G5 org 模式与五类插件扩展点、G6 计量。参考实现：magpie（路由组、意图路由、脱敏）。许可：MIT。
