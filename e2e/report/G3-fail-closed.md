@@ -1,6 +1,6 @@
 # G3 fail-closed
 
-结果：**通过** · 运行于 2026-11-01 16:50:55 UTC · linux/amd64
+结果：**通过** · 运行于 2026-11-01 16:56:38 UTC · linux/amd64
 
 检测器插件 `ner`（e2e/fakedetector，go-plugin gRPC 子进程，识别人名 PERSON）被声明为必需（`redaction.detectors: [ner]`）。分三种情况：插件正常、配置里禁用、运行中进程被杀。
 

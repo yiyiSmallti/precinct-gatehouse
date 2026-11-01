@@ -135,6 +135,9 @@ func (e *Engine) action(kind, mode string) string {
 	return a
 }
 
+// actionRank orders actions for overlapping findings.
+var actionRank = map[string]int{"audit": 1, "warn": 2, "mask": 3, "block": 4}
+
 // Error is a redaction-stage failure with an HTTP status.
 type Error struct {
 	Status int
@@ -144,7 +147,8 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Msg }
 
-// DetectText runs every detector on one string.
+// DetectText runs every detector on one string. The findings are sorted by
+// start (longer first) and may overlap.
 func (e *Engine) DetectText(ctx context.Context, text string) ([]Finding, error) {
 	if text == "" {
 		return nil, nil
@@ -182,7 +186,8 @@ func (e *Engine) DetectText(ctx context.Context, text string) ([]Finding, error)
 		}
 		all = append(all, fs...)
 	}
-	// resolve overlaps: earlier start wins, then longer span, then source order
+	// Findings may overlap; Apply decides per overlapping cluster so that a
+	// blocking finding is never dropped and masking covers the union.
 	sort.SliceStable(all, func(i, j int) bool {
 		if all[i].Start != all[j].Start {
 			return all[i].Start < all[j].Start
@@ -190,9 +195,8 @@ func (e *Engine) DetectText(ctx context.Context, text string) ([]Finding, error)
 		return all[i].End-all[i].Start > all[j].End-all[j].Start
 	})
 	var out []Finding
-	end := -1
 	for _, f := range all {
-		if f.Start < 0 || f.End > len(text) || f.Start >= f.End || f.Start < end {
+		if f.Start < 0 || f.End > len(text) || f.Start >= f.End {
 			continue
 		}
 		v := text[f.Start:f.End]
@@ -200,7 +204,6 @@ func (e *Engine) DetectText(ctx context.Context, text string) ([]Finding, error)
 			continue
 		}
 		out = append(out, f)
-		end = f.End
 	}
 	return out, nil
 }
@@ -245,28 +248,65 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 		}
 		var b strings.Builder
 		last := 0
-		for _, f := range fs {
-			v := text[f.Start:f.End]
-			act := e.action(f.Kind, mode)
-			if act == "keep" {
+		// cluster overlapping findings; the cluster takes its strongest action
+		// and a mask covers the whole cluster span
+		for i := 0; i < len(fs); {
+			type hit struct {
+				f   Finding
+				act string
+			}
+			var hits []hit
+			start, end := fs[i].Start, fs[i].End
+			for ; i < len(fs) && fs[i].Start < end; i++ {
+				if fs[i].End > end {
+					end = fs[i].End
+				}
+				if act := e.action(fs[i].Kind, mode); act != "keep" {
+					hits = append(hits, hit{fs[i], act})
+				}
+			}
+			if len(hits) == 0 {
 				continue
 			}
-			res.Report.Counts[strings.ToLower(f.Kind)]++
-			if len(res.Report.Samples) < 50 {
-				res.Report.Samples = append(res.Report.Samples, audit.Sample{Kind: f.Kind, Length: utf8.RuneCountInString(v), Action: act})
+			act, kind := hits[0].act, hits[0].f.Kind
+			for _, h := range hits[1:] {
+				if actionRank[h.act] > actionRank[act] {
+					act, kind = h.act, h.f.Kind
+				}
+			}
+			for _, h := range hits {
+				v := text[h.f.Start:h.f.End]
+				res.Report.Counts[strings.ToLower(h.f.Kind)]++
+				if len(res.Report.Samples) < 50 {
+					res.Report.Samples = append(res.Report.Samples, audit.Sample{Kind: h.f.Kind, Length: utf8.RuneCountInString(v), Action: act})
+				}
+				if h.act == "block" {
+					blocked = append(blocked, fmt.Sprintf("%s(%d)", strings.ToLower(h.f.Kind), utf8.RuneCountInString(v)))
+				}
 			}
 			switch act {
-			case "block":
-				blocked = append(blocked, fmt.Sprintf("%s(%d)", strings.ToLower(f.Kind), utf8.RuneCountInString(v)))
 			case "warn":
 				res.Report.Warned++
 			case "mask":
-				ph := Placeholder(userKey, f.Kind, v)
+				if len(hits) > 1 {
+					// mask the union of the masked spans
+					start, end = len(text), 0
+					for _, h := range hits {
+						if h.act != "mask" {
+							continue
+						}
+						start, end = min(start, h.f.Start), max(end, h.f.End)
+					}
+				} else {
+					start, end = hits[0].f.Start, hits[0].f.End
+				}
+				v := text[start:end]
+				ph := Placeholder(userKey, kind, v)
 				bucket.Put(ph, v)
 				masked[v] = ph
-				b.WriteString(text[last:f.Start])
+				b.WriteString(text[last:start])
 				b.WriteString(ph)
-				last = f.End
+				last = end
 				res.Report.Masked++
 			}
 		}
