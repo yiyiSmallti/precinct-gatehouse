@@ -258,6 +258,12 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 		}
 		resp.Body.Close()
 		if err != nil {
+			status := http.StatusBadGateway
+			var oe *oai.Error
+			if errors.As(err, &oe) {
+				status = oe.Status
+			}
+			p.meterRecord(st, ref, prov.Target, usage, prov.Cost(model, usage.PromptTokens, usage.CompletionTokens), status, time.Since(callStart))
 			return err
 		}
 		st.rec.Status = http.StatusOK
