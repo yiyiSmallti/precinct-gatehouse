@@ -253,6 +253,10 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 				lastErr = ue
 				continue
 			}
+			if ue.Status/100 == 3 {
+				// redirects are never followed (they could leave the provider's trust boundary)
+				return oai.Errorf(http.StatusBadGateway, "upstream_redirect", "%s: provider answered with a redirect (%d); redirects are not followed", ref, ue.Status)
+			}
 			if ue.Status == 0 {
 				// no upstream response (e.g. the client went away)
 				return oai.Errorf(http.StatusBadGateway, "upstream_unavailable", "%s: %s", ref, ue.Error())
@@ -432,6 +436,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 	st.written = true
 	fl, _ := st.w.(http.Flusher)
 	var usage oai.Usage
+	done := false // saw [DONE] or a finish_reason
 	br := bufio.NewReaderSize(resp.Body, 64<<10)
 	var event bytes.Buffer
 	for {
@@ -439,7 +444,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		if len(line) > 0 {
 			event.Write(line)
 			if len(bytes.TrimSpace(line)) == 0 {
-				p.flushEvent(st.w, event.Bytes(), clientUsage, &usage)
+				p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done)
 				event.Reset()
 				if fl != nil {
 					fl.Flush()
@@ -448,13 +453,16 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		}
 		if err != nil {
 			if event.Len() > 0 {
-				p.flushEvent(st.w, event.Bytes(), clientUsage, &usage)
+				p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done)
 			}
 			if fl != nil {
 				fl.Flush()
 			}
 			if errors.Is(err, io.EOF) {
-				return usage, nil
+				if done {
+					return usage, nil
+				}
+				err = errors.New("stream ended before completion")
 			}
 			// the client already has a partial stream; report the failure so it is metered and audited
 			return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "%v", err)
@@ -462,19 +470,30 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 	}
 }
 
-func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage) {
+func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool) {
 	for _, l := range bytes.Split(ev, []byte("\n")) {
 		data, ok := bytes.CutPrefix(bytes.TrimSpace(l), []byte("data:"))
 		if !ok {
 			continue
 		}
 		data = bytes.TrimSpace(data)
+		if string(data) == "[DONE]" {
+			*done = true
+			continue
+		}
 		if len(data) == 0 || data[0] != '{' {
 			continue
 		}
 		o, err := oai.Decode(data)
 		if err != nil {
 			continue
+		}
+		if ch, _ := o["choices"].([]any); len(ch) > 0 {
+			for _, c := range ch {
+				if cm, _ := c.(map[string]any); cm != nil && cm["finish_reason"] != nil {
+					*done = true
+				}
+			}
 		}
 		if u, ok := oai.UsageOf(o); ok {
 			*usage = u

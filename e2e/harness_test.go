@@ -67,6 +67,9 @@ type FakeProvider struct {
 	down     bool
 	// Classify answers classifier prompts (system prompt mentions 路由分类器).
 	Classify func(userText string) string
+	// RedirectTo, when set, answers requests whose last user message
+	// contains "#redirect" with a 307 to this URL.
+	RedirectTo string
 }
 
 func startFake(t *testing.T, name string) *FakeProvider {
@@ -157,6 +160,10 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	model, _ := req["model"].(string)
 	user := lastUser(req)
+	if f.RedirectTo != "" && strings.Contains(user, "#redirect") {
+		http.Redirect(w, r, f.RedirectTo+"/chat/completions", http.StatusTemporaryRedirect)
+		return
+	}
 	content := fmt.Sprintf("[%s/%s] %s", f.Name, model, user)
 	if isClassifier(req) {
 		content = "0"
@@ -174,6 +181,13 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 	usage := map[string]any{"prompt_tokens": len(body) / 10, "completion_tokens": len(content) / 4, "total_tokens": len(body)/10 + len(content)/4}
 	if stream, _ := req["stream"].(bool); stream {
 		w.Header().Set("Content-Type", "text/event-stream")
+		if strings.Contains(user, "#truncate") {
+			// one partial chunk, then a clean close with no finish or [DONE]
+			b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
+				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": "partial"}}}})
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			return
+		}
 		for _, part := range []string{content[:len(content)/2], content[len(content)/2:]} {
 			b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
 				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": part}}}})

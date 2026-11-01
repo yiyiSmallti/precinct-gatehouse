@@ -1,6 +1,6 @@
 # 脱敏规则包样本集
 
-结果：**通过** · 运行于 2026-11-01 16:56:38 UTC · linux/amd64
+结果：**通过** · 运行于 2026-11-01 17:06:15 UTC · linux/amd64
 
 `fixtures/redaction/samples.tsv` 每行：期望类别（逗号分隔，`-` 表示不应检出）、文本。经 `gatehouse redact try --json` 检测，比较检出类别与期望。
 

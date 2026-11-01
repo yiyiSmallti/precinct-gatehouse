@@ -139,6 +139,23 @@ func TestG1Routing(t *testing.T) {
 	rep.Check("外部目标整条缓冲、对客户端仍是 SSE", r.Status == 200 && upstreamStream == nil && strings.Contains(string(r.Raw), "data: [DONE]"),
 		"上游请求 stream=%v，客户端收到 SSE", upstreamStream)
 
+	// 9. a provider redirect is never followed (it could leave the trust boundary)
+	outside := startFake(t, "outside")
+	local.RedirectTo = outside.URL
+	r = g.Chat(t, g.Token, map[string]any{"model": "local/small", "messages": msgs("user", "机密内容 #redirect")}, nil)
+	rep.Check("上游重定向不跟随", r.Status == 502 && len(outside.Requests()) == 0,
+		"status=%d，重定向目标收到请求 %d 次", r.Status, len(outside.Requests()))
+
+	// 10. a stream that closes cleanly before finishing is recorded as a failure
+	r = g.Chat(t, g.Token, map[string]any{"model": "local/small", "stream": true, "messages": msgs("user", "中途断流 #truncate")}, nil)
+	recs0, _ := g.AuditRecords(t)
+	lastStatus := 0.0
+	if len(recs0) > 0 {
+		lastStatus, _ = recs0[len(recs0)-1]["status"].(float64)
+	}
+	rep.Check("流未完成即结束 → 记为失败", r.Status == 200 && lastStatus == 502,
+		"客户端 status=%d（头已发出），审计记录 status=%v", r.Status, lastStatus)
+
 	// decision log
 	recs, _ := g.AuditRecords(t)
 	var b strings.Builder

@@ -47,7 +47,12 @@ func NewRegistry(cfg *config.Config) (*Registry, error) {
 		}
 		r.byName[pc.Name] = &Provider{
 			Name: pc.Name, BaseURL: pc.BaseURL, Target: pc.Target, Models: pc.Models, Pricing: pc.Pricing, key: key,
-			client: &http.Client{Timeout: pc.Timeout.D(300 * time.Second)},
+			client: &http.Client{
+				Timeout: pc.Timeout.D(300 * time.Second),
+				// never follow redirects: a redirect could replay the request
+				// body to a host outside the provider's trust boundary
+				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			},
 		}
 	}
 	return r, nil

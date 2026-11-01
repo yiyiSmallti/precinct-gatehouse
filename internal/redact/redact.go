@@ -234,7 +234,9 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 	masked := map[string]string{} // value -> placeholder, for thinking text
 	var blocked []string
 
-	process := func(text string) (string, error) {
+	// processKeep redacts text but never rewrites its first `keep` bytes (a
+	// synthetic "key: " context prefix); masks reaching into it are clipped.
+	processKeep := func(text string, keep int) (string, error) {
 		fs, err := e.DetectText(ctx, text)
 		if err != nil {
 			if mode == ModeAudit || !e.cfg.FailClosedOn() {
@@ -300,6 +302,12 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 				} else {
 					start, end = hits[0].f.Start, hits[0].f.End
 				}
+				if start < keep {
+					start = keep
+				}
+				if start >= end {
+					continue
+				}
 				v := text[start:end]
 				ph := Placeholder(userKey, kind, v)
 				bucket.Put(ph, v)
@@ -318,7 +326,7 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 		return b.String(), nil
 	}
 
-	if err := walkRequest(req, process); err != nil {
+	if err := walkRequest(req, processKeep); err != nil {
 		return res, err
 	}
 	if oai.HasImage(req) {
@@ -363,7 +371,8 @@ var thinkingFields = []string{"reasoning_content", "reasoning", "thinking"}
 // text (system, user, assistant history, tool results), tool-call arguments in
 // history, and tool descriptions. Model ids, message ids, tool names and image
 // data are left alone.
-func walkRequest(req oai.Object, fn func(string) (string, error)) error {
+func walkRequest(req oai.Object, fnKeep func(string, int) (string, error)) error {
+	fn := func(s string) (string, error) { return fnKeep(s, 0) }
 	for _, m := range oai.Messages(req) {
 		switch c := m["content"].(type) {
 		case string:
@@ -392,7 +401,7 @@ func walkRequest(req oai.Object, fn func(string) (string, error)) error {
 					continue
 				}
 				if args, ok := fnObj["arguments"].(string); ok {
-					s, err := redactJSONText(args, fn)
+					s, err := redactJSONText(args, fnKeep)
 					if err != nil {
 						return err
 					}
@@ -493,7 +502,8 @@ func redactValues(v any, fn func(string) (string, error)) (any, error) {
 // value, so escaped strings are seen decoded and the result stays valid
 // JSON. A number that contains a finding becomes a string placeholder.
 // Text that is not JSON is redacted as plain text.
-func redactJSONText(s string, fn func(string) (string, error)) (string, error) {
+func redactJSONText(s string, fnKeep func(string, int) (string, error)) (string, error) {
+	fn := func(s string) (string, error) { return fnKeep(s, 0) }
 	v, err := oai.DecodeValue([]byte(s))
 	if err != nil {
 		return fn(s)
@@ -521,7 +531,7 @@ func redactJSONText(s string, fn func(string) (string, error)) (string, error) {
 					// detect with the key in front so contextual rules
 					// ("password": ...) still see the field name
 					prefix := k + ": "
-					out, err := fn(prefix + sv)
+					out, err := fnKeep(prefix+sv, len(prefix))
 					if err != nil {
 						return nil, err
 					}

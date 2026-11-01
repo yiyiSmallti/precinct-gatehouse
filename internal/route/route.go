@@ -340,7 +340,6 @@ func (r *Router) classify(ctx context.Context, g *config.RoutingGroup, idx []int
 		d.ClassifierError = "skipped: confidential request and external classifier"
 		return -1
 	}
-	d.ClassifierModel = g.Classifier
 	if r.Prepare != nil {
 		t, err := r.Prepare(text, p.Target, dataClass)
 		if err != nil {
@@ -349,6 +348,7 @@ func (r *Router) classify(ctx context.Context, g *config.RoutingGroup, idx []int
 		}
 		text = t
 	}
+	d.ClassifierModel = g.Classifier // set only when the classifier is actually called (it is metered)
 	body := oai.Encode(map[string]any{
 		"model": model, "temperature": 0, "max_tokens": 8, "stream": false,
 		"messages": []any{

@@ -43,3 +43,22 @@ func TestOverlapMasksUnion(t *testing.T) {
 		t.Fatalf("not fully masked: %q", got)
 	}
 }
+
+// A finding that covers the synthetic "key: " prefix of a tool argument still
+// masks the value.
+func TestToolArgumentKeyPrefixFinding(t *testing.T) {
+	e, err := New(config.Redaction{Terms: []string{"password: hunter2"}}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := oai.Object{"messages": []any{map[string]any{"role": "assistant", "content": "", "tool_calls": []any{
+		map[string]any{"id": "t1", "type": "function", "function": map[string]any{"name": "login", "arguments": `{"password":"hunter2hunter2"}`}},
+	}}}}
+	if _, err := e.Apply(context.Background(), req, ModeMask, []byte("k"), "v"); err != nil {
+		t.Fatal(err)
+	}
+	args := req["messages"].([]any)[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+	if strings.Contains(args, "hunter2") || !strings.HasPrefix(args, `{"password":"{{`) {
+		t.Fatalf("not masked: %s", args)
+	}
+}
