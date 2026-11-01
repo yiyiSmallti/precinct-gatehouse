@@ -396,7 +396,11 @@ func walkRequest(req oai.Object, fnKeep func(string, int) (string, error)) error
 		}
 		if tcs, ok := m["tool_calls"].([]any); ok {
 			for _, tc := range tcs {
-				fnObj, _ := tc.(map[string]any)["function"].(map[string]any)
+				tco, ok := tc.(map[string]any)
+				if !ok {
+					return &Error{Status: http.StatusBadRequest, Code: "invalid_request", Msg: "tool_calls entries must be objects"}
+				}
+				fnObj, _ := tco["function"].(map[string]any)
 				if fnObj == nil {
 					continue
 				}
@@ -634,7 +638,8 @@ func (e *Engine) Restore(resp oai.Object, vaultKey string, rep *audit.Redaction)
 		}
 		tcs, _ := msg["tool_calls"].([]any)
 		for _, tc := range tcs {
-			fnObj, _ := tc.(map[string]any)["function"].(map[string]any)
+			tco, _ := tc.(map[string]any)
+			fnObj, _ := tco["function"].(map[string]any)
 			if fnObj == nil {
 				continue
 			}

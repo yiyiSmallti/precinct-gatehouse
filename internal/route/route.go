@@ -113,7 +113,7 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 
 	hasImage := oai.HasImage(req)
 	reasoning := oai.Str(req, "reasoning_effort") != "" || req["reasoning"] != nil || req["thinking"] != nil
-	key := turnKey(name, fmt.Sprintf("%s\x00%s\x00%v\x00%v", meta.Session, meta.Source, reasoning, hasImage), req)
+	key := turnKey(name, fmt.Sprintf("%s\x00%s\x00%s\x00%v\x00%v", meta.Session, meta.Source, meta.DataClass, reasoning, hasImage), req)
 	r.mu.Lock()
 	r.gcLocked(meta.Now)
 	if e, ok := r.turns[key]; ok && meta.Now.Before(e.expires) {
