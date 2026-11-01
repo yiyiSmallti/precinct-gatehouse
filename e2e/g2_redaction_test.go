@@ -49,7 +49,8 @@ func TestG2Redaction(t *testing.T) {
 	cloud := startFake(t, "cloud")
 	g := startGateway(t, fmt.Sprintf(g2Config, local.URL, cloud.URL), map[string]string{"words.txt": "# 客户词典\n" + g2Term + "\n"})
 
-	tools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "echo", "description": "把内容原样发给 " + g2Phone, "parameters": map[string]any{"type": "object"}}}}
+	tools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "echo", "description": "把内容原样发给 " + g2Phone, "parameters": map[string]any{"type": "object",
+		"properties": map[string]any{"to": map[string]any{"type": "string", "description": "收件号码，例如 " + g2Phone}}}}}}
 	r := g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": msgs("system", "你是助理。", "user", g2Message), "tools": tools,
 		"dsh_session_log": "完整会话日志 " + g2Phone}, map[string]string{"X-Gatehouse-Session": "s1"})
 	if r.Status != 200 {
@@ -69,7 +70,8 @@ func TestG2Redaction(t *testing.T) {
 	rep.Check("订单号未被误脱", strings.Contains(out, "订单号 "+g2Order), "订单号后的 11 位数字原样发出")
 	rep.Check("dsh_session_log 被剥掉", !strings.Contains(out, "dsh_session_log"), "该字段带完整明文会话日志，出站前删除")
 	rep.Check("Never-mask 原样", strings.Contains(out, g2Never), "%s 原样发出", g2Never)
-	rep.Check("工具描述也脱敏", !strings.Contains(out, "原样发给 "+g2Phone), "tools[].function.description 中的手机号已替换")
+	rep.Check("工具描述与参数 schema 描述也脱敏", !strings.Contains(out, "原样发给 "+g2Phone) && !strings.Contains(out, "例如 "+g2Phone) && strings.Contains(out, `"to":`),
+		"function.description 与 parameters.properties.*.description 中的手机号已替换，属性名保留")
 
 	rep.Check("响应文本回填为原值", strings.Contains(r.Content(), g2Message), "客户端收到：%s", r.Content())
 	var args map[string]string

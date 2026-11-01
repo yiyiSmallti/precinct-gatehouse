@@ -375,9 +375,78 @@ func walkRequest(req oai.Object, fn func(string) (string, error)) error {
 				}
 				fnObj["description"] = s
 			}
+			if params, ok := fnObj["parameters"].(map[string]any); ok {
+				if err := redactSchemaText(params, fn); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
+}
+
+// redactSchemaText redacts the human-readable parts of a JSON Schema
+// (description, title, examples, default) at any depth, leaving property
+// names, types and other identifiers alone.
+func redactSchemaText(node any, fn func(string) (string, error)) error {
+	switch t := node.(type) {
+	case map[string]any:
+		for k, v := range t {
+			switch k {
+			case "description", "title":
+				if s, ok := v.(string); ok {
+					out, err := fn(s)
+					if err != nil {
+						return err
+					}
+					t[k] = out
+					continue
+				}
+			case "examples", "default", "example":
+				out, err := redactValues(v, fn)
+				if err != nil {
+					return err
+				}
+				t[k] = out
+				continue
+			}
+			if err := redactSchemaText(v, fn); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, v := range t {
+			if err := redactSchemaText(v, fn); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// redactValues redacts every string inside a JSON value.
+func redactValues(v any, fn func(string) (string, error)) (any, error) {
+	switch t := v.(type) {
+	case string:
+		return fn(t)
+	case map[string]any:
+		for k, e := range t {
+			out, err := redactValues(e, fn)
+			if err != nil {
+				return nil, err
+			}
+			t[k] = out
+		}
+	case []any:
+		for i, e := range t {
+			out, err := redactValues(e, fn)
+			if err != nil {
+				return nil, err
+			}
+			t[i] = out
+		}
+	}
+	return v, nil
 }
 
 // redactJSONText redacts a JSON document (tool-call arguments) value by

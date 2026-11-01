@@ -111,7 +111,9 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 	g := r.cfg.RoutingGroups[name]
 	d.Group = name
 
-	key := turnKey(name, meta.Session+"\x00"+meta.Source, req)
+	hasImage := oai.HasImage(req)
+	reasoning := oai.Str(req, "reasoning_effort") != "" || req["reasoning"] != nil || req["thinking"] != nil
+	key := turnKey(name, fmt.Sprintf("%s\x00%s\x00%v\x00%v", meta.Session, meta.Source, reasoning, hasImage), req)
 	r.mu.Lock()
 	r.gcLocked(meta.Now)
 	if e, ok := r.turns[key]; ok && meta.Now.Before(e.expires) {
@@ -126,11 +128,14 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 	r.mu.Unlock()
 
 	tokens := oai.EstimateTokens(req)
-	hasImage := oai.HasImage(req)
-	reasoning := oai.Str(req, "reasoning_effort") != "" || req["reasoning"] != nil || req["thinking"] != nil
-	classified := -2 // -2: not yet asked; -1: no intent matched / classifier failed; else rule index
-
-	var hit *config.Rule
+	// deterministic predicates first; only rules that pass them are offered
+	// to the classifier
+	type cand struct {
+		why []string
+		ok  bool
+	}
+	pre := make([]cand, len(g.Rules))
+	var eligible []int
 	for i := range g.Rules {
 		rule := &g.Rules[i]
 		var why []string
@@ -159,9 +164,20 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 			ok = ok && inWindow(rule.Time, meta.Now)
 			why = append(why, "time in "+rule.Time)
 		}
+		pre[i] = cand{why, ok}
+		if ok && rule.Intent != "" {
+			eligible = append(eligible, i)
+		}
+	}
+	classified := -2 // -2: not yet asked; -1: no intent matched / classifier failed; else rule index
+
+	var hit *config.Rule
+	for i := range g.Rules {
+		rule := &g.Rules[i]
+		ok, why := pre[i].ok, pre[i].why
 		if ok && rule.Intent != "" {
 			if classified == -2 {
-				classified = r.classify(ctx, g, req, meta.DataClass, &d)
+				classified = r.classify(ctx, g, eligible, req, meta.DataClass, &d)
 			}
 			ok = classified == i
 			why = append(why, fmt.Sprintf("intent %q", rule.Intent))
@@ -309,15 +325,11 @@ var firstInt = regexp.MustCompile(`\d+`)
 // classify asks the group's classifier which intent the last user message
 // matches. It returns the rule index, or -1 when nothing matched or the
 // classifier failed or timed out (failure is not fatal: the group fallback applies).
-func (r *Router) classify(ctx context.Context, g *config.RoutingGroup, req oai.Object, dataClass string, d *Decision) int {
-	var idx []int
+func (r *Router) classify(ctx context.Context, g *config.RoutingGroup, idx []int, req oai.Object, dataClass string, d *Decision) int {
 	var b strings.Builder
 	b.WriteString("你是请求路由分类器。判断用户最后一条消息属于下列哪一类意图，只回答类别编号；都不符合则回答 0。\n")
-	for i, rule := range g.Rules {
-		if rule.Intent != "" {
-			idx = append(idx, i)
-			fmt.Fprintf(&b, "%d. %s\n", len(idx), rule.Intent)
-		}
+	for n, i := range idx {
+		fmt.Fprintf(&b, "%d. %s\n", n+1, g.Rules[i].Intent)
 	}
 	text := oai.LastUserText(req)
 	if rs := []rune(text); len(rs) > 2000 {

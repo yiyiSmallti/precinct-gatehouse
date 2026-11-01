@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
@@ -54,6 +55,13 @@ type Pipeline struct {
 	Audit    audit.Sink
 	UserKey  []byte // personal mode: the single local user's placeholder key
 	Log      *slog.Logger
+
+	budgetLocks sync.Map // token id -> *sync.Mutex
+}
+
+func (p *Pipeline) budgetLock(tokenID string) *sync.Mutex {
+	v, _ := p.budgetLocks.LoadOrStore(tokenID, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 type reqState struct {
@@ -137,6 +145,11 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 		return oai.Errorf(http.StatusForbidden, "model_not_allowed", "token %s may not use %q", claims.Name, requested)
 	}
 	if claims.Scope.MaxTokens > 0 {
+		// serialize budget-limited requests per token through metering, so
+		// concurrent calls cannot all pass the check on the same total
+		mu := p.budgetLock(claims.ID)
+		mu.Lock()
+		defer mu.Unlock()
 		used, err := p.Meter.TokensUsed(claims.ID)
 		if err != nil {
 			return err
@@ -239,6 +252,10 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 				p.Reg.MarkFailed(ref)
 				lastErr = ue
 				continue
+			}
+			if ue.Status == 0 {
+				// no upstream response (e.g. the client went away)
+				return oai.Errorf(http.StatusBadGateway, "upstream_unavailable", "%s: %s", ref, ue.Error())
 			}
 			// a client error from the provider is returned as is
 			st.rec.Status = ue.Status
