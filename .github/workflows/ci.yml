@@ -1,0 +1,43 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+      - name: end-to-end (G1–G4, G6, redaction fixtures)
+        run: go test -count=1 -v ./e2e/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-report
+          path: e2e/report/
+
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [windows/amd64, windows/arm64, linux/amd64, linux/arm64, darwin/amd64, darwin/arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build ${{ matrix.target }}
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          export GOOS=${{ matrix.target }}; export GOARCH=${GOOS#*/}; GOOS=${GOOS%/*}
+          go build -trimpath -ldflags "-s -w" -o dist/gatehouse-$GOOS-$GOARCH$([ $GOOS = windows ] && echo .exe) ./cmd/gatehouse
+          ls -la dist/

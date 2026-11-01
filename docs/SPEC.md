@@ -4,7 +4,7 @@
 
 ## 1. 技术栈
 
-- Go 1.23+，标准库 `net/http` + 轻量路由；SQLite（`modernc.org/sqlite`，无 cgo）做计量与 Vault 落盘；YAML 配置。
+- Go 1.26+（依赖的 gRPC/OTel 当前版本要求），标准库 `net/http` + 轻量路由；SQLite（`modernc.org/sqlite`，无 cgo）做计量与 Vault 落盘；YAML 配置。
 - 插件：hashicorp/go-plugin 模式（子进程 + gRPC，握手魔数、协议版本协商）。是否直接依赖该库在实现期决定（MPL-2.0 可用），接口按其形态定义。
 - OTLP：`go.opentelemetry.io/otel` 导出计量。
 - 构建：单二进制，三平台交叉编译；Windows 版给 Alcove 个人用户。
@@ -78,6 +78,27 @@ redaction:
   ner: { enabled: false }
   fail_closed: true
 ```
+
+### 3.5 请求约定与 dsh 接入（2026-11-01 与 Alcove 线约定）
+
+- 入口只说 OpenAI Chat Completions。dsh 自带的 DeepSeek 适配器讲 Anthropic Messages，不直接指向 Gatehouse；Alcove 在 profile 里用 `@deepseek-ai/dsh-llm-pi-ai` 配 `api: openai-completions` 路由，`baseURL` 指 `http://127.0.0.1:7788/v1`，`apiKey` 为网关令牌。`/v1/messages` 不做（PRD 3 首期外）。
+- `model`：`auto`（`default_group`）、路由组名，或 `<provider>/<model>`。
+- 可选请求头：`X-Gatehouse-Session`（会话：同回合路由固定与 Vault 范围；缺失时回退到请求体 `user` 字段，再缺失则 Vault 按令牌、回合按对话哈希）、`X-Gatehouse-Source`（路由规则 `source`）、`X-Gatehouse-Data-Class`（`public|internal|confidential`，默认 `internal`，不得高于令牌上限）。
+- 响应头（F1）：`X-Gatehouse-Request-Id`、`X-Gatehouse-Group`、`X-Gatehouse-Rule`、`X-Gatehouse-Effort`、`X-Gatehouse-Model`、`X-Gatehouse-Redaction`（`<模式>; <类别>=<计数>…`）。
+- 请求体顶层字段 `dsh_session_log` 一律在入口删除（带完整明文会话日志，会绕过脱敏）；`redaction.strip_fields` 可追加。
+- 错误码：401 `missing_token|invalid_token|token_expired|token_revoked`；403 `model_not_allowed|data_class_not_allowed|token_budget_exceeded|no_allowed_target`；400 `redaction_blocked`；503 `redaction_unavailable`；502 `upstream_unavailable`。
+- `useEffort` 下发为 `reasoning_effort`（`xhigh`、`max` 降为 `high`）。
+
+### 3.6 插件接口 v1 的已实现部分
+
+`plugin/proto/gatehousev1/detector.proto`：`Detector.Detect(text, lang, hints) → findings{kind, start, end, confidence}`，偏移是 Unicode 码点、end 不含。握手：`GATEHOUSE_PLUGIN` 魔数 + 协议版本 1，只允许 gRPC。Go 插件用 `plugin.ServeDetector(impl)`（同仓库 `plugin` 包即 SDK 雏形）。`plugins[]` 声明可执行文件，`redaction.detectors` 列出必需检测器：必需检测器禁用、启动失败或进程退出时，需要脱敏（mask/warn/block）的请求返回 503，audit 模式只记告警。其余四类扩展点随 org 模式进入同一 proto 包。
+
+### 3.7 个人模式实现与本 Spec 的差异
+
+- 未做：配置热重载、Vault 加密落盘、多轮增量检测缓存、NER 模块（M5，看验证周）、org 模式。
+- 外部目标含图请求：类别 `image`，默认动作同其它类别（mask 模式下视为 warn，原样发出并告警），可设 `image: block`。
+- 审计样本只记类别、长度、动作，不记值的前几个字符。
+- 路由组的 `usage` 分摊按进程内累计 token，重启归零。
 
 ## 4. 里程碑与任务
 
