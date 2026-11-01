@@ -37,6 +37,13 @@ routing_groups:
   external-only:
     type: order
     members: [cloud/strong]
+  ruled:
+    type: order
+    members: [local/a]
+    rules:
+      - name: batch
+        source: batch
+        use: local/b
 plugins:
   - name: cloister
     kind: auth_policy
@@ -61,7 +68,7 @@ redaction:
 
 const g5Tokens = `{
   "tok-conf":   {"tenant": "org_acme", "user": "u_zhang", "department": "研发部", "data_class": "confidential", "allowed_groups": ["default", "external-only"], "models": ["plug/x"]},
-  "tok-int":    {"tenant": "org_acme", "user": "u_li", "department": "市场部", "data_class": "internal", "allowed_groups": ["default"], "models": ["plug/x"]},
+  "tok-int":    {"tenant": "org_acme", "user": "u_li", "department": "市场部", "data_class": "internal", "allowed_groups": ["default", "ruled"], "models": ["plug/x"]},
   "tok-narrow": {"tenant": "org_acme", "user": "u_wang", "department": "财务部", "data_class": "internal", "allowed_groups": []},
   "tok-broke":  {"tenant": "org_acme", "user": "u_zhao", "department": "研发部", "data_class": "internal", "allowed_groups": ["default"], "tokens_remaining": 0},
   "tok-deny":   {"action": "deny"},
@@ -120,6 +127,8 @@ func TestG5OrgMode(t *testing.T) {
 	rep.Check("不在 allowed_groups 的组 → 403", r.Status == 403 && errCode(r) == "model_not_allowed", "status=%d code=%s", r.Status, errCode(r))
 	r = g.Chat(t, "tok-int", map[string]any{"model": "local/b", "messages": msgs("user", "hi")}, nil)
 	rep.Check("allowed_groups 内的直连模型可用", r.Status == 200, "status=%d model=%s", r.Status, header(r, "X-Gatehouse-Model"))
+	r = g.Chat(t, "tok-int", map[string]any{"model": "ruled", "messages": msgs("user", "hi")}, map[string]string{"X-Gatehouse-Source": "batch"})
+	rep.Check("允许组的规则目标（不在 members 里）照常生效", r.Status == 200 && header(r, "X-Gatehouse-Model") == "local/b", "status=%d model=%s", r.Status, header(r, "X-Gatehouse-Model"))
 	r = g.Chat(t, "tok-broke", map[string]any{"model": "auto", "messages": msgs("user", "hi")}, nil)
 	rep.Check("策略预算为 0 → 403", r.Status == 403 && errCode(r) == "token_budget_exceeded", "status=%d code=%s", r.Status, errCode(r))
 
