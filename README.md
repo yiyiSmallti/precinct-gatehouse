@@ -25,6 +25,11 @@ Precinct 系列 · 自研模型网关：路由组、意图路由、脱敏、计�
 
 只通过插件和线协议关联，不共享代码库。总览与架构文档见 [Charter](https://github.com/yiyiSmallti/precinct-charter)。
 
+## 文档
+
+- [首期 PRD](docs/PRD.md)
+- [首期执行 Spec](docs/SPEC.md)
+
 ## 状态
 
 设计阶段。参考实现：magpie（路由组、意图路由、脱敏）。许可：MIT。
