@@ -114,7 +114,7 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 	key := turnKey(name, meta.Session+"\x00"+meta.Source, req)
 	r.mu.Lock()
 	r.gcLocked(meta.Now)
-	if e, ok := r.turns[key]; ok {
+	if e, ok := r.turns[key]; ok && meta.Now.Before(e.expires) {
 		r.mu.Unlock()
 		c := e.d
 		c.Requested = requested
@@ -180,7 +180,7 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 			d.Reason += " (classifier: " + d.ClassifierError + ")"
 		}
 	}
-	d.Candidates = r.expandWithRule(name, g, d.Rule)
+	d.Candidates = r.expandWithRule(name, hit)
 
 	r.mu.Lock()
 	r.turns[key] = turnEntry{d: d, expires: meta.Now.Add(TurnTTL)}
@@ -188,9 +188,9 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 	return d, nil
 }
 
-// expandWithRule builds candidates: the matched rule's target first, then the
-// group's own members (order or usage), without duplicates.
-func (r *Router) expandWithRule(name string, g *config.RoutingGroup, ruleName string) []string {
+// expandWithRule builds candidates: the matched rule's target first (if
+// any), then the group's own members (order or usage), without duplicates.
+func (r *Router) expandWithRule(name string, hit *config.Rule) []string {
 	var out []string
 	seen := map[string]bool{}
 	add := func(refs []string) {
@@ -201,19 +201,12 @@ func (r *Router) expandWithRule(name string, g *config.RoutingGroup, ruleName st
 			}
 		}
 	}
-	if ruleName != "" {
-		for i := range g.Rules {
-			if ruleNameOf(g, i) == ruleName {
-				add(r.expand(g.Rules[i].Use))
-				break
-			}
-		}
+	if hit != nil {
+		add(r.expand(hit.Use))
 	}
 	add(r.expand(name))
 	return out
 }
-
-func ruleNameOf(g *config.RoutingGroup, i int) string { return ruleName(&g.Rules[i], i) }
 
 func ruleName(rule *config.Rule, i int) string {
 	if rule.Name != "" {
@@ -254,14 +247,13 @@ func (r *Router) Account(model string, tokens int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.used[model] += float64(tokens)
+	// credit each group that directly contains the model once, however many
+	// parents reference it
 	for name, g := range r.cfg.RoutingGroups {
 		for _, m := range g.Members {
-			if sub, ok := r.cfg.RoutingGroups[m]; ok && m != name {
-				for _, sm := range sub.Members {
-					if sm == model {
-						r.used[m] += float64(tokens)
-					}
-				}
+			if m == model {
+				r.used[name] += float64(tokens)
+				break
 			}
 		}
 	}

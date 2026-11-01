@@ -112,6 +112,17 @@ func TestG2Redaction(t *testing.T) {
 		!strings.Contains(histArgs, "13812345678") && !strings.Contains(histArgs, `\u661f`) && strings.Contains(histArgs, "{{TERM_") && strings.Contains(histArgs, "{{PHONE_"),
 		"出站 arguments=%s", histArgs)
 
+	// a contextual secret inside tool arguments is still seen with its key
+	n0 := len(cloud.Requests())
+	rs := g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": []any{
+		map[string]any{"role": "user", "content": "登录"},
+		map[string]any{"role": "assistant", "content": "", "tool_calls": []any{map[string]any{"id": "t2", "type": "function",
+			"function": map[string]any{"name": "login", "arguments": `{"user":"ops","password":"hunter2hunter2"}`}}}},
+		map[string]any{"role": "tool", "tool_call_id": "t2", "content": "ok"},
+	}}, nil)
+	rep.Check("工具参数里带键名的密码仍按 secret 处理", rs.Status == 400 && rs.ErrCode() == "redaction_blocked" && len(cloud.Requests()) == n0,
+		"status=%d code=%s", rs.Status, rs.ErrCode())
+
 	// local target in audit mode: unchanged, but counted
 	r3 := g.Chat(t, g.Token, map[string]any{"model": "local/small", "messages": msgs("user", g2Message)}, nil)
 	ls := local.Requests()

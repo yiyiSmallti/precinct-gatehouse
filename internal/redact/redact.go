@@ -408,6 +408,22 @@ func redactJSONText(s string, fn func(string) (string, error)) (string, error) {
 			return out, nil
 		case map[string]any:
 			for k, e := range t {
+				if sv, ok := e.(string); ok {
+					// detect with the key in front so contextual rules
+					// ("password": ...) still see the field name
+					prefix := k + ": "
+					out, err := fn(prefix + sv)
+					if err != nil {
+						return nil, err
+					}
+					if rest, ok := strings.CutPrefix(out, prefix); ok {
+						if rest != sv {
+							changed = true
+						}
+						t[k] = rest
+						continue
+					}
+				}
 				nv, err := walk(e)
 				if err != nil {
 					return nil, err

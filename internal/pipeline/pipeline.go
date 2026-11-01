@@ -439,7 +439,8 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 			if errors.Is(err, io.EOF) {
 				return usage, nil
 			}
-			return usage, nil // client already has a partial stream; record what we have
+			// the client already has a partial stream; report the failure so it is metered and audited
+			return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "%v", err)
 		}
 	}
 }
