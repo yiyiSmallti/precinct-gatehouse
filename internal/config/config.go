@@ -19,7 +19,7 @@ import (
 // Config is the top-level configuration file (~/.gatehouse/config.yaml).
 type Config struct {
 	Listen        string                   `yaml:"listen"`
-	Mode          string                   `yaml:"mode"`     // personal | org (org is not implemented in this phase)
+	Mode          string                   `yaml:"mode"`     // personal | org (org: an auth_policy plugin authorises every request)
 	DataDir       string                   `yaml:"data_dir"` // default: directory of the config file
 	Providers     []Provider               `yaml:"providers"`
 	RoutingGroups map[string]*RoutingGroup `yaml:"routing_groups"`
@@ -29,14 +29,22 @@ type Config struct {
 	Audit         Audit                    `yaml:"audit"`
 	Plugins       []Plugin                 `yaml:"plugins"`
 	Tokens        TokenDefaults            `yaml:"tokens"`
+	Org           Org                      `yaml:"org"`
 
 	path string
 }
 
-// Provider is one OpenAI-compatible upstream.
+// Org configures org mode.
+type Org struct {
+	PolicyTimeout Duration `yaml:"policy_timeout"` // per Resolve call, default 3s
+	PolicyCache   Duration `yaml:"policy_cache"`   // max time a resolved context is reused, default 60s (never past its expiry)
+}
+
+// Provider is one OpenAI-compatible upstream, or a provider plugin.
 type Provider struct {
 	Name    string             `yaml:"name"`
 	BaseURL string             `yaml:"base_url"`
+	Plugin  string             `yaml:"plugin"`  // name of a provider plugin; replaces base_url
 	KeyRef  string             `yaml:"key_ref"` // env:NAME | keychain:NAME | file:PATH | empty (no key)
 	Target  string             `yaml:"target"`  // local | external; default: local for loopback base_url, otherwise external
 	Models  []string           `yaml:"models"`  // model ids exposed as <provider>/<model>
@@ -108,7 +116,7 @@ type Audit struct {
 // Plugin declares an extension-point plugin executable.
 type Plugin struct {
 	Name    string   `yaml:"name"`
-	Kind    string   `yaml:"kind"` // detector (other kinds arrive with the org mode)
+	Kind    string   `yaml:"kind"` // detector | auth_policy | audit_sink | provider | hooks
 	Path    string   `yaml:"path"`
 	Args    []string `yaml:"args"`
 	Enabled *bool    `yaml:"enabled"`
@@ -276,8 +284,17 @@ func (c *Config) Validate() []string {
 	if c.Mode != "personal" && c.Mode != "org" {
 		add("mode: must be personal or org, got %q", c.Mode)
 	}
-	if c.Mode == "org" {
-		add("mode: org needs a policy plugin, which is not part of this release yet")
+	policies := 0
+	for _, pl := range c.Plugins {
+		if pl.Kind == "auth_policy" {
+			policies++
+		}
+	}
+	switch {
+	case c.Mode == "org" && policies != 1:
+		add("mode: org needs exactly one plugin of kind auth_policy, found %d", policies)
+	case c.Mode != "org" && policies > 0:
+		add("plugins: auth_policy plugins are only used in org mode")
 	}
 	if len(c.Providers) == 0 {
 		add("providers: at least one provider is required")
@@ -293,7 +310,14 @@ func (c *Config) Validate() []string {
 			add("providers[%d].name: duplicate %q", i, pr.Name)
 		}
 		provs[pr.Name] = pr
-		if !strings.HasPrefix(pr.BaseURL, "http://") && !strings.HasPrefix(pr.BaseURL, "https://") {
+		if pr.Plugin != "" {
+			if pr.BaseURL != "" {
+				add("providers.%s: set base_url or plugin, not both", pr.Name)
+			}
+			if !c.hasPlugin(pr.Plugin, "provider") {
+				add("providers.%s.plugin: %q is not declared under plugins with kind provider", pr.Name, pr.Plugin)
+			}
+		} else if !strings.HasPrefix(pr.BaseURL, "http://") && !strings.HasPrefix(pr.BaseURL, "https://") {
 			add("providers.%s.base_url: must start with http:// or https://", pr.Name)
 		}
 		if pr.Target != "local" && pr.Target != "external" {
@@ -396,8 +420,13 @@ func (c *Config) Validate() []string {
 		if pl.Name == "" {
 			add("plugins[%d].name: required", i)
 		}
-		if pl.Kind != "detector" {
-			add("plugins.%s.kind: only detector is supported in this release", pl.Name)
+		switch pl.Kind {
+		case "detector", "auth_policy", "audit_sink", "provider", "hooks":
+		default:
+			add("plugins.%s.kind: must be detector, auth_policy, audit_sink, provider or hooks", pl.Name)
+		}
+		if plugins[pl.Name] {
+			add("plugins.%s: duplicate name", pl.Name)
 		}
 		if pl.Path == "" {
 			add("plugins.%s.path: required", pl.Name)
@@ -405,14 +434,23 @@ func (c *Config) Validate() []string {
 		plugins[pl.Name] = true
 	}
 	for _, d := range c.Redaction.Detectors {
-		if !plugins[d] {
-			add("redaction.detectors: %q is not declared under plugins", d)
+		if !c.hasPlugin(d, "detector") {
+			add("redaction.detectors: %q is not declared under plugins with kind detector", d)
 		}
 	}
 	if c.Meter.OTLP != nil && c.Meter.OTLP.Endpoint == "" {
 		add("meter.otlp.endpoint: required when meter.otlp is set")
 	}
 	return p
+}
+
+func (c *Config) hasPlugin(name, kind string) bool {
+	for _, pl := range c.Plugins {
+		if pl.Name == name && pl.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // FailClosedOn reports whether redaction fails closed (default true).

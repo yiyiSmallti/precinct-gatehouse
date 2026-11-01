@@ -24,9 +24,10 @@ import (
 )
 
 var (
-	binDir      string
-	gatehouse   string
-	fakeDetPath string
+	binDir       string
+	gatehouse    string
+	fakeDetPath  string
+	fakePlugPath string
 )
 
 func TestMain(m *testing.M) {
@@ -41,7 +42,8 @@ func TestMain(m *testing.M) {
 	}
 	gatehouse = filepath.Join(dir, "gatehouse"+exe)
 	fakeDetPath = filepath.Join(dir, "fakedetector"+exe)
-	for out, pkg := range map[string]string{gatehouse: "../cmd/gatehouse", fakeDetPath: "./fakedetector"} {
+	fakePlugPath = filepath.Join(dir, "fakeplugin"+exe)
+	for out, pkg := range map[string]string{gatehouse: "../cmd/gatehouse", fakeDetPath: "./fakedetector", fakePlugPath: "./fakeplugin"} {
 		cmd := exec.Command("go", "build", "-o", out, pkg)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -236,6 +238,7 @@ func startGateway(t *testing.T, cfg string, files map[string]string) *Gateway {
 	cfg = strings.ReplaceAll(cfg, "{{LISTEN}}", addr)
 	cfg = strings.ReplaceAll(cfg, "{{DIR}}", filepath.ToSlash(dir))
 	cfg = strings.ReplaceAll(cfg, "{{FAKEDET}}", filepath.ToSlash(fakeDetPath))
+	cfg = strings.ReplaceAll(cfg, "{{FAKEPLUGIN}}", filepath.ToSlash(fakePlugPath))
 	for name, content := range files {
 		os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600)
 	}

@@ -1,0 +1,44 @@
+// Gatehouse plugin interface v1: Hooks extension point.
+//
+// OnRequest runs after policy and before routing and may rewrite the request
+// body, but not model, stream or tools (Gatehouse rejects such a rewrite
+// with 500 and keeps the original). OnResponse is read-only and called with
+// the final response body (after placeholder restore) for non-streaming
+// responses. Hooks run locally before redaction, so they see plaintext;
+// only install hooks you trust with it.
+syntax = "proto3";
+
+package gatehouse.plugin.v1;
+
+option go_package = "github.com/yiyiSmallti/precinct-gatehouse/plugin/proto/gatehousev1";
+
+service Hooks {
+  rpc OnRequest(HookRequest) returns (HookRequestResult);
+  rpc OnResponse(HookResponse) returns (HookResponseResult);
+}
+
+message HookContext {
+  string request_id = 1;
+  string tenant = 2;
+  string user = 3;
+  string department = 4;
+  string data_class = 5;
+  string source = 6;
+}
+
+message HookRequest {
+  HookContext ctx = 1;
+  bytes body = 2;  // Chat Completions request JSON
+}
+
+message HookRequestResult {
+  bytes body = 1;  // empty = unchanged
+}
+
+message HookResponse {
+  HookContext ctx = 1;
+  bytes body = 2;  // Chat Completions response JSON
+  int32 status = 3;
+}
+
+message HookResponseResult {}

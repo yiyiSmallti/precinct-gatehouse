@@ -147,21 +147,27 @@ Next steps:
 	if err != nil {
 		return err
 	}
-	tok, created, err := srv.LocalToken()
-	if err != nil {
-		return err
+	tokPath := ""
+	if cfg.Mode != "org" {
+		// org mode: tokens come from the policy plugin, no local token
+		_, created, err := srv.LocalToken()
+		if err != nil {
+			return err
+		}
+		tokPath = filepath.Join(cfg.DataDir, "local.token")
+		if created {
+			log.Info("issued the local gateway token", "file", tokPath)
+		}
 	}
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		srv.Shutdown(context.Background())
 		return err
 	}
-	tokPath := filepath.Join(cfg.DataDir, "local.token")
-	if created {
-		log.Info("issued the local gateway token", "file", tokPath)
-	}
 	log.Info("gatehouse listening", "addr", "http://"+ln.Addr().String()+"/v1", "mode", cfg.Mode, "token_file", tokPath)
-	_ = tok
+	if srv.PolicyDown {
+		log.Warn("policy plugin unavailable; org mode refuses every request with 503 (fail-closed)")
+	}
 	if len(srv.Missing) > 0 {
 		log.Warn("required detectors unavailable; requests that need redaction will get 503", "detectors", srv.Missing)
 	}

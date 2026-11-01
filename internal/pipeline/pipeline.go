@@ -5,13 +5,19 @@
 // In personal mode the policy step is built in: one user, scopes come from
 // the gateway token, and data class comes from the X-Gatehouse-Data-Class
 // header (default internal) capped by the token.
+//
+// In org mode the AuthPolicy plugin resolves the bearer token into a tenant
+// context (tenant, user, department, data class floor, allowed groups,
+// budget). The plugin being unavailable refuses every request with 503.
 package pipeline
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -28,10 +34,12 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/meter"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/policy"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/provider"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/route"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/token"
+	sdk "github.com/yiyiSmallti/precinct-gatehouse/plugin"
 )
 
 // Request headers understood by Gatehouse.
@@ -53,8 +61,10 @@ type Pipeline struct {
 	Reg      *provider.Registry
 	Redactor *redact.Engine
 	Audit    audit.Sink
-	UserKey  []byte // personal mode: the single local user's placeholder key
+	UserKey  []byte // personal mode: the single local user's placeholder key; org mode: derivation key
 	Log      *slog.Logger
+	Policy   *policy.Resolver // org mode only
+	Hooks    []Hook           // OnRequest/OnResponse plugins, in config order
 
 	budgetLocks sync.Map // token id -> *sync.Mutex
 }
@@ -68,6 +78,7 @@ type reqState struct {
 	id      string
 	start   time.Time
 	claims  token.Claims
+	org     *policy.Context // org mode
 	rec     audit.Record
 	w       http.ResponseWriter
 	written bool
@@ -103,6 +114,9 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 	if tok == "" {
 		return oai.Errorf(http.StatusUnauthorized, "missing_token", "missing gateway token (Authorization: Bearer <token>)")
 	}
+	if p.Policy != nil {
+		return p.handleOrg(ctx, st, r, tok)
+	}
 	claims, err := p.Tokens.Verify(tok)
 	if err != nil {
 		st.rec.TokenID = claims.ID
@@ -117,23 +131,11 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 	st.claims = claims
 	st.rec.TokenID, st.rec.TokenName = claims.ID, claims.Name
 
-	body, err := io.ReadAll(http.MaxBytesReader(st.w, r.Body, MaxBody))
+	req, err := p.readRequest(st, r)
 	if err != nil {
-		return oai.Errorf(http.StatusRequestEntityTooLarge, "body_too_large", "%v", err)
-	}
-	req, err := oai.Decode(body)
-	if err != nil {
-		return oai.Errorf(http.StatusBadRequest, "invalid_json", "%v", err)
-	}
-	// fields that carry plaintext outside the redaction scope never leave the gateway
-	for _, f := range append([]string{"dsh_session_log"}, p.Cfg.Redaction.StripFields...) {
-		delete(req, f)
-	}
-	if len(oai.Messages(req)) == 0 {
-		return oai.Errorf(http.StatusBadRequest, "invalid_request", "messages is required")
+		return err
 	}
 	requested := oai.Str(req, "model")
-	st.rec.RequestedModel = requested
 
 	// policy (personal mode): token scope, budget, data class
 	isGroup := p.Router.IsGroup(requested)
@@ -158,21 +160,144 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 			return oai.Errorf(http.StatusForbidden, "token_budget_exceeded", "token %s used %d of %d tokens", claims.Name, used, claims.Scope.MaxTokens)
 		}
 	}
-	dataClass := strings.ToLower(strings.TrimSpace(r.Header.Get(HeaderDataClass)))
-	if dataClass == "" {
-		dataClass = "internal"
-	}
-	if token.ClassRank(dataClass) < 0 {
-		return oai.Errorf(http.StatusBadRequest, "invalid_data_class", "unknown data class %q", dataClass)
-	}
 	maxClass := claims.Scope.DataClass
 	if maxClass == "" {
 		maxClass = "internal"
+	}
+	dataClass, err := requestClass(r, "internal")
+	if err != nil {
+		return err
 	}
 	if token.ClassRank(dataClass) > token.ClassRank(maxClass) {
 		return oai.Errorf(http.StatusForbidden, "data_class_not_allowed", "token %s may send at most %s data", claims.Name, maxClass)
 	}
 	st.rec.DataClass = dataClass
+	return p.serve(ctx, st, r, req, dataClass, p.UserKey, nil)
+}
+
+// handleOrg authorises the request through the AuthPolicy plugin.
+func (p *Pipeline) handleOrg(ctx context.Context, st *reqState, r *http.Request, tok string) error {
+	req, err := p.readRequest(st, r)
+	if err != nil {
+		return err
+	}
+	requested := oai.Str(req, "model")
+	group := ""
+	if p.Router.IsGroup(requested) {
+		group = p.Router.ResolveGroupName(requested)
+	}
+	pc, err := p.Policy.Resolve(ctx, tok, &sdk.RequestMeta{Model: requested, RouteGroup: group, ClientIp: clientIP(r), RequestId: st.id, Source: st.rec.Source})
+	if err != nil {
+		var pe *policy.Error
+		if errors.As(err, &pe) {
+			return oai.Errorf(pe.Status, pe.Code, "%s", pe.Msg)
+		}
+		return err
+	}
+	st.org = pc
+	st.claims = token.Claims{ID: "org:" + pc.Tenant + "/" + pc.User, Name: pc.User}
+	st.rec.TokenID, st.rec.TokenName = st.claims.ID, pc.User
+	st.rec.Tenant, st.rec.User, st.rec.Department = pc.Tenant, pc.User, pc.Department
+	st.rec.OnBehalfOf, st.rec.InstanceID, st.rec.WorkspaceID, st.rec.PolicyVersion = pc.OnBehalfOf, pc.InstanceID, pc.WorkspaceID, pc.PolicyVersion
+
+	allowed := p.orgAllowed(pc)
+	if group != "" {
+		if !contains(pc.AllowedGroups, group) {
+			return oai.Errorf(http.StatusForbidden, "model_not_allowed", "policy does not allow group %q for %s", group, pc.User)
+		}
+	} else if requested != "" && !allowed[requested] {
+		return oai.Errorf(http.StatusForbidden, "model_not_allowed", "policy does not allow model %q for %s", requested, pc.User)
+	}
+	if pc.TokensRemaining != nil && *pc.TokensRemaining <= 0 {
+		return oai.Errorf(http.StatusForbidden, "token_budget_exceeded", "policy budget for %s is used up", pc.User)
+	}
+	if pc.DepartmentTokensRemaining != nil && *pc.DepartmentTokensRemaining <= 0 {
+		return oai.Errorf(http.StatusForbidden, "department_budget_exceeded", "department budget of %s is used up", pc.Department)
+	}
+	// the policy's class is a floor: the client may raise it, never lower it
+	dataClass, err := requestClass(r, pc.DataClass)
+	if err != nil {
+		return err
+	}
+	if token.ClassRank(dataClass) < token.ClassRank(pc.DataClass) {
+		dataClass = pc.DataClass
+	}
+	st.rec.DataClass = dataClass
+	mac := hmac.New(sha256.New, p.UserKey)
+	mac.Write([]byte(pc.Tenant + "\x00" + pc.User))
+	return p.serve(ctx, st, r, req, dataClass, mac.Sum(nil), allowed)
+}
+
+// orgAllowed lists the provider/model refs a policy context may reach: the
+// members of its allowed groups plus its direct model allowlist.
+func (p *Pipeline) orgAllowed(pc *policy.Context) map[string]bool {
+	out := map[string]bool{}
+	for _, g := range pc.AllowedGroups {
+		for _, m := range p.Router.Members(g) {
+			out[m] = true
+		}
+	}
+	for _, m := range pc.Models {
+		out[m] = true
+	}
+	return out
+}
+
+func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(st.w, r.Body, MaxBody))
+	if err != nil {
+		return nil, oai.Errorf(http.StatusRequestEntityTooLarge, "body_too_large", "%v", err)
+	}
+	req, err := oai.Decode(body)
+	if err != nil {
+		return nil, oai.Errorf(http.StatusBadRequest, "invalid_json", "%v", err)
+	}
+	// fields that carry plaintext outside the redaction scope never leave the gateway
+	for _, f := range append([]string{"dsh_session_log"}, p.Cfg.Redaction.StripFields...) {
+		delete(req, f)
+	}
+	if len(oai.Messages(req)) == 0 {
+		return nil, oai.Errorf(http.StatusBadRequest, "invalid_request", "messages is required")
+	}
+	st.rec.RequestedModel = oai.Str(req, "model")
+	return req, nil
+}
+
+func requestClass(r *http.Request, def string) (string, error) {
+	dataClass := strings.ToLower(strings.TrimSpace(r.Header.Get(HeaderDataClass)))
+	if dataClass == "" {
+		dataClass = def
+	}
+	if token.ClassRank(dataClass) < 0 {
+		return "", oai.Errorf(http.StatusBadRequest, "invalid_data_class", "unknown data class %q", dataClass)
+	}
+	return dataClass, nil
+}
+
+func clientIP(r *http.Request) string {
+	host := r.RemoteAddr
+	if i := strings.LastIndexByte(host, ':'); i > 0 {
+		host = host[:i]
+	}
+	return strings.Trim(host, "[]")
+}
+
+func contains(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// serve runs route → redact → provider → restore → meter for an authorised
+// request. allowed, when not nil, limits the candidates (org mode).
+func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req oai.Object, dataClass string, userKey []byte, allowed map[string]bool) error {
+	requested := oai.Str(req, "model")
+	if err := p.runRequestHooks(ctx, st, req, dataClass); err != nil {
+		return err
+	}
 
 	// route
 	// Without the header, fall back to the OpenAI `user` field. With neither,
@@ -195,6 +320,18 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 		p.meterClassifier(st, dec)
 	}
 	cands := p.orderCandidates(dec.Candidates, dataClass)
+	if allowed != nil {
+		var keep []string
+		for _, c := range cands {
+			if allowed[c] {
+				keep = append(keep, c)
+			}
+		}
+		if len(keep) == 0 && len(cands) > 0 {
+			return oai.Errorf(http.StatusForbidden, "model_not_allowed", "routing for %q selected only models outside the policy's allowed groups", requested)
+		}
+		cands = keep
+	}
 	if len(cands) == 0 {
 		return oai.Errorf(http.StatusForbidden, "no_allowed_target", "data class %s may only use local models and none is configured for %q; refusing rather than sending it outside", dataClass, requested)
 	}
@@ -208,7 +345,7 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 	if so, ok := req["stream_options"].(map[string]any); ok {
 		clientUsage = oai.Bool(so, "include_usage")
 	}
-	vaultKey := claims.ID + "\x00" + session
+	vaultKey := st.claims.ID + "\x00" + session
 
 	var lastErr *provider.UpstreamError
 	for _, ref := range cands {
@@ -219,7 +356,7 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 		if e := effortParam(dec.Effort); e != "" {
 			out["reasoning_effort"] = e
 		}
-		res, rerr := p.Redactor.Apply(ctx, out, mode, p.UserKey, vaultKey)
+		res, rerr := p.Redactor.Apply(ctx, out, mode, userKey, vaultKey)
 		st.rec.Redaction = res.Report
 		st.rec.Model, st.rec.Target = ref, prov.Target
 		if rerr != nil {
@@ -298,6 +435,9 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 	if lastErr != nil {
 		msg += ": last error: " + lastErr.Error()
 	}
+	if dataClass == "confidential" {
+		return oai.Errorf(http.StatusServiceUnavailable, "local_targets_unavailable", "%s (tried %s); confidential data is never sent to external models, so the request is refused", msg, strings.Join(cands, ", "))
+	}
 	return oai.Errorf(http.StatusBadGateway, "upstream_unavailable", "%s (tried %s)", msg, strings.Join(cands, ", "))
 }
 
@@ -365,6 +505,10 @@ func (p *Pipeline) relayBuffered(st *reqState, resp *http.Response, vaultKey str
 		p.Redactor.Restore(o, vaultKey, st.rec.Redaction)
 	}
 	usage, _ := oai.UsageOf(o)
+	if len(p.Hooks) > 0 {
+		body := oai.Encode(o)
+		go p.runResponseHooks(p.hookCtx(st, st.rec.DataClass), body, http.StatusOK)
+	}
 	st.written = true
 	if !clientStream {
 		st.w.Header().Set("Content-Type", "application/json")

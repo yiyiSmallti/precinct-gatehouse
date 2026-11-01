@@ -86,16 +86,37 @@ redaction:
 - 可选请求头：`X-Gatehouse-Session`（会话：同回合路由固定与 Vault 范围；缺失时回退到请求体 `user` 字段，再缺失则 Vault 按令牌、回合按对话哈希）、`X-Gatehouse-Source`（路由规则 `source`）、`X-Gatehouse-Data-Class`（`public|internal|confidential`，默认 `internal`，不得高于令牌上限）。
 - 响应头（F1）：`X-Gatehouse-Request-Id`、`X-Gatehouse-Group`、`X-Gatehouse-Rule`、`X-Gatehouse-Effort`、`X-Gatehouse-Model`、`X-Gatehouse-Redaction`（`<模式>; <类别>=<计数>…`）。
 - 请求体顶层字段 `dsh_session_log` 一律在入口删除（带完整明文会话日志，会绕过脱敏）；`redaction.strip_fields` 可追加。
-- 错误码：401 `missing_token|invalid_token|token_expired|token_revoked`；403 `model_not_allowed|data_class_not_allowed|token_budget_exceeded|no_allowed_target`；400 `redaction_blocked`；503 `redaction_unavailable`；502 `upstream_unavailable`。
+- 错误码：401 `missing_token|invalid_token|token_expired|token_revoked`；403 `model_not_allowed|data_class_not_allowed|token_budget_exceeded|department_budget_exceeded|no_allowed_target|policy_denied`；400 `redaction_blocked|invalid_request`；503 `redaction_unavailable|policy_unavailable|policy_invalid|hook_unavailable|hook_failed|local_targets_unavailable`；500 `hook_invalid`；502 `upstream_unavailable|upstream_redirect|upstream_stream_interrupted`。
 - `useEffort` 下发为 `reasoning_effort`（`xhigh`、`max` 降为 `high`）。
 
-### 3.6 插件接口 v1 的已实现部分
+### 3.6 插件接口 v1
 
-`plugin/proto/gatehousev1/detector.proto`：`Detector.Detect(text, lang, hints) → findings{kind, start, end, confidence}`，偏移是 Unicode 码点、end 不含。握手：`GATEHOUSE_PLUGIN` 魔数 + 协议版本 1，只允许 gRPC。Go 插件用 `plugin.ServeDetector(impl)`（同仓库 `plugin` 包即 SDK 雏形）。`plugins[]` 声明可执行文件，`redaction.detectors` 列出必需检测器：必需检测器禁用、启动失败或进程退出时，需要脱敏（mask/warn/block）的请求返回 503，audit 模式只记告警。其余四类扩展点随 org 模式进入同一 proto 包。
+`plugin/proto/gatehousev1/` 五个 proto 文件，同一包 `gatehouse.plugin.v1`。握手：`GATEHOUSE_PLUGIN` 魔数 + 协议版本 1，只允许 gRPC。Go SDK 是同仓库 `plugin` 包：`plugin.Serve(plugin.Set{...})` 一个可执行文件可服务一种或多种扩展点（`ServeDetector` 保留）。`plugins[]` 声明 `name`、`kind`（`detector|auth_policy|audit_sink|provider|hooks`）、`path`、`args`、`enabled`。
 
-### 3.7 个人模式实现与本 Spec 的差异
+| 扩展点 | RPC | 宿主行为 |
+| --- | --- | --- |
+| Detector（`detector.proto`） | `Detect(text, lang, hints) → findings{kind, start, end, confidence}`，偏移是 Unicode 码点、end 不含 | `redaction.detectors` 列出必需检测器：禁用、启动失败或进程退出时，需要脱敏（mask/warn/block）的请求返回 503，audit 模式只记告警 |
+| AuthPolicy（`policy.proto`） | `Resolve(token, request_meta{model, route_group, client_ip, request_id, source}) → GatewayContext` | 只在 org 模式用，且必须恰好一个。字段与 Cloister `gateway-context.schema.json` 一一对应（`expires_at` 改为 `expires_at_unix`，预算用 `has_*` 区分"0"与"不限"）。gRPC `UNAUTHENTICATED` → 401 `invalid_token`，`PERMISSION_DENIED` → 403 `policy_denied`，其余错误、超时（`org.policy_timeout`，默认 3 s）、进程不在 → 503 `policy_unavailable`。上下文按（令牌、请求模型、路由组）缓存，至多 `org.policy_cache`（默认 60 s）且不超过 `expires_at`；插件进程不在时缓存也不用（fail-closed） |
+| AuditSink（`audit.proto`） | `Write(records_json[]) → accepted` | 每条审计记录先写本地 JSONL 文件（内置文件实现，始终开启），再入队异步批量发给每个 AuditSink 插件（每批至多 200 条）；失败指数退避重试，队列上限 10 000 条，溢出丢最旧并告警（本地文件仍有）。记录 `request_id` 唯一，插件据此去重 |
+| Provider（`provider.proto`） | `Chat(model, body) → stream {status, content_type, data}` | `providers[].plugin: <名字>` 代替 `base_url`。首条消息带状态码与类型；JSON 一次给完，SSE 分多条。插件不在或 gRPC 失败按可重试上游错误处理（触发故障转移），错误信息只记状态码 |
+| Hooks（`hooks.proto`） | `OnRequest(ctx, body) → body'`；`OnResponse(ctx, body, status)` | OnRequest 在策略之后、路由之前按配置顺序执行，可改写请求但不能改 `model`、`stream`、`tools`（改了返回 500 `hook_invalid`）；钩子插件不在或报错返回 503（钩子可能承担策略，不静默跳过）。OnResponse 只读，在缓冲响应回填之后异步调用。钩子在脱敏之前运行、看得到明文，只装可信的钩子 |
 
-- 未做：配置热重载、Vault 加密落盘、多轮增量检测缓存、NER 模块（M5，看验证周）、org 模式。
+审计记录（JSONL 与发给 AuditSink 的同一格式）：`time, request_id, token_id, token_name, tenant, user, department, on_behalf_of, instance_id, workspace_id, policy_version, source, requested_model, data_class, group, rule, rule_reason, effort, attempts[{model,status,error}], model, target, redaction{mode, counts, masked, warned, blocked, restored, samples[{kind,length,action}], alerts}, status, error, prompt_tokens, completion_tokens, latency_ms`。org 模式字段只在 org 模式出现。
+
+### 3.6.1 org 模式
+
+`mode: org` 时不签发、不接受本机 `ght1.` 令牌，Bearer 令牌整体交给 AuthPolicy 插件解析：
+
+- 路由组必须在 `allowed_groups` 内；直连模型必须在 `models` 或某个允许组（含嵌套）的成员里；规则选出的候选再按同一集合过滤。org 模式下空 `allowed_groups` 表示什么组都不允许。
+- `data_class` 是请求分级的下限：`X-Gatehouse-Data-Class` 只能调高，不能调低。`confidential` 只走本地目标，本地候选全部失败时返回 503 `local_targets_unavailable`，不降级到外部。
+- `budget.tokens_remaining`、`department_tokens_remaining` 为 0 时 403；预算的扣减由策略端负责（Gatehouse 只报用量，经 AuditSink）。
+- 占位符键 = HMAC(本机密钥, 租户 + 用户)；计量按 `org:<tenant>/<user>` 归因。
+- `/v1/models` 按策略列出允许的组与模型；`/healthz` 带 `policy{plugin, available}`，插件不在时 `status: unavailable`。
+
+### 3.7 实现与本 Spec 的差异
+
+- 未做：配置热重载、Vault 加密落盘、多轮增量检测缓存、NER 模块（M5，看验证周）、插件进程崩溃后自动重启（当前需重启 Gatehouse）、插件包（`.tgz` + `gatehouse` 字段）的安装命令。
+- org 模式暂不使用 `byo_api` 与策略下发的 `redaction` 段（脱敏仍按本机配置）；`budget.period` 只透传不解释。
 - 外部目标含图请求：类别 `image`，默认动作同其它类别（mask 模式下视为 warn，原样发出并告警），可设 `image: block`。
 - 审计样本只记类别、长度、动作，不记值的前几个字符。
 - 路由组的 `usage` 分摊按进程内累计 token，重启归零。
@@ -105,7 +126,7 @@ redaction:
 - M1 骨架（2 周）：OpenAI 兼容入口、单提供方出站、personal 配置、令牌签发校验、计量 SQLite、CLI。验收 G4、G6 部分。
 - M2 路由（1.5 周）：order/usage 组、意图规则、分类器调用与超时、同回合固定、健康与故障转移。验收 G1。
 - M3 脱敏（3 周）：规则包与校验、词典、Never-mask、模式表、键控哈希、Vault、回填（含 tool_calls JSON 校验）、整条缓冲、审计记录、`redact try`。验收 G2、G3。
-- M4 插件接口（2 周）：五类扩展点、子进程宿主、假策略插件、AuditSink 文件实现、org 模式与 fail-closed。验收 G5。
+- M4 插件接口（2 周）：五类扩展点、子进程宿主、假策略插件、AuditSink 文件实现、org 模式与 fail-closed。验收 G5（已完成，报告 `e2e/report/G5-org-mode.md`）。
 - M5 NER 可选模块（1 周，视验证周结论）：Detector 插件形态接入本地小模型，超时退化。
 - 合计 8.5–9.5 周。
 

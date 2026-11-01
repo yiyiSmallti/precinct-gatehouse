@@ -1,0 +1,27 @@
+// Gatehouse plugin interface v1: Provider extension point.
+//
+// A provider that does not speak the OpenAI Chat Completions protocol is
+// served by a plugin. Gatehouse sends the outbound (already redacted)
+// Chat Completions request body and receives an OpenAI-compatible response:
+// one JSON body, or, when the request has "stream": true, SSE bytes split
+// across messages. The first message carries the HTTP-like status.
+syntax = "proto3";
+
+package gatehouse.plugin.v1;
+
+option go_package = "github.com/yiyiSmallti/precinct-gatehouse/plugin/proto/gatehousev1";
+
+service Provider {
+  rpc Chat(ChatRequest) returns (stream ChatResponse);
+}
+
+message ChatRequest {
+  string model = 1;  // model id without the provider prefix
+  bytes body = 2;    // Chat Completions request JSON
+}
+
+message ChatResponse {
+  int32 status = 1;          // first message only; 0 means 200
+  string content_type = 2;   // first message only; application/json or text/event-stream
+  bytes data = 3;
+}

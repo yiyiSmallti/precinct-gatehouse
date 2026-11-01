@@ -231,7 +231,32 @@ func ruleName(rule *config.Rule, i int) string {
 	return fmt.Sprintf("rules[%d]", i)
 }
 
+// Members lists every provider/model a request to group can be routed to:
+// the targets of the group's rules (which Decide puts first) plus its
+// members, with nested groups expanded. Rules of nested groups are not
+// applied by Decide, so they are not included.
+func (r *Router) Members(group string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(refs []string) {
+		for _, x := range refs {
+			if !seen[x] {
+				seen[x] = true
+				out = append(out, x)
+			}
+		}
+	}
+	if g, ok := r.cfg.RoutingGroups[group]; ok {
+		for i := range g.Rules {
+			add(r.expand(g.Rules[i].Use))
+		}
+	}
+	add(r.expand(group))
+	return out
+}
+
 // expand turns a model ref or group name into model refs.
+
 func (r *Router) expand(ref string) []string {
 	g, ok := r.cfg.RoutingGroups[ref]
 	if !ok {

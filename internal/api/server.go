@@ -20,20 +20,23 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/pipeline"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/plugin"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/policy"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/provider"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/route"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/store"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/token"
+	sdk "github.com/yiyiSmallti/precinct-gatehouse/plugin"
 )
 
 // Server is a running gateway.
 type Server struct {
-	HTTP     *http.Server
-	Pipeline *pipeline.Pipeline
-	Missing  []string // required detectors that are unavailable
-	closers  []func()
-	otlp     *meter.OTLP
+	HTTP       *http.Server
+	Pipeline   *pipeline.Pipeline
+	Missing    []string // required detectors that are unavailable
+	PolicyDown bool     // org mode: the policy plugin did not start
+	closers    []func()
+	otlp       *meter.OTLP
 }
 
 // New wires every component from a validated config.
@@ -60,12 +63,56 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		m.AddExporter(o)
 		s.otlp = o
 	}
-	sink, err := audit.NewFileSink(cfg.Audit.Dir)
+	fileSink, err := audit.NewFileSink(cfg.Audit.Dir)
 	if err != nil {
 		return nil, err
 	}
 	host := &plugin.Host{}
 	s.closers = append(s.closers, host.Close)
+	sink := audit.NewForwarder(fileSink, log)
+	s.closers = append(s.closers, func() { sink.Close(5 * time.Second) })
+	sinks, failedSinks := host.StartKind(cfg, sdk.KindAuditSink, log)
+	for _, as := range sinks {
+		sink.Add(as.Name, as.Impl.(sdk.AuditSink))
+	}
+	if len(failedSinks) > 0 {
+		log.Warn("audit sink plugins unavailable; records stay in the local audit file", "plugins", failedSinks)
+	}
+	provPlugins, _ := host.StartKind(cfg, sdk.KindProvider, log)
+	for _, pc := range cfg.Providers {
+		if pc.Plugin == "" {
+			continue
+		}
+		fn := plugin.Unavailable(pc.Plugin)
+		for _, pp := range provPlugins {
+			if pp.Name == pc.Plugin {
+				fn = plugin.ProviderChat(pp, pc.Timeout.D(300*time.Second))
+			}
+		}
+		reg.SetPlugin(pc.Name, fn)
+	}
+	var hooks []pipeline.Hook
+	hookPlugins, failedHooks := host.StartKind(cfg, sdk.KindHooks, log)
+	for _, hp := range hookPlugins {
+		hooks = append(hooks, pipeline.Hook{Name: hp.Name, Impl: hp.Impl.(sdk.Hooks), Exited: hp.Exited})
+	}
+	for _, n := range failedHooks {
+		// a hook that did not start refuses requests rather than being skipped
+		hooks = append(hooks, pipeline.Hook{Name: n, Exited: func() bool { return true }})
+	}
+	var resolver *policy.Resolver
+	if cfg.Mode == "org" {
+		pols, failed := host.StartKind(cfg, sdk.KindAuthPolicy, log)
+		switch {
+		case len(pols) == 1:
+			resolver = policy.New(cfg, pols[0].Name, pols[0])
+		case len(failed) == 1:
+			resolver = policy.New(cfg, failed[0], nil)
+			s.PolicyDown = true
+		default:
+			return nil, fmt.Errorf("org mode needs exactly one auth_policy plugin")
+		}
+	}
 	detectors, missing := host.StartDetectors(cfg, log)
 	s.Missing = missing
 	red, err := redact.New(cfg.Redaction, detectors, missing)
@@ -86,7 +133,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		}
 		return oai.Text(oai.Messages(req)[0]), nil
 	}
-	p := &pipeline.Pipeline{Cfg: cfg, Tokens: issuer, Meter: m, Router: rt, Reg: reg, Redactor: red, Audit: sink, UserKey: userKey, Log: log}
+	p := &pipeline.Pipeline{Cfg: cfg, Tokens: issuer, Meter: m, Router: rt, Reg: reg, Redactor: red, Audit: sink, UserKey: userKey, Log: log, Policy: resolver, Hooks: hooks}
 	s.Pipeline = p
 
 	mux := http.NewServeMux()
@@ -115,14 +162,34 @@ func (s *Server) Shutdown(ctx context.Context) {
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-	claims, err := s.Pipeline.Tokens.Verify(tok)
-	if err != nil {
-		code := "invalid_token"
-		if errors.Is(err, token.ErrExpired) {
-			code = "token_expired"
+	var claims token.Claims
+	if pol := s.Pipeline.Policy; pol != nil {
+		pc, err := pol.Resolve(r.Context(), tok, &sdk.RequestMeta{})
+		if err != nil {
+			var pe *policy.Error
+			if errors.As(err, &pe) {
+				oai.WriteError(w, oai.Errorf(pe.Status, pe.Code, "%s", pe.Msg))
+			} else {
+				oai.WriteError(w, oai.Errorf(http.StatusServiceUnavailable, "policy_unavailable", "%v", err))
+			}
+			return
 		}
-		oai.WriteError(w, oai.Errorf(http.StatusUnauthorized, code, "%v", err))
-		return
+		// empty lists mean "nothing" in org mode, unlike personal token scopes
+		claims.Scope = token.Scope{Groups: append([]string{"\x00"}, pc.AllowedGroups...), Models: append([]string{"\x00"}, pc.Models...)}
+		for _, g := range pc.AllowedGroups {
+			claims.Scope.Models = append(claims.Scope.Models, s.Pipeline.Router.Members(g)...)
+		}
+	} else {
+		c, err := s.Pipeline.Tokens.Verify(tok)
+		if err != nil {
+			code := "invalid_token"
+			if errors.Is(err, token.ErrExpired) {
+				code = "token_expired"
+			}
+			oai.WriteError(w, oai.Errorf(http.StatusUnauthorized, code, "%v", err))
+			return
+		}
+		claims = c
 	}
 	cfg := s.Pipeline.Cfg
 	var ids []string
@@ -161,7 +228,14 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	if len(s.Missing) > 0 {
 		status = "degraded"
 	}
-	w.Write(oai.Encode(map[string]any{"status": status, "mode": s.Pipeline.Cfg.Mode, "detectors_unavailable": s.Missing}))
+	out := map[string]any{"status": status, "mode": s.Pipeline.Cfg.Mode, "detectors_unavailable": s.Missing}
+	if pol := s.Pipeline.Policy; pol != nil {
+		out["policy"] = map[string]any{"plugin": pol.Name(), "available": pol.Available()}
+		if !pol.Available() {
+			out["status"] = "unavailable"
+		}
+	}
+	w.Write(oai.Encode(out))
 }
 
 func loadOrCreateKey(path string) ([]byte, error) {

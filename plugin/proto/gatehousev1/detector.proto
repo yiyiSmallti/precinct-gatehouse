@@ -2,8 +2,8 @@
 //
 // Plugins are separate executables started by Gatehouse and served over
 // gRPC with the hashicorp/go-plugin handshake (see plugin/handshake.go).
-// The other four extension points (AuthPolicy, AuditSink, Provider, Hooks)
-// are added to this package in the same major version.
+// The other four extension points live in policy.proto, audit.proto,
+// provider.proto and hooks.proto.
 syntax = "proto3";
 
 package gatehouse.plugin.v1;

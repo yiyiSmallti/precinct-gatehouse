@@ -65,9 +65,18 @@ func (h *Host) StartDetectors(cfg *config.Config, log *slog.Logger) ([]redact.Ex
 }
 
 func (h *Host) startDetector(pc config.Plugin) (*detector, error) {
+	raw, c, err := h.start(pc)
+	if err != nil {
+		return nil, err
+	}
+	return &detector{name: pc.Name, impl: raw.(sdk.Detector), client: c}, nil
+}
+
+// start launches a plugin process and dispenses its declared kind.
+func (h *Host) start(pc config.Plugin) (any, *goplugin.Client, error) {
 	c := goplugin.NewClient(&goplugin.ClientConfig{
 		HandshakeConfig:  sdk.Handshake,
-		Plugins:          goplugin.PluginSet{sdk.KindDetector: &sdk.DetectorPlugin{}},
+		Plugins:          sdk.PluginSet(),
 		Cmd:              exec.Command(pc.Path, pc.Args...),
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},
 		Logger:           hclog.New(&hclog.LoggerOptions{Name: "plugin." + pc.Name, Output: io.Discard}),
@@ -78,13 +87,47 @@ func (h *Host) startDetector(pc config.Plugin) (*detector, error) {
 	h.mu.Unlock()
 	rpc, err := c.Client()
 	if err != nil {
-		return nil, err
+		return nil, c, err
 	}
-	raw, err := rpc.Dispense(sdk.KindDetector)
+	raw, err := rpc.Dispense(pc.Kind)
 	if err != nil {
-		return nil, err
+		return nil, c, err
 	}
-	return &detector{name: pc.Name, impl: raw.(sdk.Detector), client: c}, nil
+	return raw, c, nil
+}
+
+// Started is a running plugin of any kind other than detector.
+type Started struct {
+	Name   string
+	Impl   any // sdk.AuthPolicy, sdk.AuditSink, *sdk.ProviderClient or sdk.Hooks
+	client *goplugin.Client
+}
+
+// Exited reports whether the plugin process has gone away.
+func (s *Started) Exited() bool { return s.client == nil || s.client.Exited() }
+
+// StartKind starts every enabled plugin of kind. Disabled plugins and
+// plugins that fail to start are returned by name in failed.
+func (h *Host) StartKind(cfg *config.Config, kind string, log *slog.Logger) (running []*Started, failed []string) {
+	for _, pc := range cfg.Plugins {
+		if pc.Kind != kind {
+			continue
+		}
+		if pc.Enabled != nil && !*pc.Enabled {
+			log.Warn("plugin disabled", "plugin", pc.Name, "kind", kind)
+			failed = append(failed, pc.Name)
+			continue
+		}
+		raw, c, err := h.start(pc)
+		if err != nil {
+			log.Error("plugin failed to start", "plugin", pc.Name, "kind", kind, "err", err)
+			failed = append(failed, pc.Name)
+			continue
+		}
+		log.Info("plugin started", "plugin", pc.Name, "kind", kind)
+		running = append(running, &Started{Name: pc.Name, Impl: raw, client: c})
+	}
+	return running, failed
 }
 
 // Close kills all plugin processes.

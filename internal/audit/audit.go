@@ -17,6 +17,13 @@ type Record struct {
 	RequestID        string     `json:"request_id"`
 	TokenID          string     `json:"token_id,omitempty"`
 	TokenName        string     `json:"token_name,omitempty"`
+	Tenant           string     `json:"tenant,omitempty"` // org mode: from the policy context
+	User             string     `json:"user,omitempty"`
+	Department       string     `json:"department,omitempty"`
+	OnBehalfOf       string     `json:"on_behalf_of,omitempty"`
+	InstanceID       string     `json:"instance_id,omitempty"`
+	WorkspaceID      string     `json:"workspace_id,omitempty"`
+	PolicyVersion    int64      `json:"policy_version,omitempty"`
 	Source           string     `json:"source,omitempty"`
 	RequestedModel   string     `json:"requested_model,omitempty"`
 	DataClass        string     `json:"data_class,omitempty"`
