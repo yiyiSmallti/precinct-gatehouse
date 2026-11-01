@@ -1,11 +1,14 @@
 name: ci
+# Runs on pull requests only, and not for documentation-only changes.
 on:
-  push:
-    branches: [main]
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "e2e/report/**"
 
 jobs:
-  e2e:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,26 +21,16 @@ jobs:
           go vet ./...
       - name: end-to-end (G1–G4, G6, redaction fixtures)
         run: go test -count=1 -v ./e2e/
+      - name: cross-build
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for t in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS=${t%/*} GOARCH=${t#*/} go build -trimpath -ldflags "-s -w" -o /dev/null ./cmd/gatehouse
+            echo "built $t"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: e2e-report
           path: e2e/report/
-
-  cross-build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [windows/amd64, windows/arm64, linux/amd64, linux/arm64, darwin/amd64, darwin/arm64]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: build ${{ matrix.target }}
-        env:
-          CGO_ENABLED: "0"
-        run: |
-          export GOOS=${{ matrix.target }}; export GOARCH=${GOOS#*/}; GOOS=${GOOS%/*}
-          go build -trimpath -ldflags "-s -w" -o dist/gatehouse-$GOOS-$GOARCH$([ $GOOS = windows ] && echo .exe) ./cmd/gatehouse
-          ls -la dist/
