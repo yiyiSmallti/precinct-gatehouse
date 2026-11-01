@@ -117,6 +117,16 @@ func TestG1Routing(t *testing.T) {
 	}
 	rep.Check("usage 组按用量分摊", seq[0] != seq[1] && seq[1] != seq[2] && seq[2] != seq[3], "依次命中 %s", strings.Join(seq, " → "))
 
+	// usage group inside one turn: the tool round trip keeps the first pick
+	poolTurn := []any{map[string]any{"role": "user", "content": "同一回合的 usage 组"}}
+	p1 := g.Chat(t, g.Token, map[string]any{"model": "pool", "messages": poolTurn}, nil)
+	poolTurn = append(poolTurn,
+		map[string]any{"role": "assistant", "content": "", "tool_calls": []any{map[string]any{"id": "t1", "type": "function", "function": map[string]any{"name": "read", "arguments": "{}"}}}},
+		map[string]any{"role": "tool", "tool_call_id": "t1", "content": "ok"})
+	p2 := g.Chat(t, g.Token, map[string]any{"model": "pool", "messages": poolTurn}, nil)
+	rep.Check("usage 组同一回合不换模型", header(p1, "X-Gatehouse-Model") == header(p2, "X-Gatehouse-Model"),
+		"%s → %s", header(p1, "X-Gatehouse-Model"), header(p2, "X-Gatehouse-Model"))
+
 	// 7. direct model, streaming passthrough for a local target
 	r = g.Chat(t, g.Token, map[string]any{"model": "local/small", "stream": true, "messages": msgs("user", "流式测试")}, nil)
 	rep.Check("本地目标流式透传", r.Status == 200 && strings.Contains(string(r.Raw), "data: [DONE]") && strings.Contains(string(r.Raw), "流式测试") && !strings.Contains(string(r.Raw), `"usage"`),

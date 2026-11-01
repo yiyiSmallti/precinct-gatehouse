@@ -102,14 +102,12 @@ type UpstreamError struct {
 }
 
 func (e *UpstreamError) Error() string {
+	// The body is never included: providers may echo prompt text, and this
+	// message ends up in audit records and client error messages.
 	if e.Err != nil {
 		return e.Err.Error()
 	}
-	b := e.Body
-	if len(b) > 200 {
-		b = b[:200]
-	}
-	return fmt.Sprintf("upstream status %d: %s", e.Status, strings.TrimSpace(string(b)))
+	return fmt.Sprintf("upstream status %d", e.Status)
 }
 
 // Chat posts body to <base_url>/chat/completions. On success the caller owns

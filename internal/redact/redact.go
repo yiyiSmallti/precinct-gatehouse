@@ -72,7 +72,12 @@ type Engine struct {
 func New(cfg config.Redaction, external []ExternalDetector, missing []string) (*Engine, error) {
 	e := &Engine{cfg: cfg, rules: rules.New(cfg.InternalDomains), never: map[string]bool{}, external: external, missing: missing,
 		Vault: NewVault(cfg.VaultTTL.D(24 * 3600e9))}
-	terms := append([]string(nil), cfg.Terms...)
+	var terms []string
+	for _, t := range cfg.Terms {
+		if t = strings.TrimSpace(t); t != "" {
+			terms = append(terms, t)
+		}
+	}
 	if cfg.Dictionary != "" {
 		f, err := os.Open(cfg.Dictionary)
 		if err != nil {
@@ -347,7 +352,7 @@ func walkRequest(req oai.Object, fn func(string) (string, error)) error {
 					continue
 				}
 				if args, ok := fnObj["arguments"].(string); ok {
-					s, err := fn(args)
+					s, err := redactJSONText(args, fn)
 					if err != nil {
 						return err
 					}
@@ -373,6 +378,58 @@ func walkRequest(req oai.Object, fn func(string) (string, error)) error {
 		}
 	}
 	return nil
+}
+
+// redactJSONText redacts a JSON document (tool-call arguments) value by
+// value, so escaped strings are seen decoded and the result stays valid
+// JSON. A number that contains a finding becomes a string placeholder.
+// Text that is not JSON is redacted as plain text.
+func redactJSONText(s string, fn func(string) (string, error)) (string, error) {
+	v, err := oai.DecodeValue([]byte(s))
+	if err != nil {
+		return fn(s)
+	}
+	changed := false
+	var walk func(any) (any, error)
+	walk = func(x any) (any, error) {
+		switch t := x.(type) {
+		case string:
+			out, err := fn(t)
+			if out != t {
+				changed = true
+			}
+			return out, err
+		case json.Number:
+			out, err := fn(t.String())
+			if err != nil || out == t.String() {
+				return t, err
+			}
+			changed = true
+			return out, nil
+		case map[string]any:
+			for k, e := range t {
+				nv, err := walk(e)
+				if err != nil {
+					return nil, err
+				}
+				t[k] = nv
+			}
+		case []any:
+			for i, e := range t {
+				nv, err := walk(e)
+				if err != nil {
+					return nil, err
+				}
+				t[i] = nv
+			}
+		}
+		return x, nil
+	}
+	v, err = walk(v)
+	if err != nil || !changed {
+		return s, err
+	}
+	return string(oai.Encode(v)), nil
 }
 
 var b32 = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)

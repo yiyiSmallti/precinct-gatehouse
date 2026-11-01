@@ -29,6 +29,20 @@ func Decode(b []byte) (Object, error) {
 	return o, nil
 }
 
+// DecodeValue parses any JSON value, keeping numbers as json.Number.
+func DecodeValue(b []byte) (any, error) {
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.UseNumber()
+	var v any
+	if err := d.Decode(&v); err != nil {
+		return nil, err
+	}
+	if d.More() {
+		return nil, fmt.Errorf("trailing data")
+	}
+	return v, nil
+}
+
 // Encode serialises without HTML escaping.
 func Encode(v any) []byte {
 	var buf bytes.Buffer

@@ -24,9 +24,10 @@ import (
 
 // Meta is request metadata that rules can match on.
 type Meta struct {
-	Source  string // X-Gatehouse-Source
-	Session string // X-Gatehouse-Session (optional; the turn key also hashes the messages)
-	Now     time.Time
+	Source    string // X-Gatehouse-Source
+	Session   string // X-Gatehouse-Session (optional; the turn key also hashes the messages)
+	DataClass string // request data class; confidential text never goes to an external classifier
+	Now       time.Time
 }
 
 // Decision is the routing outcome for one request.
@@ -45,7 +46,7 @@ type Decision struct {
 
 // PrepareFunc may rewrite text before it is sent to the classifier (redaction
 // when the classifier is an external model). An error aborts the request.
-type PrepareFunc func(text, target string) (string, error)
+type PrepareFunc func(text, target, dataClass string) (string, error)
 
 // Router routes requests.
 type Router struct {
@@ -110,7 +111,7 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 	g := r.cfg.RoutingGroups[name]
 	d.Group = name
 
-	key := turnKey(name, meta.Session, req)
+	key := turnKey(name, meta.Session+"\x00"+meta.Source, req)
 	r.mu.Lock()
 	r.gcLocked(meta.Now)
 	if e, ok := r.turns[key]; ok {
@@ -119,7 +120,7 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 		c.Requested = requested
 		c.Reason = "turn-cached: " + e.d.Reason
 		c.ClassifierModel, c.ClassifierUsage, c.ClassifierError = "", oai.Usage{}, ""
-		c.Candidates = r.expandWithRule(name, g, c.Rule)
+		c.Candidates = append([]string(nil), e.d.Candidates...)
 		return c, nil
 	}
 	r.mu.Unlock()
@@ -160,7 +161,7 @@ func (r *Router) Decide(ctx context.Context, req oai.Object, meta Meta) (Decisio
 		}
 		if ok && rule.Intent != "" {
 			if classified == -2 {
-				classified = r.classify(ctx, g, req, &d)
+				classified = r.classify(ctx, g, req, meta.DataClass, &d)
 			}
 			ok = classified == i
 			why = append(why, fmt.Sprintf("intent %q", rule.Intent))
@@ -316,7 +317,7 @@ var firstInt = regexp.MustCompile(`\d+`)
 // classify asks the group's classifier which intent the last user message
 // matches. It returns the rule index, or -1 when nothing matched or the
 // classifier failed or timed out (failure is not fatal: the group fallback applies).
-func (r *Router) classify(ctx context.Context, g *config.RoutingGroup, req oai.Object, d *Decision) int {
+func (r *Router) classify(ctx context.Context, g *config.RoutingGroup, req oai.Object, dataClass string, d *Decision) int {
 	var idx []int
 	var b strings.Builder
 	b.WriteString("你是请求路由分类器。判断用户最后一条消息属于下列哪一类意图，只回答类别编号；都不符合则回答 0。\n")
@@ -331,9 +332,13 @@ func (r *Router) classify(ctx context.Context, g *config.RoutingGroup, req oai.O
 		text = string(rs[:2000])
 	}
 	p, model, _ := r.reg.Lookup(g.Classifier)
+	if dataClass == "confidential" && p.Target != "local" {
+		d.ClassifierError = "skipped: confidential request and external classifier"
+		return -1
+	}
 	d.ClassifierModel = g.Classifier
 	if r.Prepare != nil {
-		t, err := r.Prepare(text, p.Target)
+		t, err := r.Prepare(text, p.Target, dataClass)
 		if err != nil {
 			d.ClassifierError = "skipped: " + err.Error()
 			return -1

@@ -1,6 +1,6 @@
 # G6 计量
 
-结果：**通过** · 运行于 2026-11-01 16:23:21 UTC · linux/amd64
+结果：**通过** · 运行于 2026-11-01 16:34:31 UTC · linux/amd64
 
 两把令牌在本地与外部模型上发请求（含一次外部宕机后的故障转移与一次分类器之外的直连），网关停止时冲刷 OTLP。用 `gatehouse report --format json` 的按令牌汇总与假 OTLP 收集器收到的累计值逐项核对。
 
@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 故障转移的请求也计量 | ✅ | model=local/small |
 | 收集器收到导出 | ✅ | 收到 1 次 OTLP 推送 |
-| 报表覆盖三把令牌 | ✅ | 令牌：map[tok_2fa20f67931a1c17:local tok_34af9e1d9270f773:alice tok_7198a8b8cacf9bd1:bob] |
+| 报表覆盖三把令牌 | ✅ | 令牌：map[tok_243f5b60f3675469:bob tok_2452cf125857e581:local tok_d121d200cb45c6b7:alice] |
 | 令牌 alice 汇总一致 | ✅ | requests 3/3 prompt 48/48 completion 87/87 cost 0.000792/0.000792 |
 | 令牌 bob 汇总一致 | ✅ | requests 4/4 prompt 22/22 completion 22/22 cost 0.000033/0.000033 |
 | 令牌 local 汇总一致 | ✅ | requests 1/1 prompt 7/7 completion 6/6 cost 0.000062/0.000062 |

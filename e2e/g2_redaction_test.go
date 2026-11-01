@@ -28,6 +28,7 @@ redaction:
   mode_by_target: { local: audit, external: mask }
   categories: { phone: mask, id_card: mask, bank_card: mask, term: mask, email: mask, secret: block }
   dictionary: {{DIR}}/words.txt
+  terms: [""]   # an empty inline term must be ignored, not loop forever
   never_mask: ["team@example.com"]
 `
 
@@ -82,6 +83,34 @@ func TestG2Redaction(t *testing.T) {
 	out2 := string(sent[len(sent)-1])
 	phone1 := firstOf(phs, "{{PHONE_")
 	rep.Check("跨回合同一值同一占位符", r2.Status == 200 && phone1 != "" && strings.Count(out2, phone1) >= 2, "%s 在第二回合出现 %d 次", phone1, strings.Count(out2, phone1))
+
+	// tool-call arguments in history: JSON-escaped values and numbers
+	hist := []any{
+		map[string]any{"role": "user", "content": "查一下客户"},
+		map[string]any{"role": "assistant", "content": "", "tool_calls": []any{map[string]any{"id": "t1", "type": "function",
+			"function": map[string]any{"name": "lookup", "arguments": `{"company":"\u661f\u8fb0\u79d1\u6280","phone":13812345678}`}}}},
+		map[string]any{"role": "tool", "tool_call_id": "t1", "content": "已找到"},
+	}
+	rh := g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": hist}, nil)
+	sent = cloud.Requests()
+	var outReq struct {
+		Messages []struct {
+			ToolCalls []struct {
+				Function struct{ Arguments string } `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"messages"`
+	}
+	json.Unmarshal(sent[len(sent)-1], &outReq)
+	histArgs := ""
+	for _, m := range outReq.Messages {
+		for _, tc := range m.ToolCalls {
+			histArgs = tc.Function.Arguments
+		}
+	}
+	var parsed map[string]any
+	rep.Check("历史工具参数按 JSON 解码后脱敏", rh.Status == 200 && json.Unmarshal([]byte(histArgs), &parsed) == nil &&
+		!strings.Contains(histArgs, "13812345678") && !strings.Contains(histArgs, `\u661f`) && strings.Contains(histArgs, "{{TERM_") && strings.Contains(histArgs, "{{PHONE_"),
+		"出站 arguments=%s", histArgs)
 
 	// local target in audit mode: unchanged, but counted
 	r3 := g.Chat(t, g.Token, map[string]any{"model": "local/small", "messages": msgs("user", g2Message)}, nil)

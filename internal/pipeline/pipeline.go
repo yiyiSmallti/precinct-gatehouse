@@ -169,7 +169,7 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 	if session == "" {
 		session = oai.Str(req, "user")
 	}
-	dec, err := p.Router.Decide(ctx, req, route.Meta{Source: st.rec.Source, Session: session, Now: time.Now()})
+	dec, err := p.Router.Decide(ctx, req, route.Meta{Source: st.rec.Source, Session: session, DataClass: dataClass, Now: time.Now()})
 	if err != nil {
 		var um route.ErrUnknownModel
 		if errors.As(err, &um) {

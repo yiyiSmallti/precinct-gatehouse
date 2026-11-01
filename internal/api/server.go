@@ -77,9 +77,9 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		return nil, err
 	}
 	rt := route.New(cfg, reg)
-	rt.Prepare = func(text, target string) (string, error) {
+	rt.Prepare = func(text, target, dataClass string) (string, error) {
 		// the classifier sees the last user message: redact it like any other outbound text
-		mode := red.Mode(target, "internal")
+		mode := red.Mode(target, dataClass)
 		req := oai.Object{"messages": []any{map[string]any{"role": "user", "content": text}}}
 		if _, err := red.Apply(context.Background(), req, mode, userKey, "classifier"); err != nil {
 			return "", err

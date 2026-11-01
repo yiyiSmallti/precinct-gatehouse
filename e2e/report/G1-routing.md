@@ -1,6 +1,6 @@
 # G1 个人模式路由
 
-结果：**通过** · 运行于 2026-11-01 16:23:19 UTC · linux/amd64
+结果：**通过** · 运行于 2026-11-01 16:34:29 UTC · linux/amd64
 
 两个假提供方：`local`（本地目标，托管分类器 small、备用 backup）与 `cloud`（外部目标，强模型 strong）。默认组 `order: [cloud/strong, local/backup]`，三条规则：闲聊意图 → local/small，估算 token > 3000 → cloud/strong，多步推理/长文意图 → cloud/strong。
 
@@ -15,6 +15,7 @@
 | 强模型宕机 → order 组切到备用 | ✅ | status=200 model=local/backup rule=reasoning |
 | 冷却期内跳过故障模型 | ✅ | model=local/backup，强模型在冷却期内收到请求 0 次 |
 | usage 组按用量分摊 | ✅ | 依次命中 local/a → local/b → local/a → local/b |
+| usage 组同一回合不换模型 | ✅ | local/a → local/a |
 | 本地目标流式透传 | ✅ | Content-Type=text/event-stream；客户端未要 usage，网关读取后丢弃 usage 块 |
 | 外部目标整条缓冲、对客户端仍是 SSE | ✅ | 上游请求 stream=<nil>，客户端收到 SSE |
 
@@ -33,6 +34,8 @@
 | pool | pool | - | no rule matched; group usage order | local/b | local/b:200 |
 | pool | pool | - | no rule matched; group usage order | local/a | local/a:200 |
 | pool | pool | - | no rule matched; group usage order | local/b | local/b:200 |
+| pool | pool | - | no rule matched; group usage order | local/a | local/a:200 |
+| pool | pool | - | turn-cached: no rule matched; group usage order | local/a | local/a:200 |
 | local/small | - | - | direct model | local/small | local/small:200 |
 | cloud/strong | - | - | direct model | cloud/strong | cloud/strong:200 |
 
