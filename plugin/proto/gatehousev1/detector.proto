@@ -1,0 +1,38 @@
+// Gatehouse plugin interface v1: Detector extension point.
+//
+// Plugins are separate executables started by Gatehouse and served over
+// gRPC with the hashicorp/go-plugin handshake (see plugin/handshake.go).
+// The other four extension points (AuthPolicy, AuditSink, Provider, Hooks)
+// are added to this package in the same major version.
+syntax = "proto3";
+
+package gatehouse.plugin.v1;
+
+option go_package = "github.com/yiyiSmallti/precinct-gatehouse/plugin/proto/gatehousev1";
+
+service Detector {
+  // Detect finds sensitive spans in one text. Gatehouse calls it once per
+  // text field in the redaction scope, with a per-call deadline.
+  rpc Detect(DetectRequest) returns (DetectResponse);
+}
+
+message DetectRequest {
+  string text = 1;
+  // BCP 47 hint such as "zh" or "en"; empty when unknown.
+  string lang = 2;
+  map<string, string> hints = 3;
+}
+
+message Finding {
+  // Upper-case category, e.g. PERSON, ADDRESS, ORG. Becomes the placeholder
+  // kind and, lower-cased, the key under redaction.categories.
+  string kind = 1;
+  // Unicode code point offsets into text; end is exclusive.
+  int32 start = 2;
+  int32 end = 3;
+  float confidence = 4;
+}
+
+message DetectResponse {
+  repeated Finding findings = 1;
+}
