@@ -62,3 +62,17 @@ func TestToolArgumentKeyPrefixFinding(t *testing.T) {
 		t.Fatalf("not masked: %s", args)
 	}
 }
+
+// A malformed tool_calls entry is rejected, not a panic.
+func TestMalformedToolCall(t *testing.T) {
+	e, err := New(config.Redaction{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := oai.Object{"messages": []any{map[string]any{"role": "assistant", "content": "", "tool_calls": []any{nil}}}}
+	_, err = e.Apply(context.Background(), req, ModeMask, []byte("k"), "v")
+	var re *Error
+	if !errors.As(err, &re) || re.Status != 400 {
+		t.Fatalf("want 400, got %v", err)
+	}
+}
