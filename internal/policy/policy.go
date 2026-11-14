@@ -70,7 +70,7 @@ func New(cfg *config.Config, name string, plug *plugin.Started) *Resolver {
 	return &Resolver{
 		name: name, plug: plug,
 		timeout: cfg.Org.PolicyTimeout.D(3 * time.Second),
-		maxAge:  cfg.Org.PolicyCache.D(60 * time.Second),
+		maxAge:  cfg.Org.PolicyCache.D(5 * time.Second),
 		cache:   map[[32]byte]entry{},
 	}
 }

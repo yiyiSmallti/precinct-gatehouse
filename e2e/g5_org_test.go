@@ -71,6 +71,7 @@ const g5Tokens = `{
   "tok-int":    {"tenant": "org_acme", "user": "u_li", "department": "市场部", "data_class": "internal", "allowed_groups": ["default", "ruled"], "models": ["plug/x"]},
   "tok-narrow": {"tenant": "org_acme", "user": "u_wang", "department": "财务部", "data_class": "internal", "allowed_groups": []},
   "tok-broke":  {"tenant": "org_acme", "user": "u_zhao", "department": "研发部", "data_class": "internal", "allowed_groups": ["default"], "tokens_remaining": 0},
+  "tok-leave":  {"tenant": "org_acme", "user": "u_sun", "department": "研发部", "data_class": "internal", "allowed_groups": ["default"]},
   "tok-deny":   {"action": "deny"},
   "tok-forbid": {"action": "forbid"},
   "tok-crash":  {"action": "crash"}
@@ -164,7 +165,28 @@ func TestG5OrgMode(t *testing.T) {
 	}
 	rep.Check("AuditSink 插件收到记录（与本地文件一致）", len(sunk) > 0 && len(sunk) <= len(fileRecs) && hasDept, "插件收到 %d 条，本地文件 %d 条", len(sunk), len(fileRecs))
 
-	// 9. the policy plugin dies -> every request 503, cached contexts included
+	// 9. a member leaves: the policy now refuses their token, and the gateway
+	// follows within seconds with no policy_cache in the config (the default)
+	r = g.Chat(t, "tok-leave", map[string]any{"model": "auto", "messages": msgs("user", "退出前")}, nil)
+	before := r.Status
+	revoked := strings.Replace(g5Tokens, `"tok-leave":  {`, `"tok-leave":  {"action": "deny", `, 1)
+	if err := os.WriteFile(filepath.Join(g.Dir, "tokens.json"), []byte(revoked), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const leaveLimit = 10 * time.Second
+	start := time.Now()
+	after := 0
+	for time.Since(start) < leaveLimit {
+		after = g.Chat(t, "tok-leave", map[string]any{"model": "auto", "messages": msgs("user", "退出后")}, nil).Status
+		if after == 401 {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	rep.Check(fmt.Sprintf("策略收回令牌后，网关在 %s 内拒绝（默认缓存）", leaveLimit), before == 200 && after == 401,
+		"收回前 status=%d；收回后 %.1f 秒时 status=%d", before, time.Since(start).Seconds(), after)
+
+	// 10. the policy plugin dies -> every request 503, cached contexts included
 	r = g.Chat(t, "tok-crash", map[string]any{"model": "auto", "messages": msgs("user", "hi")}, nil)
 	crash := r.Status
 	time.Sleep(300 * time.Millisecond)
@@ -175,7 +197,7 @@ func TestG5OrgMode(t *testing.T) {
 	hz := getJSON(t, strings.TrimSuffix(g.URL, "/v1")+"/healthz", "")
 	rep.Check("healthz 报告策略不可用", strings.Contains(hz, `"available":false`), "%s", hz)
 
-	// 10. policy plugin disabled at start -> 503 from the first request
+	// 11. policy plugin disabled at start -> 503 from the first request
 	g2 := startGateway(t, fmt.Sprintf(g5Config, local.URL, cloud.URL, false), map[string]string{"tokens.json": g5Tokens})
 	r = g2.Chat(t, "tok-int", map[string]any{"model": "auto", "messages": msgs("user", "hi")}, nil)
 	rep.Check("策略插件禁用 → 503", r.Status == 503 && errCode(r) == "policy_unavailable", "status=%d code=%s", r.Status, errCode(r))

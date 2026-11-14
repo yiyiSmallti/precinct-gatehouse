@@ -37,7 +37,7 @@ type Config struct {
 // Org configures org mode.
 type Org struct {
 	PolicyTimeout Duration `yaml:"policy_timeout"` // per Resolve call, default 3s
-	PolicyCache   Duration `yaml:"policy_cache"`   // max time a resolved context is reused, default 60s (never past its expiry)
+	PolicyCache   Duration `yaml:"policy_cache"`   // max time a resolved context is reused, default 5s (never past its expiry); also how long a revoked token keeps working
 }
 
 // Provider is one OpenAI-compatible upstream, or a provider plugin.
