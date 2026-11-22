@@ -96,6 +96,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/api/redaction", s.guard(s.redactionInfo))
 	s.mux.HandleFunc("POST /admin/api/redaction/try", s.guard(s.redactionTry))
 	s.mux.HandleFunc("GET /admin/api/config", s.guard(s.getConfig))
+	s.mux.HandleFunc("PUT /admin/api/config/sections", s.guard(s.putConfigSections))
 	s.mux.HandleFunc("PUT /admin/api/config/sections/{section}", s.guard(s.putConfigSection))
 	s.mux.HandleFunc("GET /admin/api/config/yaml", s.guard(s.getConfigYAML))
 	s.mux.HandleFunc("PUT /admin/api/config/yaml", s.guard(s.putConfigYAML))

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -403,5 +404,109 @@ func TestUnhealthyFallbackHonorsExclusions(t *testing.T) {
 	}
 	if largeHits.Load() != 1 || smallHits.Load() != 1 {
 		t.Fatalf("expected 1 attempt on large and 1 failover attempt on small, got large=%d small=%d", largeHits.Load(), smallHits.Load())
+	}
+}
+
+func TestStarterWarmupWithV1BaseURL(t *testing.T) {
+	var pathsMu sync.Mutex
+	var paths []string
+	var doubleV1Hits atomic.Int32
+	var warmHits atomic.Int32
+	var infoHits atomic.Int32
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathsMu.Lock()
+		paths = append(paths, r.URL.Path)
+		pathsMu.Unlock()
+		switch r.URL.Path {
+		case "/get_server_info":
+			infoHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		case "/v1/v1/chat/completions":
+			doubleV1Hits.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		case "/v1/chat/completions":
+			_, _ = io.Copy(io.Discard, r.Body)
+			if strings.Contains(r.Header.Get("User-Agent"), "warmer") {
+				warmHits.Add(1)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":2,"total_tokens":122,"prompt_tokens_details":{"cached_tokens":100}}}`))
+			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer up.Close()
+
+	hub := NewHub(t.TempDir(), nil)
+	defer func() { _ = hub.Close() }()
+
+	f := false
+	tc := config.TieredConfig{
+		Mode:               "active",
+		HeavyMissThreshold: 24000,
+		HealthIntervalSec:  60,
+		ZhThinkAnchor:      &f,
+		StarterCache: &config.TieredStarterCache{
+			Enabled:          true,
+			MinTokens:        16,
+			MaxTokens:        100000,
+			MinHits:          1,
+			CheckIntervalSec: 600,
+			StartupDelaySec:  600,
+		},
+		Backends: []config.TieredBackend{
+			{ID: "b1", URL: up.URL + "/v1", Tier: 1, MaxContextTokens: 64000, MaxSafeInput: 50000, PromoteAt: 50000, SpeedScore: 100},
+		},
+	}
+
+	tr, err := hub.Transport("p", "local", &tc, nil)
+	if err != nil {
+		t.Fatalf("Transport: %v", err)
+	}
+	hub.Activate(&config.Config{Providers: []config.Provider{{Name: "p", Target: "local", Tiered: &tc}}})
+
+	// Populate starter cache via a normal active chat request.
+	sys := strings.Repeat("Reusable system prompt context for v1 normalization test. ", 8)
+	payload, _ := json.Marshal(map[string]any{
+		"model": "m1",
+		"messages": []map[string]any{
+			{"role": "system", "content": sys},
+			{"role": "user", "content": "hi"},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	r, ok := hub.Router("p")
+	if !ok {
+		t.Fatal("missing router p")
+	}
+	starters := r.Starters()
+	if len(starters) != 1 {
+		t.Fatalf("expected 1 starter captured, got %d", len(starters))
+	}
+	warmRes, err := r.WarmStarter(starters[0].Hash, true)
+	if err != nil || len(warmRes) != 1 || warmRes[0].Error != "" {
+		t.Fatalf("expected starter warmup to succeed, got err=%v res=%+v", err, warmRes)
+	}
+	if doubleV1Hits.Load() != 0 {
+		t.Fatalf("expected 0 hits to /v1/v1/chat/completions, got %d", doubleV1Hits.Load())
+	}
+	if infoHits.Load() < 1 || warmHits.Load() != 1 {
+		pathsMu.Lock()
+		seen := append([]string(nil), paths...)
+		pathsMu.Unlock()
+		t.Fatalf("expected /get_server_info >=1 and warmup /v1/chat/completions == 1, got info=%d warm=%d paths=%v", infoHits.Load(), warmHits.Load(), seen)
 	}
 }

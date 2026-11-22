@@ -169,9 +169,12 @@ export const store = {
     const order = this.orderedDirtySections();
     this.problems = [];
     this.buildError = '';
+    if (!order.length) return true;
+    const sections = {};
     for (const sec of order) {
-      await api.validateConfig({ section: sec, data: this.drafts[sec] });
+      sections[sec] = this.drafts[sec];
     }
+    await api.validateConfig({ sections });
     return true;
   },
 
@@ -184,18 +187,19 @@ export const store = {
     this.buildError = '';
     this.notify();
     try {
-      let lastRes = null;
-      let hash = this.baseHash || this.server?.hash || '';
+      const hash = this.baseHash || this.server?.hash || '';
+      const sections = {};
       for (const sec of order) {
-        const res = await api.putSection(sec, hash, this.drafts[sec]);
-        lastRes = res;
-        delete this.drafts[sec];
-        const fresh = await api.getConfig();
-        this.server = fresh;
-        this.latestServer = fresh;
-        hash = fresh?.hash || '';
-        this.baseHash = hash;
+        sections[sec] = this.drafts[sec];
       }
+      const lastRes = await api.putSections(hash, sections);
+      for (const sec of order) {
+        delete this.drafts[sec];
+      }
+      const fresh = await api.getConfig();
+      this.server = fresh;
+      this.latestServer = fresh;
+      this.baseHash = fresh?.hash || '';
       const rr = lastRes?.restart_required || this.server?.restart_required || [];
       if (rr.length) {
         toast(`配置已热重载生效（v${this.server?.version || ''}），部分启动项需重启: ${rr.join(', ')}`, 'warn', 5500);

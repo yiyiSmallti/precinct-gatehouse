@@ -34,17 +34,69 @@ function meterRow(label, used, limit) {
   );
 }
 
-function modelAndGroupSuggestions() {
-  const raw = store.server?.raw || {};
+function effectiveRaw() {
+  const base = store.server?.raw || {};
+  const routing = store.getSection('routing') || {};
+  return {
+    ...base,
+    providers: store.getSection('providers') || base.providers || [],
+    default_group: routing.default_group ?? base.default_group ?? '',
+    routing_groups: routing.routing_groups ?? base.routing_groups ?? {},
+    model_aliases: store.getSection('aliases') || base.model_aliases || [],
+  };
+}
+
+export function modelAndGroupSuggestions(rawOverride = null) {
+  const raw = rawOverride || effectiveRaw();
   const models = [];
   (raw.providers || []).forEach((p) => {
     (p.models || []).forEach((m) => models.push(`${p.name}/${m}`));
   });
-  (raw.model_aliases || []).forEach((a) => {
-    if (a.match) models.push(a.match);
-  });
   const groups = Object.keys(raw.routing_groups || {});
   return { models: Array.from(new Set(models)), groups };
+}
+
+function globMatch(pattern, value) {
+  if (!pattern) return false;
+  if (pattern === value) return true;
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  const reStr = '^' + escaped.replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]') + '$';
+  try {
+    return new RegExp(reStr).test(value);
+  } catch {
+    return false;
+  }
+}
+
+export function normalizeKeyScopes(models, groups, raw = {}) {
+  const aliases = raw.model_aliases || [];
+  const routingGroups = raw.routing_groups || {};
+  const defaultGroup = raw.default_group || '';
+  const resolveAlias = (name) => {
+    for (const a of aliases) {
+      if (!a || !a.match || !a.use) continue;
+      if (a.match === name || globMatch(a.match, name)) return a.use;
+    }
+    return name;
+  };
+  const outModels = [];
+  const outGroups = (groups || []).map((g) => String(g || '').trim()).filter(Boolean);
+  for (const rawModel of models || []) {
+    const m = String(rawModel || '').trim();
+    if (!m) continue;
+    const target = resolveAlias(m);
+    if (target === 'auto' && defaultGroup) {
+      outGroups.push(defaultGroup);
+    } else if (Object.prototype.hasOwnProperty.call(routingGroups, target)) {
+      outGroups.push(target);
+    } else {
+      outModels.push(target);
+    }
+  }
+  return {
+    models: Array.from(new Set(outModels)),
+    groups: Array.from(new Set(outGroups)),
+  };
 }
 
 function showSecretModal(plainKey, keyInfo) {
@@ -146,10 +198,11 @@ export function renderKeys(container) {
         const ms = Date.parse(expIn.value);
         if (!Number.isNaN(ms)) expiresAt = Math.floor(ms / 1000);
       }
+      const scoped = normalizeKeyScopes(formState.models, formState.groups, effectiveRaw());
       const payload = {
         name,
-        models: formState.models,
-        groups: formState.groups,
+        models: scoped.models,
+        groups: scoped.groups,
         rpm: Math.max(0, Number(rpmIn.value || 0)),
         rpd: Math.max(0, Number(rpdIn.value || 0)),
         concurrency: Math.max(0, Number(concIn.value || 0)),
@@ -192,7 +245,7 @@ export function renderKeys(container) {
           el('label', { className: 'field-label' }, '允许模型（留空不限制）'),
           createTagInput({
             values: formState.models,
-            placeholder: '输入模型标识或通配符，回车添加',
+            placeholder: '选择或输入 provider/model，回车添加',
             suggestions: sug.models,
             onChange: (vals) => { formState.models = vals; },
           })

@@ -154,6 +154,81 @@ func (s *Server) writeApplyErr(w http.ResponseWriter, err error) {
 	writeJSONError(w, http.StatusInternalServerError, err.Error())
 }
 
+func applySectionsMapToRaw(raw *config.Config, sections map[string]json.RawMessage) ([]string, error) {
+	if len(sections) == 0 {
+		return nil, errors.New("sections is required")
+	}
+	order := []string{"providers", "routing", "aliases", "redaction", "general"}
+	seen := make(map[string]bool, len(order))
+	applied := make([]string, 0, len(sections))
+	for _, sec := range order {
+		seen[sec] = true
+		data, ok := sections[sec]
+		if !ok {
+			continue
+		}
+		if err := applySectionToRaw(raw, sec, data); err != nil {
+			return nil, err
+		}
+		applied = append(applied, sec)
+	}
+	var extra []string
+	for sec := range sections {
+		if !seen[sec] {
+			extra = append(extra, sec)
+		}
+	}
+	sort.Strings(extra)
+	for _, sec := range extra {
+		if err := applySectionToRaw(raw, sec, sections[sec]); err != nil {
+			return nil, err
+		}
+	}
+	return applied, nil
+}
+
+func (s *Server) putConfigSections(w http.ResponseWriter, r *http.Request, _ string) {
+	var req struct {
+		BaseHash string                     `json:"base_hash"`
+		Sections map[string]json.RawMessage `json:"sections"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":    "invalid_config",
+			"problems": []string{err.Error()},
+		})
+		return
+	}
+	st := s.deps.Live.Status()
+	if req.BaseHash != st.Hash {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":        "conflict",
+			"current_hash": st.Hash,
+		})
+		return
+	}
+	raw := st.Snapshot.Cfg.RawCopy()
+	applied, err := applySectionsMapToRaw(raw, req.Sections)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":    "invalid_config",
+			"problems": []string{err.Error()},
+		})
+		return
+	}
+	yamlBytes, err := config.MarshalRaw(raw)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	res, err := s.deps.Live.Apply(yamlBytes, "web:"+strings.Join(applied, ","), req.BaseHash)
+	if err != nil {
+		s.writeApplyErr(w, err)
+		return
+	}
+	s.writeApplyOK(w, res)
+}
+
 func (s *Server) putConfigSection(w http.ResponseWriter, r *http.Request, _ string) {
 	section := r.PathValue("section")
 	var req struct {
@@ -226,9 +301,10 @@ func (s *Server) putConfigYAML(w http.ResponseWriter, r *http.Request, _ string)
 
 func (s *Server) validateConfig(w http.ResponseWriter, r *http.Request, _ string) {
 	var req struct {
-		YAML    *string         `json:"yaml"`
-		Section string          `json:"section"`
-		Data    json.RawMessage `json:"data"`
+		YAML     *string                    `json:"yaml"`
+		Section  string                     `json:"section"`
+		Data     json.RawMessage            `json:"data"`
+		Sections map[string]json.RawMessage `json:"sections"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -241,6 +317,21 @@ func (s *Server) validateConfig(w http.ResponseWriter, r *http.Request, _ string
 	var yamlBytes []byte
 	if req.YAML != nil {
 		yamlBytes = []byte(*req.YAML)
+	} else if len(req.Sections) > 0 {
+		raw := st.Snapshot.Cfg.RawCopy()
+		if _, err := applySectionsMapToRaw(raw, req.Sections); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error":    "invalid_config",
+				"problems": []string{err.Error()},
+			})
+			return
+		}
+		var err error
+		yamlBytes, err = config.MarshalRaw(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	} else if req.Section != "" {
 		raw := st.Snapshot.Cfg.RawCopy()
 		if err := applySectionToRaw(raw, req.Section, req.Data); err != nil {

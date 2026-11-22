@@ -83,11 +83,13 @@ type cacheEntry struct {
 
 // Store persists API keys in SQLite and caches active lookups briefly in memory.
 type Store struct {
-	db      *sql.DB
-	now     func() time.Time
-	cacheMu sync.RWMutex
-	cache   map[string]cacheEntry
-	dataVer int64
+	db                  *sql.DB
+	now                 func() time.Time
+	cacheMu             sync.RWMutex
+	cache               map[string]cacheEntry
+	dataVer             int64
+	localGen            uint64
+	testAfterLookupScan func()
 
 	touchMu   sync.Mutex
 	lastTouch map[string]int64
@@ -133,6 +135,7 @@ func (s *Store) touchLoop() {
 func (s *Store) clearCache() {
 	s.cacheMu.Lock()
 	clear(s.cache)
+	s.localGen++
 	s.cacheMu.Unlock()
 }
 
@@ -227,17 +230,21 @@ func (s *Store) Lookup(plain string) (Key, error) {
 	now := s.now()
 
 	var dv int64
+	dvOK := false
 	if err := s.db.QueryRow(`PRAGMA data_version`).Scan(&dv); err == nil {
+		dvOK = true
 		s.cacheMu.Lock()
 		if dv != s.dataVer {
 			clear(s.cache)
 			s.dataVer = dv
+			s.localGen++
 		}
 		s.cacheMu.Unlock()
 	}
 
 	s.cacheMu.RLock()
 	ce, ok := s.cache[h]
+	gen := s.localGen
 	s.cacheMu.RUnlock()
 
 	var k Key
@@ -254,8 +261,11 @@ func (s *Store) Lookup(plain string) (Key, error) {
 		if err != nil {
 			return Key{}, err
 		}
+		if s.testAfterLookupScan != nil {
+			s.testAfterLookupScan()
+		}
 		s.cacheMu.Lock()
-		if dv == s.dataVer {
+		if dvOK && dv == s.dataVer && gen == s.localGen {
 			s.cache[h] = cacheEntry{key: k, expires: now.Add(cacheTTL)}
 		}
 		s.cacheMu.Unlock()

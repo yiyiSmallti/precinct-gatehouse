@@ -337,10 +337,31 @@ func targetChatURL(target *url.URL, reqURL *url.URL) string {
 		}
 	} else {
 		base := strings.TrimRight(target.Path, "/")
-		u.Path = base + reqURL.Path
+		if strings.HasSuffix(base, "/v1") && (reqURL.Path == "/v1" || strings.HasPrefix(reqURL.Path, "/v1/")) {
+			u.Path = base + strings.TrimPrefix(reqURL.Path, "/v1")
+		} else {
+			u.Path = base + reqURL.Path
+		}
 	}
-	u.RawQuery = reqURL.RawQuery
+	if reqURL.RawQuery != "" {
+		u.RawQuery = reqURL.RawQuery
+	}
 	return u.String()
+}
+
+func backendChatCompletionsURL(target *url.URL, rawURL string) string {
+	if target == nil {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			base := strings.TrimRight(rawURL, "/")
+			if strings.HasSuffix(base, "/v1") {
+				return base + "/chat/completions"
+			}
+			return base + "/v1/chat/completions"
+		}
+		target = u
+	}
+	return targetChatURL(target, &url.URL{Path: "/v1/chat/completions"})
 }
 
 func syntheticJSONResp(req *http.Request, status int, body string) *http.Response {

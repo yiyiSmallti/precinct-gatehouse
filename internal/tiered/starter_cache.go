@@ -1046,7 +1046,7 @@ func (sc *StarterCache) WarmDue(force bool, onlyHash string) []WarmResult {
 
 func (sc *StarterCache) warmOne(entry *StarterEntry, backend *BackendState) WarmResult {
 	start := time.Now()
-	bCfg := backend.config()
+	bCfg, bTarget := backend.snapshot()
 	routerTarget := sc.router.getTarget()
 	if routerTarget != "local" && normalizeOriginTarget(entry.OriginTarget) != "external" {
 		sc.mu.Lock()
@@ -1083,7 +1083,7 @@ func (sc *StarterCache) warmOne(entry *StarterEntry, backend *BackendState) Warm
 		payload = filtered
 	}
 
-	targetURL := strings.TrimRight(bCfg.URL, "/") + "/v1/chat/completions"
+	targetURL := backendChatCompletionsURL(bTarget, bCfg.URL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(payload))
 	if err != nil {
 		sc.totalWarmFails.Add(1)

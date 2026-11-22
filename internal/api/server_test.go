@@ -665,3 +665,85 @@ redaction:
 		t.Fatalf("expected 0 upstream requests when warm-up blocked by redaction, got %d", reqCount.Load()-beforeReqs)
 	}
 }
+
+func TestAnthropicCountTokensIncludesTools(t *testing.T) {
+	dir := t.TempDir()
+	raw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    base_url: http://127.0.0.1:18080/v1
+    models: [m1]
+`, dir)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(raw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	countFor := func(payload map[string]any) int {
+		t.Helper()
+		b, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/messages/count_tokens", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", tok)
+		rec := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("count_tokens status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			InputTokens int `json:"input_tokens"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.InputTokens
+	}
+
+	plainTokens := countFor(map[string]any{
+		"model":    "claude-3-7-sonnet",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+
+	longDesc := strings.Repeat("Detailed tool schema description for context budgeting. ", 80) // ~4.4 KB
+	toolTokens := countFor(map[string]any{
+		"model":    "claude-3-7-sonnet",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		"tools": []map[string]any{{
+			"name":        "search_records",
+			"description": longDesc,
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query": map[string]any{"type": "string", "description": "search string"},
+				},
+				"required": []string{"query"},
+			},
+		}},
+	})
+
+	if toolTokens-plainTokens < 900 {
+		t.Fatalf("expected tool schema (~4.4KB) to add >=900 tokens, got plain=%d withTools=%d (diff=%d)",
+			plainTokens, toolTokens, toolTokens-plainTokens)
+	}
+}

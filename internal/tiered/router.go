@@ -477,7 +477,8 @@ func probeBackends(backends []*BackendState, apiKey string, client *http.Client,
 			defer wg.Done()
 			prevHealthy := b.healthy.Load()
 			bCfg := b.config()
-			req, err := http.NewRequest(http.MethodGet, strings.TrimRight(bCfg.URL, "/")+"/get_server_info", nil)
+			probeBase := strings.TrimSuffix(strings.TrimRight(bCfg.URL, "/"), "/v1")
+			req, err := http.NewRequest(http.MethodGet, probeBase+"/get_server_info", nil)
 			var resp *http.Response
 			if err == nil {
 				if apiKey != "" {

@@ -348,3 +348,100 @@ providers:
 		t.Fatalf("expected external on-disk edit to remain intact on conflict")
 	}
 }
+
+func TestBatchConfigSectionsInterdependentRename(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := SetPassword(db, "admin", "password-123"); err != nil {
+		t.Fatal(err)
+	}
+
+	initialYAML := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    base_url: http://127.0.0.1:18080/v1
+    models: [m1]
+default_group: main
+routing_groups:
+  main:
+    members: [p/m1]
+model_aliases:
+  - match: friendly
+    use: main
+`, dir)
+
+	mgr, _ := newTestLiveManager(t, dir, initialYAML, nil)
+	srv := New(Deps{DB: db, Live: mgr})
+
+	reqLogin, _ := http.NewRequest(http.MethodPost, "/admin/api/login", bytes.NewReader([]byte(`{"username":"admin","password":"password-123"}`)))
+	reqLogin.Header.Set("Content-Type", "application/json")
+	recLogin := httptest.NewRecorder()
+	srv.ServeHTTP(recLogin, reqLogin)
+	var tok string
+	for _, c := range recLogin.Result().Cookies() {
+		if c.Name == cookieName {
+			tok = c.Value
+		}
+	}
+	if tok == "" {
+		t.Fatal("missing admin cookie")
+	}
+
+	baseHash := mgr.Current().Cfg.Hash()
+	sections := map[string]any{
+		"routing": map[string]any{
+			"default_group": "primary",
+			"routing_groups": map[string]any{
+				"primary": map[string]any{
+					"members": []string{"p/m1"},
+				},
+			},
+		},
+		"aliases": []map[string]any{
+			{
+				"match": "friendly",
+				"use":   "primary",
+			},
+		},
+	}
+
+	valBody, _ := json.Marshal(map[string]any{"sections": sections})
+	reqVal, _ := http.NewRequest(http.MethodPost, "/admin/api/config/validate", bytes.NewReader(valBody))
+	reqVal.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
+	reqVal.Header.Set("X-Gatehouse-Admin", "1")
+	reqVal.Header.Set("Content-Type", "application/json")
+	recVal := httptest.NewRecorder()
+	srv.ServeHTTP(recVal, reqVal)
+	if recVal.Code != http.StatusOK {
+		t.Fatalf("expected validate sections 200 OK, got %d (%s)", recVal.Code, recVal.Body.String())
+	}
+
+	putBody, _ := json.Marshal(map[string]any{
+		"base_hash": baseHash,
+		"sections":  sections,
+	})
+	reqPut, _ := http.NewRequest(http.MethodPut, "/admin/api/config/sections", bytes.NewReader(putBody))
+	reqPut.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
+	reqPut.Header.Set("X-Gatehouse-Admin", "1")
+	reqPut.Header.Set("Content-Type", "application/json")
+	recPut := httptest.NewRecorder()
+	srv.ServeHTTP(recPut, reqPut)
+	if recPut.Code != http.StatusOK {
+		t.Fatalf("expected PUT /admin/api/config/sections 200 OK, got %d (%s)", recPut.Code, recPut.Body.String())
+	}
+
+	cur := mgr.Current().Cfg
+	if cur.DefaultGroup != "primary" || cur.RoutingGroups["primary"] == nil || cur.RoutingGroups["main"] != nil {
+		t.Fatalf("expected routing group renamed main -> primary, got default=%q groups=%v", cur.DefaultGroup, cur.RoutingGroups)
+	}
+	if len(cur.ModelAliases) != 1 || cur.ModelAliases[0].Match != "friendly" || cur.ModelAliases[0].Use != "primary" {
+		t.Fatalf("expected alias friendly -> primary, got %+v", cur.ModelAliases)
+	}
+}

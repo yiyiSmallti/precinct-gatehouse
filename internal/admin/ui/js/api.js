@@ -89,6 +89,11 @@ export const api = {
   redactionTry: (data) => request('POST', '/admin/api/redaction/try', data),
 
   getConfig: () => request('GET', '/admin/api/config'),
+  putSections: (baseHash, sections) =>
+    request('PUT', '/admin/api/config/sections', {
+      base_hash: baseHash,
+      sections,
+    }),
   putSection: (section, baseHash, data) =>
     request('PUT', `/admin/api/config/sections/${encodeURIComponent(section)}`, {
       base_hash: baseHash,
