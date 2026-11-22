@@ -192,9 +192,7 @@ Next steps:
 			DB:               srv.DB,
 			Keys:             srv.Keys,
 			Limiter:          srv.Limiter,
-			Reg:              srv.Reg,
-			Cfg:              cfg,
-			Redactor:         srv.Redactor,
+			Live:             srv.Live,
 			MissingDetectors: srv.Missing,
 			UserKey:          srv.UserKey,
 			SessionTTL:       cfg.Admin.SessionTTL.D(12 * time.Hour),
@@ -218,15 +216,33 @@ Next steps:
 	go func() { errc <- srv.HTTP.Serve(ln) }()
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	select {
-	case <-sig:
-	case err := <-errc:
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			if admSrv != nil {
-				_ = admSrv.Shutdown(context.Background())
+	hup := notifyReload()
+	if hup != nil {
+		defer signal.Stop(hup)
+	}
+loop:
+	for {
+		select {
+		case <-sig:
+			break loop
+		case <-hup:
+			res, changed, rerr := srv.Live.ReloadFromDisk("signal")
+			if rerr != nil {
+				log.Error("SIGHUP reload failed", "err", rerr)
+			} else if changed {
+				log.Info("config reloaded via SIGHUP", "version", res.Version, "restart_required", res.RestartRequired)
+			} else {
+				log.Info("SIGHUP received, config unchanged", "version", res.Version)
 			}
-			srv.Shutdown(context.Background())
-			return err
+		case err := <-errc:
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				if admSrv != nil {
+					_ = admSrv.Shutdown(context.Background())
+				}
+				srv.Shutdown(context.Background())
+				return err
+			}
+			break loop
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -357,9 +373,25 @@ func configCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	var dbCloser func()
+	resolve := keystore.Resolve
+	for _, p := range cfg.Providers {
+		if strings.HasPrefix(p.KeyRef, "db:") {
+			db, derr := store.Open(cfg.DataDir)
+			if derr != nil {
+				return derr
+			}
+			dbCloser = func() { db.Close() }
+			resolve = func(ref string) (string, error) { return api.ResolveKey(db, ref) }
+			break
+		}
+	}
+	if dbCloser != nil {
+		defer dbCloser()
+	}
 	var problems []string
 	for _, p := range cfg.Providers {
-		if _, err := keystore.Resolve(p.KeyRef); err != nil {
+		if _, err := resolve(p.KeyRef); err != nil {
 			problems = append(problems, fmt.Sprintf("providers.%s.key_ref: %v", p.Name, err))
 		}
 	}

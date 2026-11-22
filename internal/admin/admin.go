@@ -18,8 +18,8 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/limit"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/live"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
-	"github.com/yiyiSmallti/precinct-gatehouse/internal/provider"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact/rules"
 )
@@ -32,9 +32,7 @@ type Deps struct {
 	DB               *sql.DB
 	Keys             *keys.Store
 	Limiter          *limit.Limiter
-	Reg              *provider.Registry
-	Cfg              *config.Config
-	Redactor         *redact.Engine
+	Live             *live.Manager
 	MissingDetectors []string
 	UserKey          []byte
 	SessionTTL       time.Duration
@@ -658,7 +656,8 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (s *Server) channels(w http.ResponseWriter, _ *http.Request, _ string) {
-	cfg := s.deps.Cfg
+	snap := s.deps.Live.Current()
+	cfg := snap.Cfg
 	type modelHealth struct {
 		Name    string `json:"name"`
 		Ref     string `json:"ref"`
@@ -681,7 +680,7 @@ func (s *Server) channels(w http.ResponseWriter, _ *http.Request, _ string) {
 			ms = append(ms, modelHealth{
 				Name:    m,
 				Ref:     ref,
-				Healthy: s.deps.Reg == nil || s.deps.Reg.Healthy(ref),
+				Healthy: snap.Reg == nil || snap.Reg.Healthy(ref),
 			})
 		}
 		base := p.BaseURL
@@ -778,24 +777,25 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": msg})
 }
 
-func (s *Server) redactionMode(target, class string) string {
-	if s.deps.Redactor != nil {
-		return s.deps.Redactor.Mode(target, class)
+func redactionMode(snap *live.Snapshot, target, class string) string {
+	if snap.Redactor != nil {
+		return snap.Redactor.Mode(target, class)
 	}
 	if class == "confidential" && target == "external" {
 		return redact.ModeBlock
 	}
-	if m := s.deps.Cfg.Redaction.ModeByTarget[target]; m != "" {
+	if m := snap.Cfg.Redaction.ModeByTarget[target]; m != "" {
 		return m
 	}
 	return redact.ModeMask
 }
 
 func (s *Server) redactionInfo(w http.ResponseWriter, _ *http.Request, _ string) {
-	rc := s.deps.Cfg.Redaction
+	snap := s.deps.Live.Current()
+	rc := snap.Cfg.Redaction
 	modeByTarget := map[string]string{
-		"local":    s.redactionMode("local", "internal"),
-		"external": s.redactionMode("external", "internal"),
+		"local":    redactionMode(snap, "local", "internal"),
+		"external": redactionMode(snap, "external", "internal"),
 	}
 	for k, v := range rc.ModeByTarget {
 		modeByTarget[k] = v
@@ -807,7 +807,7 @@ func (s *Server) redactionInfo(w http.ResponseWriter, _ *http.Request, _ string)
 	for _, tgt := range targets {
 		row := map[string]string{}
 		for _, cl := range classes {
-			row[cl] = s.redactionMode(tgt, cl)
+			row[cl] = redactionMode(snap, tgt, cl)
 		}
 		matrix[tgt] = row
 	}
@@ -907,12 +907,12 @@ func (s *Server) redactionInfo(w http.ResponseWriter, _ *http.Request, _ string)
 		Target        string `json:"target"`
 		EffectiveMode string `json:"effective_mode"`
 	}
-	provs := make([]provMode, 0, len(s.deps.Cfg.Providers))
-	for _, p := range s.deps.Cfg.Providers {
+	provs := make([]provMode, 0, len(snap.Cfg.Providers))
+	for _, p := range snap.Cfg.Providers {
 		provs = append(provs, provMode{
 			Name:          p.Name,
 			Target:        p.Target,
-			EffectiveMode: s.redactionMode(p.Target, "internal"),
+			EffectiveMode: redactionMode(snap, p.Target, "internal"),
 		})
 	}
 
@@ -961,7 +961,8 @@ func (s *Server) redactionInfo(w http.ResponseWriter, _ *http.Request, _ string)
 }
 
 func (s *Server) redactionTry(w http.ResponseWriter, r *http.Request, _ string) {
-	if s.deps.Redactor == nil {
+	snap := s.deps.Live.Current()
+	if snap.Redactor == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "redactor unavailable")
 		return
 	}
@@ -993,9 +994,9 @@ func (s *Server) redactionTry(w http.ResponseWriter, r *http.Request, _ string) 
 		return
 	}
 
-	mode := s.deps.Redactor.Mode(req.Target, req.DataClass)
+	mode := snap.Redactor.Mode(req.Target, req.DataClass)
 	oaiReq := oai.Object{"messages": []any{map[string]any{"role": "user", "content": req.Text}}}
-	res, aerr := s.deps.Redactor.Apply(r.Context(), oaiReq, mode, s.deps.UserKey, "admin-try")
+	res, aerr := snap.Redactor.Apply(r.Context(), oaiReq, mode, s.deps.UserKey, "admin-try")
 	outText := ""
 	errMsg := ""
 	if aerr != nil {

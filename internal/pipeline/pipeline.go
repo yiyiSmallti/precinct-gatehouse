@@ -31,9 +31,9 @@ import (
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
-	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/limit"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/live"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/meter"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/policy"
@@ -53,19 +53,16 @@ const (
 
 // Pipeline holds the shared components.
 type Pipeline struct {
-	Cfg      *config.Config
-	Tokens   *token.Issuer
-	Keys     *keys.Store
-	Limiter  *limit.Limiter
-	Meter    *meter.Meter
-	Router   *route.Router
-	Reg      *provider.Registry
-	Redactor *redact.Engine
-	Audit    audit.Sink
-	UserKey  []byte // personal mode: the single local user's placeholder key; org mode: derivation key
-	Log      *slog.Logger
-	Policy   *policy.Resolver // org mode only
-	Hooks    []Hook           // OnRequest/OnResponse plugins, in config order
+	Live    *live.Manager
+	Tokens  *token.Issuer
+	Keys    *keys.Store
+	Limiter *limit.Limiter
+	Meter   *meter.Meter
+	Audit   audit.Sink
+	UserKey []byte // personal mode: the single local user's placeholder key; org mode: derivation key
+	Log     *slog.Logger
+	Policy  *policy.Resolver // org mode only
+	Hooks   []Hook           // OnRequest/OnResponse plugins, in config order
 }
 
 type principal struct {
@@ -79,6 +76,7 @@ type principal struct {
 type reqState struct {
 	id           string
 	start        time.Time
+	snap         *live.Snapshot
 	protocol     string
 	decode       func([]byte) (oai.Object, error)
 	principal    principal
@@ -106,7 +104,7 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 	if decode == nil {
 		decode = oai.Decode
 	}
-	st := &reqState{id: newID(), start: time.Now(), protocol: protocol, decode: decode, w: w}
+	st := &reqState{id: newID(), start: time.Now(), snap: p.Live.Current(), protocol: protocol, decode: decode, w: w}
 	st.rec = audit.Record{Time: st.start, RequestID: st.id, Source: r.Header.Get(HeaderSource)}
 	w.Header().Set("X-Gatehouse-Request-Id", st.id)
 	err := p.handle(r.Context(), st, r)
@@ -239,10 +237,10 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 	requested := oai.Str(req, "model")
 
 	// policy (personal mode): token scope, budget, data class
-	isGroup := p.Router.IsGroup(requested)
+	isGroup := st.snap.Router.IsGroup(requested)
 	scopeName := requested
 	if isGroup {
-		scopeName = p.Router.ResolveGroupName(requested)
+		scopeName = st.snap.Router.ResolveGroupName(requested)
 	}
 	if !st.principal.Scope.AllowsModel(scopeName, isGroup) {
 		return oai.Errorf(http.StatusForbidden, "model_not_allowed", "token %s may not use %q", st.principal.Name, requested)
@@ -294,8 +292,8 @@ func (p *Pipeline) handleOrg(ctx context.Context, st *reqState, r *http.Request,
 	}
 	requested := oai.Str(req, "model")
 	group := ""
-	if p.Router.IsGroup(requested) {
-		group = p.Router.ResolveGroupName(requested)
+	if st.snap.Router.IsGroup(requested) {
+		group = st.snap.Router.ResolveGroupName(requested)
 	}
 	pc, err := p.Policy.Resolve(ctx, tok, &sdk.RequestMeta{Model: requested, RouteGroup: group, ClientIp: clientIP(r), RequestId: st.id, Source: st.rec.Source})
 	if err != nil {
@@ -311,7 +309,7 @@ func (p *Pipeline) handleOrg(ctx context.Context, st *reqState, r *http.Request,
 	st.rec.Tenant, st.rec.User, st.rec.Department = pc.Tenant, pc.User, pc.Department
 	st.rec.OnBehalfOf, st.rec.InstanceID, st.rec.WorkspaceID, st.rec.PolicyVersion = pc.OnBehalfOf, pc.InstanceID, pc.WorkspaceID, pc.PolicyVersion
 
-	allowed := p.orgAllowed(pc)
+	allowed := p.orgAllowed(st.snap, pc)
 	if group != "" {
 		if !contains(pc.AllowedGroups, group) {
 			return oai.Errorf(http.StatusForbidden, "model_not_allowed", "policy does not allow group %q for %s", group, pc.User)
@@ -342,10 +340,10 @@ func (p *Pipeline) handleOrg(ctx context.Context, st *reqState, r *http.Request,
 
 // orgAllowed lists the provider/model refs a policy context may reach: the
 // members of its allowed groups plus its direct model allowlist.
-func (p *Pipeline) orgAllowed(pc *policy.Context) map[string]bool {
+func (p *Pipeline) orgAllowed(snap *live.Snapshot, pc *policy.Context) map[string]bool {
 	out := map[string]bool{}
 	for _, g := range pc.AllowedGroups {
-		for _, m := range p.Router.Members(g) {
+		for _, m := range snap.Router.Members(g) {
 			out[m] = true
 		}
 	}
@@ -357,7 +355,7 @@ func (p *Pipeline) orgAllowed(pc *policy.Context) map[string]bool {
 
 func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error) {
 	rc := r.Body
-	if maxBytes := p.Cfg.MaxBodyBytes(); maxBytes > 0 {
+	if maxBytes := st.snap.Cfg.MaxBodyBytes(); maxBytes > 0 {
 		rc = http.MaxBytesReader(st.w, r.Body, maxBytes)
 	}
 	body, err := io.ReadAll(rc)
@@ -373,7 +371,7 @@ func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error
 		return nil, oai.Errorf(http.StatusBadRequest, "invalid_request", "%v", err)
 	}
 	// fields that carry plaintext outside the redaction scope never leave the gateway
-	for _, f := range append([]string{"dsh_session_log"}, p.Cfg.Redaction.StripFields...) {
+	for _, f := range append([]string{"dsh_session_log"}, st.snap.Cfg.Redaction.StripFields...) {
 		delete(req, f)
 	}
 	if len(oai.Messages(req)) == 0 {
@@ -383,7 +381,7 @@ func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error
 	st.rec.RequestedModel = origModel
 	st.clientStream = oai.Bool(req, "stream")
 	if origModel != "" {
-		if resolved := p.Cfg.ResolveAlias(origModel); resolved != origModel {
+		if resolved := st.snap.Cfg.ResolveAlias(origModel); resolved != origModel {
 			req["model"] = resolved
 		}
 	}
@@ -445,7 +443,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 	if session == "" {
 		session = oai.Str(req, "user")
 	}
-	dec, err := p.Router.Decide(ctx, req, route.Meta{Source: st.rec.Source, Session: session, DataClass: dataClass, Now: time.Now()})
+	dec, err := st.snap.Router.Decide(ctx, req, route.Meta{Source: st.rec.Source, Session: session, DataClass: dataClass, Now: time.Now()})
 	if err != nil {
 		var um route.ErrUnknownModel
 		if errors.As(err, &um) {
@@ -457,7 +455,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 	if dec.ClassifierModel != "" {
 		p.meterClassifier(st, dec)
 	}
-	cands := p.orderCandidates(dec.Candidates, dataClass)
+	cands := p.orderCandidates(st.snap, dec.Candidates, dataClass)
 	if allowed != nil {
 		var keep []string
 		for _, c := range cands {
@@ -487,8 +485,8 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 
 	var lastErr *provider.UpstreamError
 	for _, ref := range cands {
-		prov, model, _ := p.Reg.Lookup(ref)
-		mode := p.Redactor.Mode(prov.Target, dataClass)
+		prov, model, _ := st.snap.Reg.Lookup(ref)
+		mode := st.snap.Redactor.Mode(prov.Target, dataClass)
 		out := oai.Clone(req).(map[string]any)
 		out["model"] = model
 		if e := effortParam(dec.Effort); e != "" {
@@ -500,7 +498,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 		for k, v := range prov.ExtraBody {
 			out[k] = oai.Clone(v)
 		}
-		res, rerr := p.Redactor.Apply(ctx, out, mode, userKey, vaultKey)
+		res, rerr := st.snap.Redactor.Apply(ctx, out, mode, userKey, vaultKey)
 		st.rec.Redaction = res.Report
 		st.rec.Model, st.rec.Target = ref, prov.Target
 		if rerr != nil {
@@ -530,7 +528,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: ue.Status, Error: ue.Error()})
 			p.meterRecord(st, ref, prov.Target, oai.Usage{}, 0, statusOf(ue), time.Since(callStart))
 			if ue.Retryable {
-				p.Reg.MarkFailed(ref)
+				st.snap.Reg.MarkFailed(ref)
 				lastErr = ue
 				continue
 			}
@@ -551,7 +549,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			st.written = true
 			return nil
 		}
-		p.Reg.MarkOK(ref)
+		st.snap.Reg.MarkOK(ref)
 		st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: resp.StatusCode})
 		var usage oai.Usage
 		if upStream {
@@ -576,7 +574,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 		st.cachedTokens = usage.CachedTokens
 		cost := prov.Cost(model, usage.PromptTokens, usage.CompletionTokens)
 		p.meterRecord(st, ref, prov.Target, usage, cost, http.StatusOK, time.Since(callStart))
-		p.Router.Account(ref, usage.PromptTokens+usage.CompletionTokens)
+		st.snap.Router.Account(ref, usage.PromptTokens+usage.CompletionTokens)
 		return nil
 	}
 	msg := "all candidate models failed"
@@ -591,17 +589,17 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 
 // orderCandidates applies the data-class hard constraint and puts healthy
 // models first (keeping configured order within each half).
-func (p *Pipeline) orderCandidates(cands []string, dataClass string) []string {
+func (p *Pipeline) orderCandidates(snap *live.Snapshot, cands []string, dataClass string) []string {
 	var healthy, cooling []string
 	for _, ref := range cands {
-		prov, _, ok := p.Reg.Lookup(ref)
+		prov, _, ok := snap.Reg.Lookup(ref)
 		if !ok {
 			continue
 		}
 		if dataClass == "confidential" && prov.Target != "local" {
 			continue
 		}
-		if p.Reg.Healthy(ref) {
+		if snap.Reg.Healthy(ref) {
 			healthy = append(healthy, ref)
 		} else {
 			cooling = append(cooling, ref)
@@ -622,7 +620,7 @@ func (p *Pipeline) meterRecord(st *reqState, ref, target string, u oai.Usage, co
 }
 
 func (p *Pipeline) meterClassifier(st *reqState, dec route.Decision) {
-	prov, model, _ := p.Reg.Lookup(dec.ClassifierModel)
+	prov, model, _ := st.snap.Reg.Lookup(dec.ClassifierModel)
 	status := http.StatusOK
 	if dec.ClassifierError != "" {
 		status = http.StatusGatewayTimeout
@@ -650,7 +648,7 @@ func (p *Pipeline) relayBuffered(st *reqState, resp *http.Response, vaultKey str
 		return oai.Usage{}, oai.Errorf(http.StatusBadGateway, "upstream_bad_json", "provider returned invalid JSON")
 	}
 	if st.rec.Redaction != nil {
-		p.Redactor.Restore(o, vaultKey, st.rec.Redaction)
+		st.snap.Redactor.Restore(o, vaultKey, st.rec.Redaction)
 	}
 	usage, _ := oai.UsageOf(o)
 	if len(p.Hooks) > 0 {

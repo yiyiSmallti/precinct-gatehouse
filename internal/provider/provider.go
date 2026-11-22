@@ -48,10 +48,14 @@ func (r *Registry) SetPlugin(name string, fn func(ctx context.Context, body []by
 }
 
 // NewRegistry resolves keys and builds HTTP clients.
-func NewRegistry(cfg *config.Config) (*Registry, error) {
+// If resolve is nil, keystore.Resolve is used.
+func NewRegistry(cfg *config.Config, resolve func(ref string) (string, error)) (*Registry, error) {
+	if resolve == nil {
+		resolve = keystore.Resolve
+	}
 	r := &Registry{byName: map[string]*Provider{}}
 	for _, pc := range cfg.Providers {
-		key, err := keystore.Resolve(pc.KeyRef)
+		key, err := resolve(pc.KeyRef)
 		if err != nil {
 			return nil, fmt.Errorf("provider %s: %w", pc.Name, err)
 		}

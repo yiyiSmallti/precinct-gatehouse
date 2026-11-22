@@ -20,7 +20,9 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/compat"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/keystore"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/limit"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/live"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/meter"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/pipeline"
@@ -38,16 +40,35 @@ import (
 type Server struct {
 	HTTP       *http.Server
 	Pipeline   *pipeline.Pipeline
+	Live       *live.Manager
 	DB         *sql.DB
 	Keys       *keys.Store
 	Limiter    *limit.Limiter
-	Reg        *provider.Registry
-	Redactor   *redact.Engine
 	UserKey    []byte
 	Missing    []string // required detectors that are unavailable
 	PolicyDown bool     // org mode: the policy plugin did not start
 	closers    []func()
 	otlp       *meter.OTLP
+}
+
+// ResolveKey resolves a provider key_ref, reading db:NAME from settings and
+// delegating other references (env:, keychain:, file:) to keystore.Resolve.
+func ResolveKey(db *sql.DB, ref string) (string, error) {
+	if name, ok := strings.CutPrefix(ref, "db:"); ok {
+		if db == nil {
+			return "", fmt.Errorf("database unavailable for key_ref %q", ref)
+		}
+		var v string
+		err := db.QueryRow(`SELECT v FROM settings WHERE k=?`, "provider_key:"+name).Scan(&v)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("provider key %q is not set in database", name)
+		}
+		if err != nil {
+			return "", err
+		}
+		return v, nil
+	}
+	return keystore.Resolve(ref)
 }
 
 // New wires every component from a validated config.
@@ -57,6 +78,13 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		return nil, err
 	}
 	s := &Server{DB: db, closers: []func(){func() { db.Close() }}}
+	cleanupOnErr := true
+	defer func() {
+		if cleanupOnErr {
+			s.Shutdown(context.Background())
+		}
+	}()
+
 	keyStore := keys.NewStore(db)
 	s.Keys = keyStore
 	s.closers = append(s.closers, keyStore.Close)
@@ -66,11 +94,6 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	if err != nil {
 		return nil, err
 	}
-	reg, err := provider.NewRegistry(cfg)
-	if err != nil {
-		return nil, err
-	}
-	s.Reg = reg
 	m := meter.New(db)
 	if days := cfg.LogRetentionDays(); days > 0 {
 		if err := m.PruneRequestLog(days, time.Now()); err != nil {
@@ -117,18 +140,6 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		log.Warn("audit sink plugins unavailable; records stay in the local audit file", "plugins", failedSinks)
 	}
 	provPlugins, _ := host.StartKind(cfg, sdk.KindProvider, log)
-	for _, pc := range cfg.Providers {
-		if pc.Plugin == "" {
-			continue
-		}
-		fn := plugin.Unavailable(pc.Plugin)
-		for _, pp := range provPlugins {
-			if pp.Name == pc.Plugin {
-				fn = plugin.ProviderChat(pp, pc.Timeout.D(300*time.Second))
-			}
-		}
-		reg.SetPlugin(pc.Name, fn)
-	}
 	var hooks []pipeline.Hook
 	hookPlugins, failedHooks := host.StartKind(cfg, sdk.KindHooks, log)
 	for _, hp := range hookPlugins {
@@ -153,27 +164,70 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	}
 	detectors, missing := host.StartDetectors(cfg, log)
 	s.Missing = missing
-	red, err := redact.New(cfg.Redaction, detectors, missing)
-	if err != nil {
-		return nil, fmt.Errorf("redaction: %w", err)
-	}
-	s.Redactor = red
 	userKey, err := loadOrCreateKey(filepath.Join(cfg.DataDir, "user.key"))
 	if err != nil {
 		return nil, err
 	}
 	s.UserKey = userKey
-	rt := route.New(cfg, reg)
-	rt.Prepare = func(text, target, dataClass string) (string, error) {
-		// the classifier sees the last user message: redact it like any other outbound text
-		mode := red.Mode(target, dataClass)
-		req := oai.Object{"messages": []any{map[string]any{"role": "user", "content": text}}}
-		if _, err := red.Apply(context.Background(), req, mode, userKey, "classifier"); err != nil {
-			return "", err
-		}
-		return oai.Text(oai.Messages(req)[0]), nil
+
+	resolveKey := func(ref string) (string, error) {
+		return ResolveKey(db, ref)
 	}
-	p := &pipeline.Pipeline{Cfg: cfg, Tokens: issuer, Keys: keyStore, Limiter: limiter, Meter: m, Router: rt, Reg: reg, Redactor: red, Audit: sink, UserKey: userKey, Log: log, Policy: resolver, Hooks: hooks}
+	buildSnapshot := func(nextCfg *config.Config, prev *live.Snapshot) (*live.Snapshot, error) {
+		reg, err := provider.NewRegistry(nextCfg, resolveKey)
+		if err != nil {
+			return nil, err
+		}
+		for _, pc := range nextCfg.Providers {
+			if pc.Plugin == "" {
+				continue
+			}
+			var found *plugin.Started
+			for _, pp := range provPlugins {
+				if pp.Name == pc.Plugin {
+					found = pp
+					break
+				}
+			}
+			if found == nil {
+				if prev != nil {
+					return nil, fmt.Errorf("provider 插件 %s 未运行，需重启 gatehouse", pc.Plugin)
+				}
+				reg.SetPlugin(pc.Name, plugin.Unavailable(pc.Plugin))
+				continue
+			}
+			reg.SetPlugin(pc.Name, plugin.ProviderChat(found, pc.Timeout.D(300*time.Second)))
+		}
+		red, err := redact.New(nextCfg.Redaction, detectors, missing)
+		if err != nil {
+			return nil, fmt.Errorf("redaction: %w", err)
+		}
+		if prev != nil && prev.Redactor != nil {
+			red.Vault = prev.Redactor.Vault
+		}
+		rt := route.New(nextCfg, reg)
+		rt.Prepare = func(text, target, dataClass string) (string, error) {
+			// the classifier sees the last user message: redact it like any other outbound text
+			mode := red.Mode(target, dataClass)
+			req := oai.Object{"messages": []any{map[string]any{"role": "user", "content": text}}}
+			if _, err := red.Apply(context.Background(), req, mode, userKey, "classifier"); err != nil {
+				return "", err
+			}
+			return oai.Text(oai.Messages(req)[0]), nil
+		}
+		return &live.Snapshot{Cfg: nextCfg, Reg: reg, Router: rt, Redactor: red}, nil
+	}
+
+	liveMgr, err := live.New(cfg, buildSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	s.Live = liveMgr
+	watchCtx, cancelWatch := context.WithCancel(context.Background())
+	s.closers = append(s.closers, cancelWatch)
+	go liveMgr.Watch(watchCtx, log)
+
+	p := &pipeline.Pipeline{Live: liveMgr, Tokens: issuer, Keys: keyStore, Limiter: limiter, Meter: m, Audit: sink, UserKey: userKey, Log: log, Policy: resolver, Hooks: hooks}
 	s.Pipeline = p
 
 	mux := http.NewServeMux()
@@ -184,17 +238,20 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	s.HTTP = &http.Server{Addr: cfg.Listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	cleanupOnErr = false
 	return s, nil
 }
 
 // LocalToken returns the personal-mode token, issuing it on first start.
 func (s *Server) LocalToken() (string, bool, error) {
-	return s.Pipeline.Tokens.LocalToken(s.Pipeline.Cfg.DataDir)
+	return s.Pipeline.Tokens.LocalToken(s.Live.Current().Cfg.DataDir)
 }
 
 // Shutdown stops serving, flushes metrics and kills plugins.
 func (s *Server) Shutdown(ctx context.Context) {
-	_ = s.HTTP.Shutdown(ctx)
+	if s.HTTP != nil {
+		_ = s.HTTP.Shutdown(ctx)
+	}
 	if s.otlp != nil {
 		_ = s.otlp.Shutdown(ctx)
 	}
@@ -259,8 +316,9 @@ func (s *Server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	snap := s.Live.Current()
 	rc := r.Body
-	if maxBytes := s.Pipeline.Cfg.MaxBodyBytes(); maxBytes > 0 {
+	if maxBytes := snap.Cfg.MaxBodyBytes(); maxBytes > 0 {
 		rc = http.MaxBytesReader(w, r.Body, maxBytes)
 	}
 	body, err := io.ReadAll(rc)
@@ -283,6 +341,7 @@ func (s *Server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
+	snap := s.Live.Current()
 	tok := pipeline.Bearer(r)
 	var claims token.Claims
 	if pol := s.Pipeline.Policy; pol != nil {
@@ -303,7 +362,7 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		// empty lists mean "nothing" in org mode, unlike personal token scopes
 		claims.Scope = token.Scope{Groups: append([]string{"\x00"}, pc.AllowedGroups...), Models: append([]string{"\x00"}, pc.Models...)}
 		for _, g := range pc.AllowedGroups {
-			claims.Scope.Models = append(claims.Scope.Models, s.Pipeline.Router.Members(g)...)
+			claims.Scope.Models = append(claims.Scope.Models, snap.Router.Members(g)...)
 		}
 	} else if strings.HasPrefix(tok, "sk-") {
 		k, err := s.Keys.Lookup(tok)
@@ -330,7 +389,7 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		}
 		claims = c
 	}
-	cfg := s.Pipeline.Cfg
+	cfg := snap.Cfg
 	var ids []string
 	seen := map[string]bool{}
 	addID := func(id string) {
@@ -387,11 +446,12 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	snap := s.Live.Current()
 	status := "ok"
 	if len(s.Missing) > 0 {
 		status = "degraded"
 	}
-	out := map[string]any{"status": status, "mode": s.Pipeline.Cfg.Mode, "detectors_unavailable": s.Missing}
+	out := map[string]any{"status": status, "mode": snap.Cfg.Mode, "config_version": snap.Version, "detectors_unavailable": s.Missing}
 	if pol := s.Pipeline.Policy; pol != nil {
 		out["policy"] = map[string]any{"plugin": pol.Name(), "available": pol.Available()}
 		if !pol.Available() {
