@@ -64,9 +64,10 @@ type FakeProvider struct {
 	ln   net.Listener
 	srv  *http.Server
 
-	mu       sync.Mutex
-	requests [][]byte
-	down     bool
+	mu          sync.Mutex
+	requests    [][]byte
+	authHeaders []string
+	down        bool
 	// Classify answers classifier prompts (system prompt mentions 路由分类器).
 	Classify func(userText string) string
 	// RedirectTo, when set, answers requests whose last user message
@@ -95,6 +96,13 @@ func (f *FakeProvider) Requests() [][]byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([][]byte(nil), f.requests...)
+}
+
+// AuthHeaders returns the Authorization header values received so far.
+func (f *FakeProvider) AuthHeaders() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.authHeaders...)
 }
 
 // ChatRequests returns decoded non-classifier requests.
@@ -149,6 +157,7 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	f.mu.Lock()
 	f.requests = append(f.requests, body)
+	f.authHeaders = append(f.authHeaders, r.Header.Get("Authorization"))
 	down := f.down
 	f.mu.Unlock()
 	if down {

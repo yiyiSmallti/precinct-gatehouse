@@ -95,6 +95,20 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/api/channels", s.guard(s.channels))
 	s.mux.HandleFunc("GET /admin/api/redaction", s.guard(s.redactionInfo))
 	s.mux.HandleFunc("POST /admin/api/redaction/try", s.guard(s.redactionTry))
+	s.mux.HandleFunc("GET /admin/api/config", s.guard(s.getConfig))
+	s.mux.HandleFunc("PUT /admin/api/config/sections/{section}", s.guard(s.putConfigSection))
+	s.mux.HandleFunc("GET /admin/api/config/yaml", s.guard(s.getConfigYAML))
+	s.mux.HandleFunc("PUT /admin/api/config/yaml", s.guard(s.putConfigYAML))
+	s.mux.HandleFunc("POST /admin/api/config/validate", s.guard(s.validateConfig))
+	s.mux.HandleFunc("POST /admin/api/config/reload", s.guard(s.reloadConfig))
+	s.mux.HandleFunc("GET /admin/api/config/history", s.guard(s.listConfigHistory))
+	s.mux.HandleFunc("GET /admin/api/config/history/{name}", s.guard(s.getConfigHistory))
+	s.mux.HandleFunc("POST /admin/api/config/rollback", s.guard(s.rollbackConfig))
+	s.mux.HandleFunc("POST /admin/api/providers/test", s.guard(s.testProvider))
+	s.mux.HandleFunc("PUT /admin/api/providers/{name}/key", s.guard(s.putProviderKey))
+	s.mux.HandleFunc("DELETE /admin/api/providers/{name}/key", s.guard(s.deleteProviderKey))
+	s.mux.HandleFunc("POST /admin/api/password", s.guard(s.changePassword))
+	s.mux.HandleFunc("GET /admin/api/flow", s.guard(s.flow))
 }
 
 func (s *Server) serveUI(name, contentType string) http.HandlerFunc {

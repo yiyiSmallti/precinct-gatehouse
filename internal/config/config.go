@@ -81,6 +81,7 @@ type Provider struct {
 	Timeout      Duration           `yaml:"timeout,omitempty" json:"timeout,omitempty"`   // per upstream request, default 300s
 	SystemPrompt string             `yaml:"system_prompt,omitempty" json:"system_prompt,omitempty"`
 	ExtraBody    map[string]any     `yaml:"extra_body,omitempty" json:"extra_body,omitempty"`
+	HasKey       bool               `yaml:"-" json:"has_key"`
 }
 
 // Pricing is the price per one million tokens.
