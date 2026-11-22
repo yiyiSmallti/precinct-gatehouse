@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/compat"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/limit"
@@ -172,6 +174,9 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/chat/completions", p)
+	mux.HandleFunc("POST /v1/responses", s.openaiResponses)
+	mux.HandleFunc("POST /v1/messages", s.anthropicMessages)
+	mux.HandleFunc("POST /v1/messages/count_tokens", s.anthropicCountTokens)
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	s.HTTP = &http.Server{Addr: cfg.Listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -192,6 +197,85 @@ func (s *Server) Shutdown(ctx context.Context) {
 	for i := len(s.closers) - 1; i >= 0; i-- {
 		s.closers[i]()
 	}
+}
+
+func (s *Server) openaiResponses(w http.ResponseWriter, r *http.Request) {
+	tr := compat.NewResponsesTranslator("")
+	cw := compat.NewWriter(w, tr)
+	s.Pipeline.Serve(cw, r, "responses", func(b []byte) (oai.Object, error) {
+		req, model, dropped, err := compat.DecodeResponses(b)
+		tr.Model = model
+		if len(dropped) > 0 {
+			cw.Header().Set("X-Gatehouse-Dropped-Tools", strings.Join(dropped, ", "))
+		}
+		return req, err
+	})
+	cw.Finish()
+}
+
+func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
+	tr := compat.NewAnthropicTranslator("")
+	cw := compat.NewWriter(w, tr)
+	s.Pipeline.Serve(cw, r, "messages", func(b []byte) (oai.Object, error) {
+		req, model, err := compat.DecodeAnthropic(b)
+		tr.Model = model
+		return req, err
+	})
+	cw.Finish()
+}
+
+func (s *Server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
+	tok := pipeline.Bearer(r)
+	if tok == "" {
+		compat.WriteAnthropicError(w, http.StatusUnauthorized, "missing gateway token (Authorization: Bearer <token> or x-api-key)")
+		return
+	}
+	if pol := s.Pipeline.Policy; pol != nil {
+		if strings.HasPrefix(tok, "sk-") {
+			compat.WriteAnthropicError(w, http.StatusUnauthorized, "api keys are not supported in org mode")
+			return
+		}
+		if _, err := pol.Resolve(r.Context(), tok, &sdk.RequestMeta{}); err != nil {
+			var pe *policy.Error
+			if errors.As(err, &pe) {
+				compat.WriteAnthropicError(w, pe.Status, pe.Msg)
+			} else {
+				compat.WriteAnthropicError(w, http.StatusServiceUnavailable, err.Error())
+			}
+			return
+		}
+	} else if strings.HasPrefix(tok, "sk-") {
+		if _, err := s.Keys.Lookup(tok); err != nil {
+			compat.WriteAnthropicError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+	} else {
+		if _, err := s.Pipeline.Tokens.Verify(tok); err != nil {
+			compat.WriteAnthropicError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+	}
+	rc := r.Body
+	if maxBytes := s.Pipeline.Cfg.MaxBodyBytes(); maxBytes > 0 {
+		rc = http.MaxBytesReader(w, r.Body, maxBytes)
+	}
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		compat.WriteAnthropicError(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
+	req, _, err := compat.DecodeAnthropic(body)
+	if err != nil {
+		compat.WriteAnthropicError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(oai.Messages(req)) == 0 {
+		compat.WriteAnthropicError(w, http.StatusBadRequest, "messages is required")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(oai.Encode(map[string]any{"input_tokens": oai.EstimateTokens(req)}))
 }
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {

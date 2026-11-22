@@ -177,13 +177,27 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	msg := map[string]any{"role": "assistant", "content": content}
+	if strings.Contains(user, "#think") {
+		msg["reasoning_content"] = "思考..."
+	}
 	finish := "stop"
+	var toolArgsStr string
+	hasTools := false
 	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
+		hasTools = true
 		args, _ := json.Marshal(map[string]string{"echo": user})
-		msg["tool_calls"] = []any{map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "echo", "arguments": string(args)}}}
+		toolArgsStr = string(args)
+		msg["tool_calls"] = []any{map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "echo", "arguments": toolArgsStr}}}
 		finish = "tool_calls"
 	}
-	usage := map[string]any{"prompt_tokens": len(body) / 10, "completion_tokens": len(content) / 4, "total_tokens": len(body)/10 + len(content)/4}
+	promptTok := len(body) / 10
+	compTok := len(content) / 4
+	usage := map[string]any{
+		"prompt_tokens":         promptTok,
+		"completion_tokens":     compTok,
+		"total_tokens":          promptTok + compTok,
+		"prompt_tokens_details": map[string]any{"cached_tokens": promptTok / 2},
+	}
 	if stream, _ := req["stream"].(bool); stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		if strings.Contains(user, "#truncate") {
@@ -193,10 +207,30 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "data: %s\n\n", b)
 			return
 		}
+		if strings.Contains(user, "#think") {
+			for _, part := range []string{"思考", "..."} {
+				b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
+					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": part}}}})
+				fmt.Fprintf(w, "data: %s\n\n", b)
+			}
+		}
 		for _, part := range []string{content[:len(content)/2], content[len(content)/2:]} {
 			b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
 				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": part}}}})
 			fmt.Fprintf(w, "data: %s\n\n", b)
+		}
+		if hasTools {
+			mid := len(toolArgsStr) / 2
+			chunks := []map[string]any{
+				{"index": 0, "id": "call_1", "type": "function", "function": map[string]any{"name": "echo", "arguments": ""}},
+				{"index": 0, "function": map[string]any{"arguments": toolArgsStr[:mid]}},
+				{"index": 0, "function": map[string]any{"arguments": toolArgsStr[mid:]}},
+			}
+			for _, tc := range chunks {
+				b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
+					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{tc}}}}})
+				fmt.Fprintf(w, "data: %s\n\n", b)
+			}
 		}
 		b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
 			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}})
