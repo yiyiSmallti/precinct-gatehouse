@@ -141,11 +141,13 @@ func (l *Limiter) Acquire(keyID string, lim keys.Limits, now time.Time) (func(co
 			if ks.inflight > 0 {
 				ks.inflight--
 			}
-			if ks.todayReserved > 0 {
-				ks.todayReserved--
-			}
-			if countable && ks.day == day {
-				ks.todayCount++
+			if ks.day == day {
+				if ks.todayReserved > 0 {
+					ks.todayReserved--
+				}
+				if countable {
+					ks.todayCount++
+				}
 			}
 		})
 	}, nil

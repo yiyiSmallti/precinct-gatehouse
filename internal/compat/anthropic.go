@@ -302,20 +302,20 @@ func mapAnthropicStopReason(finish string) string {
 type AnthropicTranslator struct {
 	Model string
 
-	blockIdx    int
-	openKind    string
-	openToolIdx int
-	stopReason  string
-	usage       oai.Usage
+	blockIdx      int
+	openKind      string
+	openTools     map[int]int
+	openToolOrder []int
+	stopReason    string
+	usage         oai.Usage
 }
 
 // NewAnthropicTranslator creates a per-request Anthropic response translator.
 func NewAnthropicTranslator(requestedModel string) *AnthropicTranslator {
 	return &AnthropicTranslator{
-		Model:       requestedModel,
-		blockIdx:    -1,
-		openToolIdx: -1,
-		stopReason:  "end_turn",
+		Model:      requestedModel,
+		blockIdx:   -1,
+		stopReason: "end_turn",
 	}
 }
 
@@ -432,11 +432,25 @@ func (t *AnthropicTranslator) closeBlock(w http.ResponseWriter) {
 		"index": t.blockIdx,
 	})
 	t.openKind = ""
-	t.openToolIdx = -1
+}
+
+func (t *AnthropicTranslator) closeOpenTools(w http.ResponseWriter) {
+	for _, tcIdx := range t.openToolOrder {
+		bIdx, ok := t.openTools[tcIdx]
+		if !ok {
+			continue
+		}
+		t.emitEvent(w, "content_block_stop", map[string]any{
+			"index": bIdx,
+		})
+	}
+	t.openTools = nil
+	t.openToolOrder = nil
 }
 
 func (t *AnthropicTranslator) startBlock(w http.ResponseWriter, kind string, block map[string]any) {
 	t.closeBlock(w)
+	t.closeOpenTools(w)
 	t.blockIdx++
 	t.openKind = kind
 	t.emitEvent(w, "content_block_start", map[string]any{
@@ -496,18 +510,29 @@ func (t *AnthropicTranslator) OnChunk(w http.ResponseWriter, chunk oai.Object) {
 			fn, _ := tc["function"].(map[string]any)
 			name := oai.Str(fn, "name")
 			args := oai.Str(fn, "arguments")
-			if t.openKind != "tool_use" || tcIdx != t.openToolIdx {
-				t.startBlock(w, "tool_use", map[string]any{
-					"type":  "tool_use",
-					"id":    id,
-					"name":  name,
-					"input": map[string]any{},
+			t.closeBlock(w)
+			bIdx, exists := t.openTools[tcIdx]
+			if !exists {
+				t.blockIdx++
+				bIdx = t.blockIdx
+				if t.openTools == nil {
+					t.openTools = map[int]int{}
+				}
+				t.openTools[tcIdx] = bIdx
+				t.openToolOrder = append(t.openToolOrder, tcIdx)
+				t.emitEvent(w, "content_block_start", map[string]any{
+					"index": bIdx,
+					"content_block": map[string]any{
+						"type":  "tool_use",
+						"id":    id,
+						"name":  name,
+						"input": map[string]any{},
+					},
 				})
-				t.openToolIdx = tcIdx
 			}
 			if args != "" {
 				t.emitEvent(w, "content_block_delta", map[string]any{
-					"index": t.blockIdx,
+					"index": bIdx,
 					"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
 				})
 			}
@@ -517,6 +542,7 @@ func (t *AnthropicTranslator) OnChunk(w http.ResponseWriter, chunk oai.Object) {
 
 func (t *AnthropicTranslator) EndStream(w http.ResponseWriter, ok bool) {
 	t.closeBlock(w)
+	t.closeOpenTools(w)
 	if !ok {
 		t.emitEvent(w, "error", map[string]any{
 			"error": map[string]any{

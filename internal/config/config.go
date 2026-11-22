@@ -401,16 +401,9 @@ func (c *Config) applyDefaults() {
 			if p.Tiered.StarterCache != nil && p.Tiered.StarterCache.PersistPath != "" {
 				p.Tiered.StarterCache.PersistPath = ExpandHome(p.Tiered.StarterCache.PersistPath)
 			}
-			if p.Target == "" {
-				p.Target = "local"
-			}
 		}
 		if p.Target == "" {
-			if isLoopbackURL(p.BaseURL) {
-				p.Target = "local"
-			} else {
-				p.Target = "external"
-			}
+			p.Target = defaultProviderTarget(p)
 		}
 		if p.ExtraBody != nil {
 			if m, ok := normalizeYAMLValue(p.ExtraBody).(map[string]any); ok {
@@ -443,6 +436,27 @@ func (c *Config) applyDefaults() {
 var loopbackRe = regexp.MustCompile(`^https?://(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?(/|$)`)
 
 func isLoopbackURL(u string) bool { return loopbackRe.MatchString(u) }
+
+func defaultProviderTarget(p *Provider) string {
+	if p.Tiered != nil {
+		if len(p.Tiered.Backends) == 0 {
+			return "external"
+		}
+		if p.Tiered.Mode != "active" && !isLoopbackURL(p.BaseURL) {
+			return "external"
+		}
+		for _, b := range p.Tiered.Backends {
+			if !isLoopbackURL(b.URL) {
+				return "external"
+			}
+		}
+		return "local"
+	}
+	if isLoopbackURL(p.BaseURL) {
+		return "local"
+	}
+	return "external"
+}
 
 // ExpandHome expands a leading "~/".
 func ExpandHome(p string) string {

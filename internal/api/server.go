@@ -97,27 +97,6 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		return nil, err
 	}
 	m := meter.New(db)
-	if days := cfg.LogRetentionDays(); days > 0 {
-		if err := m.PruneRequestLog(days, time.Now()); err != nil {
-			log.Warn("request_log prune failed", "err", err)
-		}
-		pruneCtx, cancelPrune := context.WithCancel(context.Background())
-		s.closers = append(s.closers, cancelPrune)
-		go func() {
-			tk := time.NewTicker(24 * time.Hour)
-			defer tk.Stop()
-			for {
-				select {
-				case <-pruneCtx.Done():
-					return
-				case now := <-tk.C:
-					if err := m.PruneRequestLog(days, now); err != nil {
-						log.Warn("request_log prune failed", "err", err)
-					}
-				}
-			}
-		}()
-	}
 	if cfg.Meter.OTLP != nil {
 		o, err := meter.NewOTLP(cfg.Meter.OTLP, version)
 		if err != nil {
@@ -209,7 +188,8 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 			}
 			reg.SetPlugin(pc.Name, plugin.ProviderChat(found, pc.Timeout.D(300*time.Second)))
 		}
-		red, err := redact.New(nextCfg.Redaction, detectors, missing)
+		snapMissing := computeMissingDetectors(nextCfg.Redaction.Detectors, detectors)
+		red, err := redact.New(nextCfg.Redaction, detectors, snapMissing)
 		if err != nil {
 			return nil, fmt.Errorf("redaction: %w", err)
 		}
@@ -234,8 +214,44 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		return nil, err
 	}
 	s.Live = liveMgr
+	if r := liveMgr.Current().Redactor; r != nil {
+		s.Missing = r.Missing()
+	}
+	pruneCh := make(chan struct{}, 1)
+	if days := liveMgr.Current().Cfg.LogRetentionDays(); days > 0 {
+		if err := m.PruneRequestLog(days, time.Now()); err != nil {
+			log.Warn("request_log prune failed", "err", err)
+		}
+	}
+	pruneCtx, cancelPrune := context.WithCancel(context.Background())
+	s.closers = append(s.closers, cancelPrune)
+	go func() {
+		tk := time.NewTicker(24 * time.Hour)
+		defer tk.Stop()
+		for {
+			var now time.Time
+			select {
+			case <-pruneCtx.Done():
+				return
+			case now = <-tk.C:
+			case <-pruneCh:
+				now = time.Now()
+			}
+			if days := liveMgr.Current().Cfg.LogRetentionDays(); days > 0 {
+				if err := m.PruneRequestLog(days, now); err != nil {
+					log.Warn("request_log prune failed", "err", err)
+				}
+			}
+		}
+	}()
 	liveMgr.OnSwap = func(snap *live.Snapshot) {
 		hub.Activate(snap.Cfg)
+		if snap.Cfg.LogRetentionDays() > 0 {
+			select {
+			case pruneCh <- struct{}{}:
+			default:
+			}
+		}
 	}
 	hub.Activate(liveMgr.Current().Cfg)
 	watchCtx, cancelWatch := context.WithCancel(context.Background())
@@ -516,14 +532,55 @@ func (s *Server) newapiTokenUsage(w http.ResponseWriter, r *http.Request) {
 	}))
 }
 
+// PruneRequestLogNow enforces the live snapshot's request_log_days retention immediately.
+func (s *Server) PruneRequestLogNow(now time.Time) error {
+	if s.Live == nil || s.Pipeline == nil || s.Pipeline.Meter == nil {
+		return nil
+	}
+	days := s.Live.Current().Cfg.LogRetentionDays()
+	if days <= 0 {
+		return nil
+	}
+	return s.Pipeline.Meter.PruneRequestLog(days, now)
+}
+
+func computeMissingDetectors(required []string, running []redact.ExternalDetector) []string {
+	if len(required) == 0 {
+		return nil
+	}
+	active := make(map[string]bool, len(running))
+	for _, d := range running {
+		if ex, ok := d.(interface{ Exited() bool }); ok && ex.Exited() {
+			continue
+		}
+		active[d.Name()] = true
+	}
+	seen := make(map[string]bool, len(required))
+	var missing []string
+	for _, name := range required {
+		if seen[name] || active[name] {
+			continue
+		}
+		seen[name] = true
+		missing = append(missing, name)
+	}
+	return missing
+}
+
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	snap := s.Live.Current()
+	var missing []string
+	if snap.Redactor != nil {
+		missing = snap.Redactor.Missing()
+	} else {
+		missing = s.Missing
+	}
 	status := "ok"
-	if len(s.Missing) > 0 {
+	if len(missing) > 0 {
 		status = "degraded"
 	}
-	out := map[string]any{"status": status, "mode": snap.Cfg.Mode, "config_version": snap.Version, "detectors_unavailable": s.Missing}
+	out := map[string]any{"status": status, "mode": snap.Cfg.Mode, "config_version": snap.Version, "detectors_unavailable": missing}
 	if pol := s.Pipeline.Policy; pol != nil {
 		out["policy"] = map[string]any{"plugin": pol.Name(), "available": pol.Available()}
 		if !pol.Available() {

@@ -104,6 +104,14 @@ func New(cfg config.Redaction, external []ExternalDetector, missing []string) (*
 	return e, nil
 }
 
+// Missing returns the names of required detectors unavailable in this engine snapshot.
+func (e *Engine) Missing() []string {
+	if len(e.missing) == 0 {
+		return nil
+	}
+	return append([]string(nil), e.missing...)
+}
+
 // Mode returns the redaction mode for a target and data class. A
 // confidential request bound for an external target is always blocked: the
 // second gate behind data-class routing.

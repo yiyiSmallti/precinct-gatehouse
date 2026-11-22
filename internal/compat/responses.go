@@ -228,6 +228,14 @@ func convertResponseInputContent(v any) any {
 	}
 }
 
+type openRespTool struct {
+	outputIndex int
+	itemID      string
+	callID      string
+	name        string
+	args        strings.Builder
+}
+
 // ResponsesTranslator translates OpenAI Chat Completions responses and streams
 // into OpenAI Responses format.
 type ResponsesTranslator struct {
@@ -239,10 +247,9 @@ type ResponsesTranslator struct {
 	outputIndex    int
 	openKind       string
 	openItemID     string
-	openCallID     string
-	openName       string
-	openToolIdx    int
 	openText       strings.Builder
+	openTools      map[int]*openRespTool
+	openToolOrder  []int
 	completedItems []any
 	finishReason   string
 	usage          oai.Usage
@@ -253,7 +260,6 @@ func NewResponsesTranslator(requestedModel string) *ResponsesTranslator {
 	return &ResponsesTranslator{
 		Model:          requestedModel,
 		outputIndex:    -1,
-		openToolIdx:    -1,
 		completedItems: []any{},
 	}
 }
@@ -444,33 +450,44 @@ func (t *ResponsesTranslator) closeOpenItem(w http.ResponseWriter) {
 			"item":         item,
 		})
 		t.completedItems = append(t.completedItems, item)
-	case "function_call":
+	}
+	t.openKind = ""
+	t.openText.Reset()
+}
+
+func (t *ResponsesTranslator) closeOpenTools(w http.ResponseWriter) {
+	for _, tcIdx := range t.openToolOrder {
+		st := t.openTools[tcIdx]
+		if st == nil {
+			continue
+		}
+		text := st.args.String()
 		t.emitEvent(w, "response.function_call_arguments.done", map[string]any{
-			"item_id":      t.openItemID,
-			"output_index": t.outputIndex,
+			"item_id":      st.itemID,
+			"output_index": st.outputIndex,
 			"arguments":    text,
 		})
 		item := map[string]any{
 			"type":      "function_call",
-			"id":        t.openItemID,
-			"call_id":   t.openCallID,
-			"name":      t.openName,
+			"id":        st.itemID,
+			"call_id":   st.callID,
+			"name":      st.name,
 			"arguments": text,
 			"status":    "completed",
 		}
 		t.emitEvent(w, "response.output_item.done", map[string]any{
-			"output_index": t.outputIndex,
+			"output_index": st.outputIndex,
 			"item":         item,
 		})
 		t.completedItems = append(t.completedItems, item)
 	}
-	t.openKind = ""
-	t.openToolIdx = -1
-	t.openText.Reset()
+	t.openTools = nil
+	t.openToolOrder = nil
 }
 
 func (t *ResponsesTranslator) startReasoning(w http.ResponseWriter) {
 	t.closeOpenItem(w)
+	t.closeOpenTools(w)
 	t.outputIndex++
 	t.openKind = "reasoning"
 	t.openItemID = fmt.Sprintf("rs_%s_%d", reqIDFromWriter(w), t.outputIndex)
@@ -492,6 +509,7 @@ func (t *ResponsesTranslator) startReasoning(w http.ResponseWriter) {
 
 func (t *ResponsesTranslator) startMessage(w http.ResponseWriter) {
 	t.closeOpenItem(w)
+	t.closeOpenTools(w)
 	t.outputIndex++
 	t.openKind = "message"
 	t.openItemID = fmt.Sprintf("msg_%s_%d", reqIDFromWriter(w), t.outputIndex)
@@ -513,25 +531,32 @@ func (t *ResponsesTranslator) startMessage(w http.ResponseWriter) {
 	})
 }
 
-func (t *ResponsesTranslator) startFunctionCall(w http.ResponseWriter, tcIdx int, callID, name string) {
+func (t *ResponsesTranslator) startFunctionCall(w http.ResponseWriter, tcIdx int, callID, name string) *openRespTool {
 	t.closeOpenItem(w)
 	t.outputIndex++
-	t.openKind = "function_call"
-	t.openToolIdx = tcIdx
-	t.openCallID = callID
-	t.openName = name
-	t.openItemID = fmt.Sprintf("fc_%s_%d", reqIDFromWriter(w), t.outputIndex)
+	st := &openRespTool{
+		outputIndex: t.outputIndex,
+		itemID:      fmt.Sprintf("fc_%s_%d", reqIDFromWriter(w), t.outputIndex),
+		callID:      callID,
+		name:        name,
+	}
+	if t.openTools == nil {
+		t.openTools = map[int]*openRespTool{}
+	}
+	t.openTools[tcIdx] = st
+	t.openToolOrder = append(t.openToolOrder, tcIdx)
 	t.emitEvent(w, "response.output_item.added", map[string]any{
-		"output_index": t.outputIndex,
+		"output_index": st.outputIndex,
 		"item": map[string]any{
 			"type":      "function_call",
-			"id":        t.openItemID,
+			"id":        st.itemID,
 			"call_id":   callID,
 			"name":      name,
 			"arguments": "",
 			"status":    "in_progress",
 		},
 	})
+	return st
 }
 
 func (t *ResponsesTranslator) OnChunk(w http.ResponseWriter, chunk oai.Object) {
@@ -591,14 +616,22 @@ func (t *ResponsesTranslator) OnChunk(w http.ResponseWriter, chunk oai.Object) {
 			fn, _ := tc["function"].(map[string]any)
 			name := oai.Str(fn, "name")
 			args := oai.Str(fn, "arguments")
-			if t.openKind != "function_call" || tcIdx != t.openToolIdx {
-				t.startFunctionCall(w, tcIdx, id, name)
+			st := t.openTools[tcIdx]
+			if st == nil {
+				st = t.startFunctionCall(w, tcIdx, id, name)
+			} else {
+				if st.callID == "" && id != "" {
+					st.callID = id
+				}
+				if st.name == "" && name != "" {
+					st.name = name
+				}
 			}
 			if args != "" {
-				t.openText.WriteString(args)
+				st.args.WriteString(args)
 				t.emitEvent(w, "response.function_call_arguments.delta", map[string]any{
-					"item_id":      t.openItemID,
-					"output_index": t.outputIndex,
+					"item_id":      st.itemID,
+					"output_index": st.outputIndex,
 					"delta":        args,
 				})
 			}
@@ -608,6 +641,7 @@ func (t *ResponsesTranslator) OnChunk(w http.ResponseWriter, chunk oai.Object) {
 
 func (t *ResponsesTranslator) EndStream(w http.ResponseWriter, ok bool) {
 	t.closeOpenItem(w)
+	t.closeOpenTools(w)
 	if !ok {
 		failed := t.responseObject("failed", "", t.completedItems, nil)
 		failed["error"] = map[string]any{

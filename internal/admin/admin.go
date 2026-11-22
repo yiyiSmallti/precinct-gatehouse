@@ -911,7 +911,12 @@ func (s *Server) redactionInfo(w http.ResponseWriter, _ *http.Request, _ string)
 	if detectors == nil {
 		detectors = []string{}
 	}
-	missing := s.deps.MissingDetectors
+	var missing []string
+	if snap.Redactor != nil {
+		missing = snap.Redactor.Missing()
+	} else {
+		missing = s.deps.MissingDetectors
+	}
 	if missing == nil {
 		missing = []string{}
 	}

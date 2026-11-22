@@ -147,6 +147,9 @@ type detector struct {
 
 func (d *detector) Name() string { return d.name }
 
+// Exited reports whether the detector subprocess has terminated.
+func (d *detector) Exited() bool { return d.client == nil || d.client.Exited() }
+
 // Detect calls the plugin and converts code point offsets to byte offsets.
 // A plugin whose process has exited is an error (the engine fails closed).
 func (d *detector) Detect(ctx context.Context, text string) ([]redact.Finding, error) {

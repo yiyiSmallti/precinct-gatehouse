@@ -12,6 +12,8 @@ function stableStringify(val) {
 
 export const store = {
   server: null,
+  latestServer: null,
+  baseHash: '',
   drafts: {},
   applying: false,
   problems: [],
@@ -29,7 +31,19 @@ export const store = {
 
   async refresh() {
     const cfg = await api.getConfig();
-    this.server = cfg;
+    this.latestServer = cfg;
+    if (!this.isDirty()) {
+      this.server = cfg;
+      this.baseHash = cfg?.hash || '';
+    } else {
+      if (!this.baseHash) this.baseHash = this.server?.hash || '';
+      if (cfg?.hash && this.baseHash && cfg.hash !== this.baseHash) {
+        this.conflict = {
+          currentHash: cfg.hash,
+          message: '配置在您编辑期间已被其他操作修改，请重新加载后再应用。',
+        };
+      }
+    }
     this.notify();
     return cfg;
   },
@@ -75,12 +89,22 @@ export const store = {
   },
 
   setDraft(sec, val) {
+    const wasDirty = this.isDirty();
+    if (!wasDirty) {
+      this.baseHash = this.server?.hash || '';
+    }
     const base = this.getServerSection(sec);
     this.problems = [];
-    this.conflict = null;
     this.buildError = '';
     if (stableStringify(base) === stableStringify(val)) {
       delete this.drafts[sec];
+      if (!this.isDirty()) {
+        this.conflict = null;
+        if (this.latestServer) {
+          this.server = this.latestServer;
+          this.baseHash = this.latestServer.hash || '';
+        }
+      }
     } else {
       this.drafts[sec] = clone(val);
     }
@@ -101,6 +125,12 @@ export const store = {
     this.problems = [];
     this.conflict = null;
     this.buildError = '';
+    if (this.latestServer) {
+      this.server = this.latestServer;
+      this.baseHash = this.latestServer.hash || '';
+    } else {
+      this.baseHash = this.server?.hash || '';
+    }
     this.notify();
   },
 
@@ -150,12 +180,16 @@ export const store = {
     this.notify();
     try {
       let lastRes = null;
+      let hash = this.baseHash || this.server?.hash || '';
       for (const sec of order) {
-        const hash = this.server?.hash || '';
         const res = await api.putSection(sec, hash, this.drafts[sec]);
         lastRes = res;
         delete this.drafts[sec];
-        this.server = await api.getConfig();
+        const fresh = await api.getConfig();
+        this.server = fresh;
+        this.latestServer = fresh;
+        hash = fresh?.hash || '';
+        this.baseHash = hash;
       }
       const rr = lastRes?.restart_required || this.server?.restart_required || [];
       if (rr.length) {
