@@ -1,0 +1,157 @@
+:root {
+  color-scheme: light;
+  /* Light Theme: Limestone, Paper, Ink & Brass */
+  --bg: #EEF0F2;
+  --surface: #FAFBFC;
+  --surface-2: #F3F5F7;
+  --surface-3: #E6EBEF;
+  --surface-rail: #F5F7F9;
+
+  --ink: #1C2733;
+  --ink-2: #465362;
+  --ink-3: #5A6674;
+
+  --border: #D7DEE5;
+  --border-strong: #BCC7D3;
+
+  --brass: #A8812F;
+  --brass-text: #795A16;
+  --brass-soft: rgba(168, 129, 47, 0.11);
+  --brass-border: rgba(168, 129, 47, 0.38);
+
+  --verdigris: #2E7A68;
+  --verdigris-soft: rgba(46, 122, 104, 0.11);
+  --verdigris-border: rgba(46, 122, 104, 0.34);
+
+  --oxblood: #A23B3B;
+  --oxblood-soft: rgba(162, 59, 59, 0.10);
+  --oxblood-border: rgba(162, 59, 59, 0.32);
+
+  --amber: #8F5A0A;
+  --amber-fill: #C7821A;
+  --amber-soft: rgba(199, 130, 26, 0.13);
+  --amber-border: rgba(143, 90, 10, 0.32);
+
+  --btn-primary-bg: #1C2733;
+  --btn-primary-fg: #FAFBFC;
+  --btn-primary-hover: #2A394A;
+
+  --diff-add-bg: rgba(46, 122, 104, 0.12);
+  --diff-del-bg: rgba(162, 59, 59, 0.11);
+
+  --shadow-drawer: -12px 0 36px rgba(28, 39, 51, 0.14);
+  --shadow-float: 0 10px 30px rgba(28, 39, 51, 0.15);
+  --backdrop: rgba(20, 28, 37, 0.42);
+
+  /* Typography Scale */
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, Menlo, Monaco, Consolas, monospace;
+
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-20: 20px;
+  --fs-28: 28px;
+  --fs-44: 44px;
+
+  /* Geometry */
+  --sidebar-w: 232px;
+  --topbar-h: 58px;
+  --drawer-w: 520px;
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #151A21;
+    --surface: #1D242D;
+    --surface-2: #242D38;
+    --surface-3: #2C3745;
+    --surface-rail: #192028;
+
+    --ink: #EAEFF4;
+    --ink-2: #B9C4D0;
+    --ink-3: #9AA6B4;
+
+    --border: #2C3643;
+    --border-strong: #3E4B5C;
+
+    --brass: #D4A94F;
+    --brass-text: #D4A94F;
+    --brass-soft: rgba(212, 169, 79, 0.14);
+    --brass-border: rgba(212, 169, 79, 0.38);
+
+    --verdigris: #4DB59C;
+    --verdigris-soft: rgba(77, 181, 156, 0.14);
+    --verdigris-border: rgba(77, 181, 156, 0.36);
+
+    --oxblood: #EC8A8A;
+    --oxblood-soft: rgba(236, 138, 138, 0.14);
+    --oxblood-border: rgba(236, 138, 138, 0.36);
+
+    --amber: #E8AB46;
+    --amber-fill: #E09F36;
+    --amber-soft: rgba(224, 159, 54, 0.14);
+    --amber-border: rgba(232, 171, 70, 0.36);
+
+    --btn-primary-bg: #D4A94F;
+    --btn-primary-fg: #151A21;
+    --btn-primary-hover: #DFB968;
+
+    --diff-add-bg: rgba(77, 181, 156, 0.14);
+    --diff-del-bg: rgba(226, 112, 112, 0.14);
+
+    --shadow-drawer: -12px 0 40px rgba(0, 0, 0, 0.45);
+    --shadow-float: 0 12px 34px rgba(0, 0, 0, 0.5);
+    --backdrop: rgba(8, 11, 15, 0.64);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #151A21;
+  --surface: #1D242D;
+  --surface-2: #242D38;
+  --surface-3: #2C3745;
+  --surface-rail: #192028;
+
+  --ink: #EAEFF4;
+  --ink-2: #B9C4D0;
+  --ink-3: #9AA6B4;
+
+  --border: #2C3643;
+  --border-strong: #3E4B5C;
+
+  --brass: #D4A94F;
+  --brass-text: #D4A94F;
+  --brass-soft: rgba(212, 169, 79, 0.14);
+  --brass-border: rgba(212, 169, 79, 0.38);
+
+  --verdigris: #4DB59C;
+  --verdigris-soft: rgba(77, 181, 156, 0.14);
+  --verdigris-border: rgba(77, 181, 156, 0.36);
+
+  --oxblood: #EC8A8A;
+  --oxblood-soft: rgba(236, 138, 138, 0.14);
+  --oxblood-border: rgba(236, 138, 138, 0.36);
+
+  --amber: #E8AB46;
+  --amber-fill: #E09F36;
+  --amber-soft: rgba(224, 159, 54, 0.14);
+  --amber-border: rgba(232, 171, 70, 0.36);
+
+  --btn-primary-bg: #D4A94F;
+  --btn-primary-fg: #151A21;
+  --btn-primary-hover: #DFB968;
+
+  --diff-add-bg: rgba(77, 181, 156, 0.14);
+  --diff-del-bg: rgba(226, 112, 112, 0.14);
+
+  --shadow-drawer: -12px 0 40px rgba(0, 0, 0, 0.45);
+  --shadow-float: 0 12px 34px rgba(0, 0, 0, 0.5);
+  --backdrop: rgba(8, 11, 15, 0.64);
+}

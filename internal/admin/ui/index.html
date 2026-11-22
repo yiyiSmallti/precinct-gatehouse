@@ -3,12 +3,19 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gatehouse 管理控制台</title>
-  <link rel="stylesheet" href="/admin/app.css">
+  <title>Precinct Gatehouse 网关控制台</title>
+  <link rel="stylesheet" href="/admin/css/tokens.css">
+  <link rel="stylesheet" href="/admin/css/base.css">
+  <link rel="stylesheet" href="/admin/css/components.css">
 </head>
 <body>
-  <div id="app"></div>
+  <div id="app" class="app-mount">
+    <div class="boot-state">正在加载控制台</div>
+  </div>
+  <div id="drawer-root"></div>
   <div id="modal-root"></div>
-  <script src="/admin/app.js"></script>
+  <div id="pending-root"></div>
+  <div id="toast-root" class="toast-stack" aria-live="polite"></div>
+  <script type="module" src="/admin/js/app.js"></script>
 </body>
 </html>

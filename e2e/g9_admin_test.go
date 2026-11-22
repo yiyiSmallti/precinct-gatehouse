@@ -164,21 +164,21 @@ func TestG9Admin(t *testing.T) {
 			sCh == 200 && len(chProvs) == 2 && len(chAliases) == 1,
 		"ov=%d(hourly=%d) use=%d(rows=%d) ch=%d(provs=%d)", sOv, len(ovHourly), sUse, len(useRows), sCh, len(chProvs))
 
-	// 9. GET /admin/ HTML includes app.js and GET /admin/app.js serves JS
+	// 9. GET /admin/ HTML includes js/app.js and GET /admin/js/app.js serves JS
 	respHTML, err := http.Get(adminBase + "/admin/")
 	if err != nil {
 		t.Fatal(err)
 	}
 	htmlBytes, _ := io.ReadAll(respHTML.Body)
 	respHTML.Body.Close()
-	respJS, err := http.Get(adminBase + "/admin/app.js")
+	respJS, err := http.Get(adminBase + "/admin/js/app.js")
 	if err != nil {
 		t.Fatal(err)
 	}
 	jsBytes, _ := io.ReadAll(respJS.Body)
 	respJS.Body.Close()
-	rep.Check("GET /admin/ 返回含 app.js 的 HTML",
-		respHTML.StatusCode == 200 && strings.Contains(string(htmlBytes), "/admin/app.js") &&
+	rep.Check("GET /admin/ 返回含 js/app.js 的 HTML",
+		respHTML.StatusCode == 200 && strings.Contains(string(htmlBytes), "/admin/js/app.js") &&
 			respJS.StatusCode == 200 && len(jsBytes) > 1000,
 		"html=%d js=%d(%d bytes)", respHTML.StatusCode, respJS.StatusCode, len(jsBytes))
 

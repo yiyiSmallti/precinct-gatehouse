@@ -24,7 +24,7 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact/rules"
 )
 
-//go:embed ui/*
+//go:embed ui
 var uiFiles embed.FS
 
 // Deps holds the dependencies required by the admin server.
@@ -77,9 +77,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/", http.StatusMovedPermanently)
 	})
-	s.mux.HandleFunc("GET /admin/", s.serveUI("index.html", "text/html; charset=utf-8"))
-	s.mux.HandleFunc("GET /admin/app.js", s.serveUI("app.js", "application/javascript; charset=utf-8"))
-	s.mux.HandleFunc("GET /admin/app.css", s.serveUI("app.css", "text/css; charset=utf-8"))
+	s.mux.HandleFunc("GET /admin/", s.handleStatic())
 
 	s.mux.HandleFunc("POST /admin/api/login", s.login)
 	s.mux.HandleFunc("POST /admin/api/logout", s.guard(s.logout))
@@ -109,23 +107,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /admin/api/providers/{name}/key", s.guard(s.deleteProviderKey))
 	s.mux.HandleFunc("POST /admin/api/password", s.guard(s.changePassword))
 	s.mux.HandleFunc("GET /admin/api/flow", s.guard(s.flow))
-}
-
-func (s *Server) serveUI(name, contentType string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if name == "index.html" && r.URL.Path != "/admin/" {
-			http.NotFound(w, r)
-			return
-		}
-		b, err := fs.ReadFile(s.ui, name)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write(b)
-	}
 }
 
 func (s *Server) guard(next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
