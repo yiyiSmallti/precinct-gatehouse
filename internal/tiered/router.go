@@ -275,22 +275,19 @@ func (r *Router) rebuildBackends(list []BackendConfig) error {
 			return fmt.Errorf("invalid backend url %q: %w", bc.URL, err)
 		}
 		if existing, ok := oldByID[bc.ID]; ok {
-			urlChanged := existing.updateConfig(bc, u)
-			if urlChanged {
-				existing.healthy.Store(false)
-				existing.healthFails.Store(0)
-				existing.lastHealthErr.Store("initializing")
-				toProbe = append(toProbe, existing)
+			_, prevURL := existing.snapshot()
+			if prevURL != nil && prevURL.String() == u.String() {
+				existing.updateConfig(bc, u)
+				nextList = append(nextList, existing)
+				nextByID[bc.ID] = existing
+				continue
 			}
-			nextList = append(nextList, existing)
-			nextByID[bc.ID] = existing
-		} else {
-			bs := &BackendState{cfg: bc, target: u}
-			bs.lastHealthErr.Store("initializing")
-			nextList = append(nextList, bs)
-			nextByID[bc.ID] = bs
-			toProbe = append(toProbe, bs)
 		}
+		bs := &BackendState{cfg: bc, target: u}
+		bs.lastHealthErr.Store("initializing")
+		nextList = append(nextList, bs)
+		nextByID[bc.ID] = bs
+		toProbe = append(toProbe, bs)
 	}
 	sort.Slice(nextList, func(i, j int) bool {
 		return nextList[i].config().Tier < nextList[j].config().Tier
@@ -372,12 +369,29 @@ func (r *Router) getBackends() []*BackendState {
 }
 
 func (r *Router) backendByID(id string) *BackendState {
-	if id == "" {
+	if r == nil || id == "" {
 		return nil
 	}
 	r.cfgMu.RLock()
 	b := r.byID[id]
 	r.cfgMu.RUnlock()
+	return b
+}
+
+func (r *Router) backendFor(id string, target *url.URL) *BackendState {
+	if r == nil || id == "" || target == nil {
+		return nil
+	}
+	r.cfgMu.RLock()
+	b := r.byID[id]
+	r.cfgMu.RUnlock()
+	if b == nil {
+		return nil
+	}
+	_, u := b.snapshot()
+	if u == nil || u.String() != target.String() {
+		return nil
+	}
 	return b
 }
 
@@ -676,17 +690,19 @@ func (r *Router) analyzeChatBody(body []byte) (*RequestAnalysis, bool) {
 		cumEst[i] = runningEst
 	}
 
-	r.mu.RLock()
 	matchedIdx := -1
 	cachedTokens := 0
-	for i := n - 1; i >= 0; i-- {
-		if entry, ok := r.prefixes[hashes[i]]; ok {
-			matchedIdx = i
-			cachedTokens = entry.Tokens
-			break
+	if r != nil {
+		r.mu.RLock()
+		for i := n - 1; i >= 0; i-- {
+			if entry, ok := r.prefixes[hashes[i]]; ok {
+				matchedIdx = i
+				cachedTokens = entry.Tokens
+				break
+			}
 		}
+		r.mu.RUnlock()
 	}
-	r.mu.RUnlock()
 
 	var totalEst, missEst int
 	if matchedIdx >= 0 {
@@ -720,26 +736,47 @@ func (r *Router) analyzeChatBody(body []byte) (*RequestAnalysis, bool) {
 	}, true
 }
 
+type resolvedBackend struct {
+	cfg    BackendConfig
+	target *url.URL
+	state  *BackendState
+}
+
 func (r *Router) selectBackend(an *RequestAnalysis, exclude map[string]bool) (*BackendState, string, bool) {
 	backends := r.getBackends()
-	heavyThresh := r.getConfig().HeavyMissThreshold
+	resolved := make([]resolvedBackend, len(backends))
+	for i, b := range backends {
+		cfg, target := b.snapshot()
+		resolved[i] = resolvedBackend{cfg: cfg, target: target, state: b}
+	}
+	rb, reason, heavy := selectResolvedBackend(r, resolved, r.getConfig().HeavyMissThreshold, an, exclude)
+	if rb == nil {
+		return nil, reason, heavy
+	}
+	return rb.state, reason, heavy
+}
 
-	var eligible []*BackendState
-	var allHealthy []*BackendState
-	for _, b := range backends {
-		bCfg := b.config()
-		if !b.healthy.Load() || exclude[bCfg.ID] {
+func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh int, an *RequestAnalysis, exclude map[string]bool) (*resolvedBackend, string, bool) {
+	if heavyThresh <= 0 {
+		heavyThresh = 24000
+	}
+
+	var eligible []*resolvedBackend
+	var allHealthy []*resolvedBackend
+	for i := range backends {
+		rb := &backends[i]
+		if (rb.state != nil && !rb.state.healthy.Load()) || exclude[rb.cfg.ID] {
 			continue
 		}
-		allHealthy = append(allHealthy, b)
-		if an.TotalEst <= bCfg.MaxSafeInput {
-			eligible = append(eligible, b)
+		allHealthy = append(allHealthy, rb)
+		if an.TotalEst <= rb.cfg.MaxSafeInput {
+			eligible = append(eligible, rb)
 		}
 	}
 	if len(eligible) == 0 {
 		if len(allHealthy) == 0 {
 			if len(backends) > 0 {
-				return backends[len(backends)-1], "fallback-unhealthy", false
+				return &backends[len(backends)-1], "fallback-unhealthy", false
 			}
 			return nil, "no-backends", false
 		}
@@ -749,15 +786,15 @@ func (r *Router) selectBackend(an *RequestAnalysis, exclude map[string]bool) (*B
 	isHeavyMiss := an.MissEst >= heavyThresh
 
 	if isHeavyMiss {
-		var idle []*BackendState
-		for _, b := range eligible {
-			if b.activeReqs.Load() == 0 && b.activeHeavy.Load() == 0 {
-				idle = append(idle, b)
+		var idle []*resolvedBackend
+		for _, rb := range eligible {
+			if rb.state == nil || (rb.state.activeReqs.Load() == 0 && rb.state.activeHeavy.Load() == 0) {
+				idle = append(idle, rb)
 			}
 		}
 		if len(idle) > 0 {
 			sort.Slice(idle, func(i, j int) bool {
-				ci, cj := idle[i].config(), idle[j].config()
+				ci, cj := idle[i].cfg, idle[j].cfg
 				if ci.SpeedScore != cj.SpeedScore {
 					return ci.SpeedScore > cj.SpeedScore
 				}
@@ -767,71 +804,93 @@ func (r *Router) selectBackend(an *RequestAnalysis, exclude map[string]bool) (*B
 		}
 
 		sort.Slice(eligible, func(i, j int) bool {
-			hi, hj := eligible[i].activeHeavy.Load(), eligible[j].activeHeavy.Load()
+			var hi, hj, ri, rj int64
+			if eligible[i].state != nil {
+				hi, ri = eligible[i].state.activeHeavy.Load(), eligible[i].state.activeReqs.Load()
+			}
+			if eligible[j].state != nil {
+				hj, rj = eligible[j].state.activeHeavy.Load(), eligible[j].state.activeReqs.Load()
+			}
 			if hi != hj {
 				return hi < hj
 			}
-			ri, rj := eligible[i].activeReqs.Load(), eligible[j].activeReqs.Load()
 			if ri != rj {
 				return ri < rj
 			}
-			return eligible[i].config().Tier < eligible[j].config().Tier
+			return eligible[i].cfg.Tier < eligible[j].cfg.Tier
 		})
 		return eligible[0], fmt.Sprintf("heavy-miss-least-busy(miss=%d)", an.MissEst), true
 	}
 
 	targetTier := 1
-	for _, b := range backends {
-		bCfg := b.config()
-		if an.TotalEst < bCfg.PromoteAt {
-			targetTier = bCfg.Tier
+	for _, rb := range backends {
+		if an.TotalEst < rb.cfg.PromoteAt {
+			targetTier = rb.cfg.Tier
 			break
 		}
-		targetTier = bCfg.Tier
+		targetTier = rb.cfg.Tier
 	}
 
-	r.mu.RLock()
-	sess, hasSess := r.sessions[an.SessionKey]
-	r.mu.RUnlock()
+	var sessTier int
+	var hasSess bool
+	if r != nil {
+		r.mu.RLock()
+		if sess, ok := r.sessions[an.SessionKey]; ok {
+			sessTier = sess.Tier
+			hasSess = true
+		}
+		r.mu.RUnlock()
+	}
 
 	reason := fmt.Sprintf("tier%d-len(%d)", targetTier, an.TotalEst)
-	if hasSess && sess.Tier > targetTier {
+	if hasSess && sessTier > targetTier {
 		demoteFloor := 0
-		for _, b := range backends {
-			bCfg := b.config()
-			if bCfg.Tier == sess.Tier {
-				demoteFloor = bCfg.DemoteBelow
+		for _, rb := range backends {
+			if rb.cfg.Tier == sessTier {
+				demoteFloor = rb.cfg.DemoteBelow
 				break
 			}
 		}
 		if an.TotalEst >= demoteFloor {
-			targetTier = sess.Tier
+			targetTier = sessTier
 			reason = fmt.Sprintf("tier%d-sticky(%d)", targetTier, an.TotalEst)
 		} else {
 			reason = fmt.Sprintf("tier%d-demoted(%d<%d)", targetTier, an.TotalEst, demoteFloor)
 		}
-	} else if hasSess && targetTier > sess.Tier {
+	} else if hasSess && targetTier > sessTier {
 		reason = fmt.Sprintf("tier%d-promoted(%d)", targetTier, an.TotalEst)
 	}
 
-	for _, b := range eligible {
-		if b.config().Tier == targetTier {
-			return b, reason, false
+	for _, rb := range eligible {
+		if rb.cfg.Tier == targetTier {
+			return rb, reason, false
 		}
 	}
-	for _, b := range eligible {
-		if b.config().Tier > targetTier {
-			return b, reason + "-failover-up", false
+	for _, rb := range eligible {
+		if rb.cfg.Tier > targetTier {
+			return rb, reason + "-failover-up", false
 		}
 	}
 	return eligible[len(eligible)-1], reason + "-failover", false
 }
 
-func (r *Router) recordCompletion(an *RequestAnalysis, backendID string, backendTier int, isHeavyWriter bool, actualPrompt, actualCached int) {
-	if an == nil || len(an.Hashes) == 0 {
+func (r *Router) recordCompletion(backends []resolvedBackend, an *RequestAnalysis, backendID string, backendTier int, isHeavyWriter bool, actualPrompt, actualCached int) {
+	if r == nil || an == nil || len(an.Hashes) == 0 {
 		return
 	}
-	backends := r.getBackends()
+	var cfgs []BackendConfig
+	if len(backends) > 0 {
+		cfgs = make([]BackendConfig, len(backends))
+		for i, rb := range backends {
+			cfgs[i] = rb.cfg
+		}
+	} else {
+		bs := r.getBackends()
+		cfgs = make([]BackendConfig, len(bs))
+		for i, b := range bs {
+			cfgs[i] = b.config()
+		}
+	}
 	now := time.Now()
 	total := an.TotalEst
 	if actualPrompt > 0 {
@@ -863,8 +922,7 @@ func (r *Router) recordCompletion(an *RequestAnalysis, backendID string, backend
 	}
 
 	homeTier := 1
-	for _, b := range backends {
-		bCfg := b.config()
+	for _, bCfg := range cfgs {
 		if total < bCfg.PromoteAt {
 			homeTier = bCfg.Tier
 			break
@@ -873,8 +931,7 @@ func (r *Router) recordCompletion(an *RequestAnalysis, backendID string, backend
 	}
 	if prev, ok := r.sessions[an.SessionKey]; ok && prev.Tier > homeTier {
 		demoteFloor := 0
-		for _, b := range backends {
-			bCfg := b.config()
+		for _, bCfg := range cfgs {
 			if bCfg.Tier == prev.Tier {
 				demoteFloor = bCfg.DemoteBelow
 				break

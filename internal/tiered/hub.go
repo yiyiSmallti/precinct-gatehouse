@@ -40,12 +40,87 @@ func NewHub(dataDir string, log *slog.Logger) *Hub {
 	}
 }
 
-// Transport returns an http.RoundTripper bound lazily by provider name. Safe during config preview/validation.
-func (h *Hub) Transport(provider string, upstream http.RoundTripper) http.RoundTripper {
+type planBackend struct {
+	cfg      BackendConfig
+	target   *url.URL
+	fallback *BackendState
+}
+
+type snapshotPlan struct {
+	provider string
+	cfg      RouterConfig
+	backends []planBackend
+}
+
+func newSnapshotPlan(provider string, tc config.TieredConfig, defaultPersist string) (*snapshotPlan, error) {
+	norm := normalizeRouterConfig(tc, defaultPersist)
+	backends := make([]planBackend, 0, len(norm.Backends))
+	for _, bc := range norm.Backends {
+		u, err := url.Parse(bc.URL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid backend url %q: %w", bc.URL, err)
+		}
+		fb := &BackendState{cfg: bc, target: u}
+		fb.healthy.Store(true)
+		backends = append(backends, planBackend{
+			cfg:      bc,
+			target:   u,
+			fallback: fb,
+		})
+	}
+	sort.Slice(backends, func(i, j int) bool {
+		return backends[i].cfg.Tier < backends[j].cfg.Tier
+	})
+	return &snapshotPlan{
+		provider: provider,
+		cfg:      norm,
+		backends: backends,
+	}, nil
+}
+
+func (p *snapshotPlan) resolve(r *Router) []resolvedBackend {
+	out := make([]resolvedBackend, len(p.backends))
+	for i, pb := range p.backends {
+		st := r.backendFor(pb.cfg.ID, pb.target)
+		if st == nil {
+			st = pb.fallback
+		}
+		out[i] = resolvedBackend{
+			cfg:    pb.cfg,
+			target: pb.target,
+			state:  st,
+		}
+	}
+	return out
+}
+
+func pickHighestHealthyResolved(backends []resolvedBackend) *resolvedBackend {
+	if len(backends) == 0 {
+		return nil
+	}
+	for i := len(backends) - 1; i >= 0; i-- {
+		if backends[i].state == nil || backends[i].state.healthy.Load() {
+			return &backends[i]
+		}
+	}
+	return &backends[len(backends)-1]
+}
+
+// Transport returns an http.RoundTripper bound to the given config snapshot for provider.
+// It is pure and safe to call during config preview/validation.
+func (h *Hub) Transport(provider string, cfg *config.TieredConfig, upstream http.RoundTripper) (http.RoundTripper, error) {
 	if upstream == nil {
 		upstream = http.DefaultTransport
 	}
-	return &hubTransport{hub: h, provider: provider, upstream: upstream}
+	if cfg == nil {
+		return upstream, nil
+	}
+	defaultPersist := filepath.Join(h.dataDir, "tiered", provider+"-starters.json")
+	plan, err := newSnapshotPlan(provider, *cfg, defaultPersist)
+	if err != nil {
+		return nil, err
+	}
+	return &hubTransport{hub: h, provider: provider, plan: plan, upstream: upstream}, nil
 }
 
 // Activate synchronizes active tiered routers with cfg (starting loops only for the live snapshot).
@@ -156,15 +231,19 @@ func (h *Hub) Close() error {
 type hubTransport struct {
 	hub      *Hub
 	provider string
+	plan     *snapshotPlan
 	upstream http.RoundTripper
 }
 
 func (t *hubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	r, ok := t.hub.Router(t.provider)
-	if !ok {
+	if t.plan == nil {
 		return t.upstream.RoundTrip(req)
 	}
-	return r.roundTrip(req, t.upstream)
+	r, _ := t.hub.Router(t.provider)
+	if t.plan.cfg.Mode == "active" {
+		return t.roundTripActive(req, r)
+	}
+	return t.roundTripShadow(req, r)
 }
 
 func readAndRestoreBody(req *http.Request) ([]byte, error) {
@@ -209,100 +288,97 @@ func syntheticJSONResp(req *http.Request, status int, body string) *http.Respons
 	}
 }
 
-func (r *Router) roundTrip(req *http.Request, upstream http.RoundTripper) (*http.Response, error) {
-	cfg := r.getConfig()
-	if cfg.Mode == "active" {
-		return r.roundTripActive(req)
-	}
-	return r.roundTripShadow(req, upstream)
-}
-
-func (r *Router) roundTripActive(req *http.Request) (*http.Response, error) {
+func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Response, error) {
 	start := time.Now()
 	body, err := readAndRestoreBody(req)
 	if err != nil {
 		return nil, err
 	}
-
-	if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/chat/completions") {
-		b := r.pickHighestHealthyBackend()
-		if b == nil {
+	resolved := t.plan.resolve(r)
+	passHighest := func(reqBody []byte) (*http.Response, error) {
+		rb := pickHighestHealthyResolved(resolved)
+		if rb == nil {
 			return syntheticJSONResp(req, http.StatusServiceUnavailable, `{"error":{"message":"no healthy backend available","type":"tiered_unavailable"}}`), nil
 		}
-		_, targetURL := b.snapshot()
-		outReq, rerr := http.NewRequestWithContext(req.Context(), req.Method, targetChatURL(targetURL, req.URL), bytes.NewReader(body))
+		outReq, rerr := http.NewRequestWithContext(req.Context(), req.Method, targetChatURL(rb.target, req.URL), bytes.NewReader(reqBody))
 		if rerr != nil {
 			return nil, rerr
 		}
 		outReq.Header = req.Header.Clone()
-		outReq.ContentLength = int64(len(body))
-		return r.transport.RoundTrip(outReq)
+		outReq.ContentLength = int64(len(reqBody))
+		return t.hub.transport.RoundTrip(outReq)
 	}
 
-	scCfg := r.starters.getCfg()
+	if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/chat/completions") {
+		return passHighest(body)
+	}
+
+	scCfg := t.plan.cfg.StarterCache
 	toolsReordered := false
-	if scCfg.CanonicalizeTools {
+	if scCfg != nil && scCfg.CanonicalizeTools {
 		if canonBody, changed, _ := canonicalizeTools(body); changed {
 			body = canonBody
 			toolsReordered = true
-			r.starters.toolsReordered.Add(1)
+			if r != nil {
+				r.starters.toolsReordered.Add(1)
+			}
 		}
 	}
 
 	var starterTmpl *StarterTemplate
-	if scCfg.Enabled {
+	if scCfg != nil && scCfg.Enabled {
 		starterTmpl = extractStarterTemplate(body, req.Header.Get("User-Agent"), scCfg.MinTokens, scCfg.MaxTokens)
 	}
 
 	an, ok := r.analyzeChatBody(body)
 	if !ok {
-		b := r.pickHighestHealthyBackend()
-		if b == nil {
-			return syntheticJSONResp(req, http.StatusServiceUnavailable, `{"error":{"message":"no healthy backend available","type":"tiered_unavailable"}}`), nil
-		}
-		_, targetURL := b.snapshot()
-		outReq, rerr := http.NewRequestWithContext(req.Context(), req.Method, targetChatURL(targetURL, req.URL), bytes.NewReader(body))
-		if rerr != nil {
-			return nil, rerr
-		}
-		outReq.Header = req.Header.Clone()
-		outReq.ContentLength = int64(len(body))
-		return r.transport.RoundTrip(outReq)
+		return passHighest(body)
 	}
 
 	sendBody := body
 	zhAnchored := false
-	if zhAnchorEnabled(r.getConfig()) {
+	if zhAnchorEnabled(t.plan.cfg) {
 		if anchoredBody, changed := injectZhThinkAnchor(body); changed {
 			sendBody = anchoredBody
 			zhAnchored = true
 		}
 	}
 
-	backends := r.getBackends()
-	if len(backends) == 0 {
+	if len(resolved) == 0 {
 		return syntheticJSONResp(req, http.StatusServiceUnavailable, `{"error":{"message":"no healthy backend available","type":"tiered_unavailable"}}`), nil
 	}
-	highestTier := backends[len(backends)-1].config().Tier
+	highestTier := resolved[len(resolved)-1].cfg.Tier
 	exclude := make(map[string]bool)
+	logger := t.hub.log
+	if r != nil {
+		logger = r.log
+	}
 
-	for attempt := 0; attempt < len(backends); attempt++ {
-		backend, reason, isHeavy := r.selectBackend(an, exclude)
-		if backend == nil {
+	for attempt := 0; attempt < len(resolved); attempt++ {
+		rb, reason, isHeavy := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, an, exclude)
+		if rb == nil {
 			return syntheticJSONResp(req, http.StatusServiceUnavailable, `{"error":{"message":"no healthy backend available","type":"tiered_unavailable"}}`), nil
 		}
-		bCfg, targetURL := backend.snapshot()
+		bCfg, targetURL, backend := rb.cfg, rb.target, rb.state
 
-		backend.activeReqs.Add(1)
-		backend.totalRouted.Add(1)
+		if backend != nil {
+			backend.activeReqs.Add(1)
+			backend.totalRouted.Add(1)
+		}
 		var heavyReleased atomic.Bool
-		if isHeavy {
+		if backend != nil && isHeavy {
 			backend.activeHeavy.Add(1)
 			backend.heavyRouted.Add(1)
 		}
 		releaseHeavy := func() {
-			if isHeavy && heavyReleased.CompareAndSwap(false, true) {
+			if backend != nil && isHeavy && heavyReleased.CompareAndSwap(false, true) {
 				backend.activeHeavy.Add(-1)
+			}
+		}
+		releaseActive := func() {
+			releaseHeavy()
+			if backend != nil {
+				backend.activeReqs.Add(-1)
 			}
 		}
 
@@ -311,8 +387,7 @@ func (r *Router) roundTripActive(req *http.Request) (*http.Response, error) {
 
 		outReq, rerr := http.NewRequestWithContext(req.Context(), req.Method, targetChatURL(targetURL, req.URL), bytes.NewReader(attemptBody))
 		if rerr != nil {
-			releaseHeavy()
-			backend.activeReqs.Add(-1)
+			releaseActive()
 			exclude[bCfg.ID] = true
 			continue
 		}
@@ -320,11 +395,10 @@ func (r *Router) roundTripActive(req *http.Request) (*http.Response, error) {
 		outReq.Header.Del("Transfer-Encoding")
 		outReq.ContentLength = int64(len(attemptBody))
 
-		resp, rerr := r.transport.RoundTrip(outReq)
+		resp, rerr := t.hub.transport.RoundTrip(outReq)
 		if rerr != nil {
-			releaseHeavy()
-			backend.activeReqs.Add(-1)
-			r.log.Warn("tiered backend roundtrip failed, failing over", "provider", r.name, "attempt", attempt, "backend", bCfg.ID, "err", rerr)
+			releaseActive()
+			logger.Warn("tiered backend roundtrip failed, failing over", "provider", t.provider, "attempt", attempt, "backend", bCfg.ID, "err", rerr)
 			exclude[bCfg.ID] = true
 			continue
 		}
@@ -333,31 +407,27 @@ func (r *Router) roundTripActive(req *http.Request) (*http.Response, error) {
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 			_ = resp.Body.Close()
 			if isContextLengthError(resp.StatusCode, errBody) {
-				releaseHeavy()
-				backend.activeReqs.Add(-1)
-				r.log.Info("backend returned context length error, retrying larger tier", "provider", r.name, "backend", bCfg.ID, "est", an.TotalEst)
-				for _, b := range backends {
-					otherCfg := b.config()
-					if otherCfg.Tier <= bCfg.Tier {
-						exclude[otherCfg.ID] = true
+				releaseActive()
+				logger.Info("backend returned context length error, retrying larger tier", "provider", t.provider, "backend", bCfg.ID, "est", an.TotalEst)
+				for _, other := range resolved {
+					if other.cfg.Tier <= bCfg.Tier {
+						exclude[other.cfg.ID] = true
 					}
 				}
 				continue
 			}
-			releaseHeavy()
-			backend.activeReqs.Add(-1)
+			releaseActive()
 			resp.Body = io.NopCloser(bytes.NewReader(errBody))
 			resp.ContentLength = int64(len(errBody))
 			setRouterHeaders(resp.Header, bCfg.ID, reason, an, toolsReordered, clampedMaxOut, zhAnchored)
 			return resp, nil
 		}
 
-		if (resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && attempt+1 < len(backends) {
+		if (resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && attempt+1 < len(resolved) {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			releaseHeavy()
-			backend.activeReqs.Add(-1)
-			r.log.Warn("tiered backend bad gateway status, failing over", "provider", r.name, "backend", bCfg.ID, "status", resp.StatusCode)
+			releaseActive()
+			logger.Warn("tiered backend bad gateway status, failing over", "provider", t.provider, "backend", bCfg.ID, "status", resp.StatusCode)
 			exclude[bCfg.ID] = true
 			continue
 		}
@@ -367,31 +437,32 @@ func (r *Router) roundTripActive(req *http.Request) (*http.Response, error) {
 			inner:        resp.Body,
 			releaseHeavy: releaseHeavy,
 			onDone: func(completed bool, tail []byte) {
-				releaseHeavy()
-				backend.activeReqs.Add(-1)
+				releaseActive()
 				actualPrompt, actualCached := extractUsageFromTail(tail)
-				if completed && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					r.recordCompletion(an, bCfg.ID, bCfg.Tier, isHeavy, actualPrompt, actualCached)
+				if r != nil && completed && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					r.recordCompletion(resolved, an, bCfg.ID, bCfg.Tier, isHeavy, actualPrompt, actualCached)
 					if starterTmpl != nil {
 						r.starters.Observe(starterTmpl)
 					}
 				}
 				durMs := time.Since(start).Milliseconds()
-				r.log.Info("tiered route", "provider", r.name, "mode", "active", "backend", bCfg.ID, "reason", reason,
+				logger.Info("tiered route", "provider", t.provider, "mode", "active", "backend", bCfg.ID, "reason", reason,
 					"est", an.TotalEst, "cached_est", an.CachedEst, "miss_est", an.MissEst,
 					"actual_prompt", actualPrompt, "actual_cached", actualCached, "status", resp.StatusCode, "ms", durMs)
-				r.appendLog(RouteLogEntry{
-					Time:         time.Now().Format("15:04:05"),
-					Backend:      bCfg.ID,
-					Reason:       reason,
-					TotalEst:     an.TotalEst,
-					CachedEst:    an.CachedEst,
-					MissEst:      an.MissEst,
-					ActualPrompt: actualPrompt,
-					ActualCache:  actualCached,
-					Status:       resp.StatusCode,
-					DurationMs:   durMs,
-				})
+				if r != nil {
+					r.appendLog(RouteLogEntry{
+						Time:         time.Now().Format("15:04:05"),
+						Backend:      bCfg.ID,
+						Reason:       reason,
+						TotalEst:     an.TotalEst,
+						CachedEst:    an.CachedEst,
+						MissEst:      an.MissEst,
+						ActualPrompt: actualPrompt,
+						ActualCache:  actualCached,
+						Status:       resp.StatusCode,
+						DurationMs:   durMs,
+					})
+				}
 			},
 		}
 		return resp, nil
@@ -400,7 +471,7 @@ func (r *Router) roundTripActive(req *http.Request) (*http.Response, error) {
 	return syntheticJSONResp(req, http.StatusBadGateway, `{"error":{"message":"all backends failed","type":"tiered_bad_gateway"}}`), nil
 }
 
-func (r *Router) roundTripShadow(req *http.Request, upstream http.RoundTripper) (*http.Response, error) {
+func (t *hubTransport) roundTripShadow(req *http.Request, r *Router) (*http.Response, error) {
 	start := time.Now()
 	origBody, err := readAndRestoreBody(req)
 	if err != nil {
@@ -408,26 +479,29 @@ func (r *Router) roundTripShadow(req *http.Request, upstream http.RoundTripper) 
 	}
 
 	if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/chat/completions") {
-		return upstream.RoundTrip(req)
+		return t.upstream.RoundTrip(req)
 	}
 
-	scCfg := r.starters.getCfg()
+	scCfg := t.plan.cfg.StarterCache
 	workBody := append([]byte(nil), origBody...)
-	if scCfg.CanonicalizeTools {
+	if scCfg != nil && scCfg.CanonicalizeTools {
 		if canonBody, changed, _ := canonicalizeTools(workBody); changed {
 			workBody = canonBody
-			r.starters.toolsReordered.Add(1)
+			if r != nil {
+				r.starters.toolsReordered.Add(1)
+			}
 		}
 	}
 	var starterTmpl *StarterTemplate
-	if scCfg.Enabled {
+	if scCfg != nil && scCfg.Enabled {
 		starterTmpl = extractStarterTemplate(workBody, req.Header.Get("User-Agent"), scCfg.MinTokens, scCfg.MaxTokens)
 	}
 	an, ok := r.analyzeChatBody(workBody)
+	resolved := t.plan.resolve(r)
 	var predID, predReason string
 	if ok {
-		if pb, pr, _ := r.selectBackend(an, nil); pb != nil {
-			predID = pb.config().ID
+		if pb, pr, _ := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, an, nil); pb != nil {
+			predID = pb.cfg.ID
 			predReason = pr
 		}
 	}
@@ -436,7 +510,7 @@ func (r *Router) roundTripShadow(req *http.Request, upstream http.RoundTripper) 
 	req.Body = io.NopCloser(bytes.NewReader(origBody))
 	req.ContentLength = int64(len(origBody))
 
-	resp, err := upstream.RoundTrip(req)
+	resp, err := t.upstream.RoundTrip(req)
 	if err != nil {
 		return nil, err
 	}
@@ -450,14 +524,28 @@ func (r *Router) roundTripShadow(req *http.Request, upstream http.RoundTripper) 
 		resp.Header.Set("X-Router-Shadow-Backend", predID)
 		resp.Header.Set("X-Router-Shadow-Reason", predReason)
 	}
-	r.recordShadow(predID, predReason, actualID, actualReason, an)
+	if r != nil {
+		r.recordShadow(predID, predReason, actualID, actualReason, an)
+	}
 
-	actualBackend := r.backendByID(actualID)
+	var actualBackend *BackendState
 	actualTier := 0
+	for i := range resolved {
+		if resolved[i].cfg.ID == actualID {
+			actualBackend = resolved[i].state
+			actualTier = resolved[i].cfg.Tier
+			break
+		}
+	}
+	if actualBackend == nil && r != nil {
+		if b := r.backendByID(actualID); b != nil {
+			actualBackend = b
+			actualTier = b.config().Tier
+		}
+	}
 	actualHeavy := strings.HasPrefix(actualReason, "heavy-miss")
 	var heavyReleased atomic.Bool
 	if actualBackend != nil {
-		actualTier = actualBackend.config().Tier
 		actualBackend.activeReqs.Add(1)
 		actualBackend.totalRouted.Add(1)
 		if actualHeavy {
@@ -480,16 +568,16 @@ func (r *Router) roundTripShadow(req *http.Request, upstream http.RoundTripper) 
 				actualBackend.activeReqs.Add(-1)
 			}
 			actualPrompt, actualCached := extractUsageFromTail(tail)
-			if completed && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if r != nil && completed && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				if actualID != "" {
-					r.recordCompletion(an, actualID, actualTier, actualHeavy, actualPrompt, actualCached)
+					r.recordCompletion(resolved, an, actualID, actualTier, actualHeavy, actualPrompt, actualCached)
 				}
 				if starterTmpl != nil {
 					r.starters.Observe(starterTmpl)
 				}
 			}
 			durMs := time.Since(start).Milliseconds()
-			if actualID != "" {
+			if r != nil && actualID != "" {
 				r.appendLog(RouteLogEntry{
 					Time:         time.Now().Format("15:04:05"),
 					Backend:      actualID,

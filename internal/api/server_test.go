@@ -11,6 +11,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -226,5 +230,284 @@ redaction:
 	}
 	if hs, unavail := checkHealth(); hs != "ok" || len(unavail) != 0 {
 		t.Fatalf("expected ok after removing required detector, got status=%q unavailable=%v", hs, unavail)
+	}
+}
+
+type gatedBody struct {
+	data    []byte
+	offset  int
+	started chan struct{}
+	once    sync.Once
+	release <-chan struct{}
+}
+
+func (g *gatedBody) Read(p []byte) (int, error) {
+	g.once.Do(func() {
+		close(g.started)
+		<-g.release
+	})
+	if g.offset >= len(g.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, g.data[g.offset:])
+	g.offset += n
+	return n, nil
+}
+
+func (g *gatedBody) Close() error { return nil }
+
+func TestInFlightTieredSnapshotIsolation(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	var localHits, extHits atomic.Int32
+	var extLastBody atomic.Value
+	mkBackend := func(counter *atomic.Int32, saveBody *atomic.Value) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/get_server_info" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"ok":true}`))
+				return
+			}
+			b, _ := io.ReadAll(r.Body)
+			if saveBody != nil {
+				saveBody.Store(string(b))
+			}
+			counter.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`))
+		}))
+	}
+	localSrv := mkBackend(&localHits, nil)
+	defer localSrv.Close()
+	extSrv := mkBackend(&extHits, &extLastBody)
+	defer extSrv.Close()
+
+	cfgText := func(target, backendURL string) string {
+		return fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: tierp
+    target: %s
+    models: [m1]
+    tiered:
+      mode: active
+      heavy_miss_threshold: 24000
+      health_interval_sec: 60
+      zh_think_anchor: false
+      starter_cache:
+        enabled: false
+      backends:
+        - id: b1
+          url: %s
+          tier: 1
+          max_context_tokens: 64000
+          max_safe_input: 50000
+          promote_at: 64000
+          speed_score: 100
+default_group: main
+routing_groups:
+  main:
+    members: [tierp/m1]
+redaction:
+  mode_by_target: { local: off, external: mask }
+`, dir, target, backendURL)
+	}
+
+	raw0 := cfgText("local", localSrv.URL)
+	if err := os.WriteFile(cfgPath, []byte(raw0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(raw0), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	inFlightReq, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", &gatedBody{
+		data:    []byte(`{"model":"tierp/m1","messages":[{"role":"user","content":"call me 13800138000"}]}`),
+		started: started,
+		release: release,
+	})
+	inFlightReq.Header.Set("Authorization", "Bearer "+tok)
+	inFlightReq.Header.Set("Content-Type", "application/json")
+	inFlightRec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		srv.HTTP.Handler.ServeHTTP(inFlightRec, inFlightReq)
+		close(done)
+	}()
+
+	// Wait until Pipeline.Serve has bound Snapshot 1 and is reading the request body.
+	<-started
+
+	// Hot reload to Snapshot 2: external target & new backend URL on the same backend ID ("b1").
+	if _, err := srv.Live.Apply([]byte(cfgText("external", extSrv.URL)), "test", srv.Live.Current().Cfg.Hash()); err != nil {
+		t.Fatalf("apply snapshot 2: %v", err)
+	}
+
+	// Unblock Snapshot 1's in-flight request: it must still dispatch to localSrv, never extSrv.
+	close(release)
+	<-done
+
+	if inFlightRec.Code != http.StatusOK {
+		t.Fatalf("expected in-flight status 200, got %d (%s)", inFlightRec.Code, inFlightRec.Body.String())
+	}
+	if localHits.Load() != 1 || extHits.Load() != 0 {
+		t.Fatalf("expected in-flight Snapshot 1 request to hit localSrv only, got local=%d ext=%d", localHits.Load(), extHits.Load())
+	}
+
+	// New request under Snapshot 2 hits extSrv with external masking applied.
+	nextReq, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"tierp/m1","messages":[{"role":"user","content":"call me 13800138000"}]}`)))
+	nextReq.Header.Set("Authorization", "Bearer "+tok)
+	nextReq.Header.Set("Content-Type", "application/json")
+	nextRec := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(nextRec, nextReq)
+	if nextRec.Code != http.StatusOK {
+		t.Fatalf("expected post-reload status 200, got %d (%s)", nextRec.Code, nextRec.Body.String())
+	}
+	if localHits.Load() != 1 || extHits.Load() != 1 {
+		t.Fatalf("expected post-reload request to hit extSrv, got local=%d ext=%d", localHits.Load(), extHits.Load())
+	}
+	seenBody, _ := extLastBody.Load().(string)
+	if !strings.Contains(seenBody, "{{PHONE_") {
+		t.Fatalf("expected post-reload external request body to be masked, got %s", seenBody)
+	}
+}
+
+func TestHotReloadVaultTTL(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	phoneRe := regexp.MustCompile(`\{\{PHONE_[a-z2-7]{8}\}\}`)
+	var capturedPlaceholder atomic.Value
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		ph := phoneRe.FindString(string(b))
+		if ph != "" {
+			capturedPlaceholder.Store(ph)
+		} else if prev, ok := capturedPlaceholder.Load().(string); ok {
+			ph = prev
+		}
+		reply := "echo " + ph
+		respJSON, _ := json.Marshal(map[string]any{
+			"id":     "c1",
+			"object": "chat.completion",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": reply},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(respJSON)
+	}))
+	defer up.Close()
+
+	cfgWithTTL := func(ttl string) string {
+		return fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: cloud
+    base_url: %s/v1
+    target: external
+    models: [m1]
+default_group: main
+routing_groups:
+  main:
+    members: [cloud/m1]
+redaction:
+  mode_by_target: { local: audit, external: mask }
+  vault_ttl: %s
+`, dir, up.URL, ttl)
+	}
+
+	raw0 := cfgWithTTL("24h")
+	if err := os.WriteFile(cfgPath, []byte(raw0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(raw0), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	call := func(msg string) string {
+		t.Helper()
+		payload := fmt.Sprintf(`{"model":"cloud/m1","messages":[{"role":"user","content":%q}]}`, msg)
+		req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(payload)))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Gatehouse-Session", "s1")
+		rec := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.Choices[0].Message.Content
+	}
+
+	// 1. Store secret placeholder under vault_ttl=24h and verify restore.
+	if got := call("my phone is 13800138000"); got != "echo 13800138000" {
+		t.Fatalf("expected restored phone initially, got %q", got)
+	}
+	ph, _ := capturedPlaceholder.Load().(string)
+	if ph == "" {
+		t.Fatal("expected upstream to observe placeholder")
+	}
+
+	// 2. Preview with a tiny TTL must NOT evict or shorten the live Vault.
+	if _, err := srv.Live.Preview([]byte(cfgWithTTL("1ms"))); err != nil {
+		t.Fatalf("preview 1ms: %v", err)
+	}
+	time.Sleep(15 * time.Millisecond)
+	if got := call("echo previous placeholder"); got != "echo 13800138000" {
+		t.Fatalf("expected Preview not to affect live vault TTL, got %q", got)
+	}
+
+	// 3. Hot reload vault_ttl to 30ms after letting the bucket sit idle > 30ms.
+	time.Sleep(50 * time.Millisecond)
+	if _, err := srv.Live.Apply([]byte(cfgWithTTL("30ms")), "test", srv.Live.Current().Cfg.Hash()); err != nil {
+		t.Fatalf("apply 30ms: %v", err)
+	}
+	if got := call("echo previous placeholder"); got != "echo "+ph {
+		t.Fatalf("expected expired bucket not to restore after vault_ttl reload, got %q (wanted %q)", got, "echo "+ph)
 	}
 }

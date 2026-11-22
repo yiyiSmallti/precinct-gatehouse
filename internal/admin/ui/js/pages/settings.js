@@ -109,22 +109,26 @@ export function renderSettings(container) {
     const maxBodyIn = el('input', {
       className: 'input num',
       type: 'number',
-      min: 1,
+      min: 0,
       value: String(gen.max_body_mb ?? 32),
       onChange: (e) => {
         const next = clone(store.getSection('general'));
-        next.max_body_mb = Math.max(1, Number(e.target.value || 32));
+        const rawVal = e.target.value.trim();
+        const parsed = rawVal === '' ? 32 : Number(rawVal);
+        next.max_body_mb = Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : 32;
         store.setDraft('general', next);
       },
     });
     const logDaysIn = el('input', {
       className: 'input num',
       type: 'number',
-      min: 1,
-      value: String(gen.request_log_days ?? 30),
+      min: 0,
+      value: String(gen.request_log_days ?? 90),
       onChange: (e) => {
         const next = clone(store.getSection('general'));
-        next.request_log_days = Math.max(1, Number(e.target.value || 30));
+        const rawVal = e.target.value.trim();
+        const parsed = rawVal === '' ? 90 : Number(rawVal);
+        next.request_log_days = Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : 90;
         store.setDraft('general', next);
       },
     });

@@ -27,11 +27,39 @@ func NewVault(ttl time.Duration) *Vault {
 	return &Vault{ttl: ttl, buckets: map[string]*Bucket{}}
 }
 
-// Bucket returns (creating) the bucket for key and marks it active.
+// SetTTL updates the default bucket TTL and immediately sweeps buckets idle beyond ttl.
+func (v *Vault) SetTTL(ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	now := time.Now()
+	v.mu.Lock()
+	v.ttl = ttl
+	for k, b := range v.buckets {
+		b.mu.RLock()
+		stale := now.Sub(b.seen) > ttl
+		b.mu.RUnlock()
+		if stale {
+			delete(v.buckets, k)
+		}
+	}
+	v.lastGC = now
+	v.mu.Unlock()
+}
+
+// Bucket returns (creating) the bucket for key and marks it active using the vault's default TTL.
 func (v *Vault) Bucket(key string) *Bucket {
+	return v.BucketWithTTL(key, v.ttl)
+}
+
+// BucketWithTTL returns (creating) the bucket for key, enforcing ttl for expiration, and marks it active.
+func (v *Vault) BucketWithTTL(key string, ttl time.Duration) *Bucket {
 	now := time.Now()
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if ttl <= 0 {
+		ttl = v.ttl
+	}
 	if now.Sub(v.lastGC) > time.Minute {
 		for k, b := range v.buckets {
 			b.mu.RLock()
@@ -44,6 +72,15 @@ func (v *Vault) Bucket(key string) *Bucket {
 		v.lastGC = now
 	}
 	b := v.buckets[key]
+	if b != nil {
+		b.mu.RLock()
+		stale := now.Sub(b.seen) > ttl
+		b.mu.RUnlock()
+		if stale {
+			delete(v.buckets, key)
+			b = nil
+		}
+	}
 	if b == nil {
 		b = &Bucket{m: map[string]string{}}
 		v.buckets[key] = b

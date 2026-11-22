@@ -165,7 +165,11 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		}
 		for _, pc := range nextCfg.Providers {
 			if pc.Tiered != nil {
-				reg.SetTransport(pc.Name, hub.Transport(pc.Name, nil))
+				tr, err := hub.Transport(pc.Name, pc.Tiered, nil)
+				if err != nil {
+					return nil, fmt.Errorf("provider %s tiered: %w", pc.Name, err)
+				}
+				reg.SetTransport(pc.Name, tr)
 			}
 		}
 		for _, pc := range nextCfg.Providers {
@@ -245,6 +249,9 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		}
 	}()
 	liveMgr.OnSwap = func(snap *live.Snapshot) {
+		if snap.Redactor != nil && snap.Redactor.Vault != nil {
+			snap.Redactor.Vault.SetTTL(snap.Redactor.VaultTTL())
+		}
 		hub.Activate(snap.Cfg)
 		if snap.Cfg.LogRetentionDays() > 0 {
 			select {

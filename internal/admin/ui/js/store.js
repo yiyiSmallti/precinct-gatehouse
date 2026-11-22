@@ -76,7 +76,7 @@ export const store = {
     if (sec === 'general') {
       return clone({
         max_body_mb: raw.max_body_mb ?? 32,
-        request_log_days: raw.request_log_days ?? 30,
+        request_log_days: raw.request_log_days ?? 90,
         tokens: raw.tokens || { default_ttl: '720h' },
       });
     }

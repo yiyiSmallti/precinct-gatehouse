@@ -54,7 +54,7 @@ export function renderLogs(container, ctx) {
         el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
           statusBadge(r.status),
           r.error_code ? el('span', { className: 'pill pill-err mono' }, r.error_code) : null,
-          el('span', { className: 'pill mono' }, r.protocol || 'openai'),
+          el('span', { className: 'pill mono' }, r.protocol || 'chat'),
           r.stream ? el('span', { className: 'pill' }, '流式 Stream') : el('span', { className: 'pill' }, '非流式')
         ),
         sectionGroup('请求标识', [
@@ -160,8 +160,8 @@ export function renderLogs(container, ctx) {
     },
       ...[
         { v: '', l: '全部协议' },
-        { v: 'openai', l: 'OpenAI Chat' },
-        { v: 'anthropic', l: 'Claude Messages' },
+        { v: 'chat', l: 'OpenAI Chat' },
+        { v: 'messages', l: 'Claude Messages' },
         { v: 'responses', l: 'OpenAI Responses' },
       ].map((o) => el('option', { value: o.v, selected: filters.protocol === o.v }, o.l))
     );
@@ -222,7 +222,7 @@ export function renderLogs(container, ctx) {
                 },
                   el('td', { className: 'num muted nowrap' }, fmtDateTime(r.ts)),
                   el('td', { className: 'nowrap' }, el('span', null, r.key_name || r.key_id || '-')),
-                  el('td', { className: 'nowrap' }, el('span', { className: 'mono muted-2', style: { fontSize: '12px' } }, r.protocol || 'openai')),
+                  el('td', { className: 'nowrap' }, el('span', { className: 'mono muted-2', style: { fontSize: '12px' } }, r.protocol || 'chat')),
                   el('td', { className: 'mono', style: { fontSize: '12px', maxWidth: '240px' } },
                     r.requested_model && r.model && r.requested_model !== r.model
                       ? [
