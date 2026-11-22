@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/admin"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/api"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
@@ -48,6 +50,7 @@ Usage:
   gatehouse apikey list [--json]
   gatehouse apikey update <id> [--name N] [--models a,b] [--groups g] [--rpm N] [--rpd N] [--concurrency N] [--ttl 0|720h] [--note s]
   gatehouse apikey enable|disable|reset|delete <id>
+  gatehouse admin set-password [--user admin]   (reads password from stdin)
   gatehouse token issue --name N [--ttl 24h] [--models p/m,...] [--groups g,...] [--max-tokens N] [--data-class internal]
   gatehouse token revoke <id|name>
   gatehouse token list
@@ -73,6 +76,8 @@ func main() {
 		err = serve(args)
 	case "apikey":
 		err = apikeyCmd(args)
+	case "admin":
+		err = adminCmd(args)
 	case "token":
 		err = tokenCmd(args)
 	case "config":
@@ -178,6 +183,34 @@ Next steps:
 	if len(srv.Missing) > 0 {
 		log.Warn("required detectors unavailable; requests that need redaction will get 503", "detectors", srv.Missing)
 	}
+	var admSrv *http.Server
+	if cfg.Admin.Listen != "" {
+		if !admin.HasPassword(srv.DB) {
+			log.Warn("admin password is not set; run `gatehouse admin set-password`")
+		}
+		adm := admin.New(admin.Deps{
+			DB:         srv.DB,
+			Keys:       srv.Keys,
+			Limiter:    srv.Limiter,
+			Reg:        srv.Reg,
+			Cfg:        cfg,
+			SessionTTL: cfg.Admin.SessionTTL.D(12 * time.Hour),
+		})
+		admLn, err := net.Listen("tcp", cfg.Admin.Listen)
+		if err != nil {
+			_ = ln.Close()
+			srv.Shutdown(context.Background())
+			return err
+		}
+		admSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second}
+		log.Info("admin listening", "addr", "http://"+admLn.Addr().String()+"/admin/")
+		defer admLn.Close()
+		go func() {
+			if err := admSrv.Serve(admLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				log.Error("admin server failed", "err", err)
+			}
+		}()
+	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.HTTP.Serve(ln) }()
 	sig := make(chan os.Signal, 1)
@@ -186,11 +219,18 @@ Next steps:
 	case <-sig:
 	case err := <-errc:
 		if err != nil && !errors.Is(err, net.ErrClosed) {
+			if admSrv != nil {
+				_ = admSrv.Shutdown(context.Background())
+			}
+			srv.Shutdown(context.Background())
 			return err
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if admSrv != nil {
+		_ = admSrv.Shutdown(ctx)
+	}
 	srv.Shutdown(ctx)
 	log.Info("gatehouse stopped")
 	return nil
@@ -654,5 +694,39 @@ func apikeyCmd(args []string) error {
 	default:
 		return fmt.Errorf("apikey: unknown subcommand %q", sub)
 	}
+	return nil
+}
+
+func adminCmd(args []string) error {
+	if len(args) == 0 || args[0] != "set-password" {
+		return fmt.Errorf("admin: want set-password [--user admin]")
+	}
+	fs, cfgPath := newFlags("admin set-password")
+	user := fs.String("user", "admin", "admin username")
+	ordered := splitFlagsAndPos(args[1:], nil)
+	if err := fs.Parse(ordered); err != nil {
+		return exitErr(2)
+	}
+	cfg, err := load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	pass := strings.TrimRight(line, "\r\n")
+	if pass == "" {
+		return fmt.Errorf("admin set-password: empty password on stdin")
+	}
+	db, err := store.Open(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := admin.SetPassword(db, *user, pass); err != nil {
+		return err
+	}
+	fmt.Printf("admin password updated for %q\n", strings.TrimSpace(*user))
 	return nil
 }

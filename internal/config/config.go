@@ -38,15 +38,22 @@ type Config struct {
 	Plugins       []Plugin                 `yaml:"plugins"`
 	Tokens        TokenDefaults            `yaml:"tokens"`
 	Org           Org                      `yaml:"org"`
+	Admin         Admin                    `yaml:"admin"`
 
 	path string
+}
+
+// Admin configures the optional web control plane.
+type Admin struct {
+	Listen     string   `yaml:"listen"`
+	SessionTTL Duration `yaml:"session_ttl"` // default 12h
 }
 
 // ModelAlias maps a requested model name (exact or path.Match pattern) to a
 // routing target ("auto", a routing group, or "<provider>/<model>").
 type ModelAlias struct {
-	Match string `yaml:"match"`
-	Use   string `yaml:"use"`
+	Match string `yaml:"match" json:"match"`
+	Use   string `yaml:"use" json:"use"`
 }
 
 // Org configures org mode.

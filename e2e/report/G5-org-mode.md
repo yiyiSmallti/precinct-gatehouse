@@ -1,6 +1,6 @@
 # G5 org 模式
 
-结果：**通过** · 运行于 2026-11-22 05:58:04 PST · darwin/arm64
+结果：**通过** · 运行于 2026-11-22 06:04:59 PST · darwin/arm64
 
 `mode: org`，策略插件 `cloister` 用 e2e/fakeplugin 的假实现（按令牌返回租户、用户、部门与分级）。默认组 `order: [cloud/strong, local/a, local/b]`，cloud 是外部目标。同时挂上 AuditSink 插件（写文件）、Provider 插件（`plug/x`）和 Hooks 插件（在最后一条用户消息后加 `[hooked:<部门>]`）。
 
