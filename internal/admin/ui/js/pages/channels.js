@@ -209,8 +209,10 @@ export function renderChannels(container) {
         nameIn.focus();
         return;
       }
-      if (!pluginIn.value.trim() && !baseURL) {
-        errBanner.textContent = '非插件渠道必须填写 Base URL';
+      if (!pluginIn.value.trim() && (!orig.tiered || orig.tiered.mode === 'shadow') && !baseURL) {
+        errBanner.textContent = orig.tiered?.mode === 'shadow'
+          ? 'Shadow 分层模式必须填写 Base URL'
+          : '非插件渠道必须填写 Base URL';
         errBanner.style.display = 'flex';
         urlIn.focus();
         return;
@@ -241,6 +243,7 @@ export function renderChannels(container) {
         nextObj.extra_body = extraBodyState.value;
       }
       if (orig.has_key) nextObj.has_key = true;
+      if (orig.tiered) nextObj.tiered = clone(orig.tiered);
 
       const pricingMap = {};
       pricingRows.forEach((r) => {
@@ -471,11 +474,14 @@ export function renderChannels(container) {
 
                 return el('tr', null,
                   el('td', { className: 'nowrap' },
-                    el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+                    el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
                       el('strong', null, p.name),
                       el('span', { className: `pill ${p.target === 'external' ? 'pill-brass' : 'pill-ok'}` },
                         p.target === 'external' ? 'external' : 'local'
-                      )
+                      ),
+                      (p.tiered || rt?.has_tiered)
+                        ? el('span', { className: 'pill pill-brass' }, '智能分层')
+                        : null
                     ),
                     p.plugin ? el('div', { className: 'muted mono', style: { fontSize: '12px' } }, `plugin: ${p.plugin}`) : null
                   ),

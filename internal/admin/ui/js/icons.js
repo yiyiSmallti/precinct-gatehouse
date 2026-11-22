@@ -6,6 +6,7 @@ const PATHS = {
   keys: '<circle cx="8" cy="14" r="3.5"/><path d="M11 11.5L19.5 4M17 6.5l2.5 2.5M14.5 9l2 2"/>',
   channels: '<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><circle cx="7" cy="7" r="0.8" fill="currentColor"/><circle cx="7" cy="17" r="0.8" fill="currentColor"/>',
   routing: '<circle cx="5" cy="12" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 12h4c2 0 3-6 6-6M11 12c2 0 3 6 6 6"/>',
+  tiers: '<rect x="3" y="4" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="16" width="18" height="4" rx="1"/>',
   redaction: '<path d="M12 3l7 3v5.5c0 4.5-3 7.8-7 9.5-4-1.7-7-5-7-9.5V6l7-3z"/><path d="M9.5 12l1.8 1.8 3.5-3.8"/>',
   logs: '<path d="M5 5h14M5 10h14M5 15h10M5 19h7"/>',
   usage: '<path d="M4 19h16"/><rect x="6" y="11" width="3" height="8" rx="0.5"/><rect x="11" y="7" width="3" height="12" rx="0.5"/><rect x="16" y="4" width="3" height="15" rx="0.5"/>',

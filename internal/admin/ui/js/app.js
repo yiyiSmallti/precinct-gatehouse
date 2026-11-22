@@ -17,6 +17,7 @@ import { renderOverview } from '/admin/js/pages/overview.js';
 import { renderKeys } from '/admin/js/pages/keys.js';
 import { renderChannels } from '/admin/js/pages/channels.js';
 import { renderRouting } from '/admin/js/pages/routing.js';
+import { renderTiered } from '/admin/js/pages/tiered.js';
 import { renderRedaction } from '/admin/js/pages/redaction.js';
 import { renderLogs } from '/admin/js/pages/logs.js';
 import { renderUsage } from '/admin/js/pages/usage.js';
@@ -37,6 +38,7 @@ const NAV_GROUPS = [
       { id: 'keys', title: '访问密钥', ic: 'keys' },
       { id: 'channels', title: '模型渠道', ic: 'channels', sec: 'providers' },
       { id: 'routing', title: '路由与别名', ic: 'routing', sec: ['routing', 'aliases'] },
+      { id: 'tiered', title: '智能路由', ic: 'tiers', sec: 'providers' },
       { id: 'redaction', title: '隐私脱敏', ic: 'redaction', sec: 'redaction' },
       { id: 'settings', title: '系统与配置', ic: 'settings', sec: 'general' },
     ],
@@ -50,6 +52,7 @@ const ROUTE_TITLES = {
   keys: '访问密钥',
   channels: '模型渠道',
   routing: '路由与别名',
+  tiered: '智能路由',
   redaction: '隐私脱敏',
   settings: '系统与配置',
 };
@@ -511,6 +514,9 @@ function renderPage() {
       break;
     case 'routing':
       renderRouting(pageHost, ctx);
+      break;
+    case 'tiered':
+      renderTiered(pageHost, ctx);
       break;
     case 'redaction':
       renderRedaction(pageHost, ctx);

@@ -113,4 +113,16 @@ export const api = {
     }),
   deleteProviderKey: (name) =>
     request('DELETE', `/admin/api/providers/${encodeURIComponent(name)}/key`),
+
+  tieredStatus: () => request('GET', '/admin/api/tiered'),
+  tieredStarters: (provider) =>
+    request('GET', `/admin/api/tiered/${encodeURIComponent(provider)}/starters`),
+  pinTieredStarter: (provider, data) =>
+    request('POST', `/admin/api/tiered/${encodeURIComponent(provider)}/starters/pin`, data),
+  deleteTieredStarter: (provider, hash) =>
+    request('DELETE', `/admin/api/tiered/${encodeURIComponent(provider)}/starters/${encodeURIComponent(hash)}`),
+  warmTieredStarters: (provider, data = {}) =>
+    request('POST', `/admin/api/tiered/${encodeURIComponent(provider)}/starters/warm`, data),
+  resetTieredShadow: (provider) =>
+    request('POST', `/admin/api/tiered/${encodeURIComponent(provider)}/shadow/reset`, {}),
 };

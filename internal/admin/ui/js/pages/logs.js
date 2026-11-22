@@ -67,6 +67,8 @@ export function renderLogs(container, ctx) {
         sectionGroup('路由与耗时', [
           kvRow('请求模型', r.requested_model || '-'),
           kvRow('路由模型', r.model || '-'),
+          kvRow('路由后端', r.route_backend || '-'),
+          kvRow('路由原因', r.route_reason || '-'),
           kvRow('输入 Token', fmtNum(r.prompt_tokens)),
           kvRow('输出 Token', fmtNum(r.completion_tokens)),
           kvRow('缓存命中 Token', fmtNum(r.cached_tokens)),
@@ -205,6 +207,7 @@ export function renderLogs(container, ctx) {
                 el('th', null, '密钥'),
                 el('th', null, '协议'),
                 el('th', null, '模型路径'),
+                el('th', null, '路由'),
                 el('th', null, '状态'),
                 el('th', { className: 'th-right' }, 'Token (输入 / 输出)'),
                 el('th', null, '脱敏'),
@@ -229,6 +232,11 @@ export function renderLogs(container, ctx) {
                       : el('div', { className: 'nowrap', style: { overflow: 'hidden', textOverflow: 'ellipsis' }, title: r.model || r.requested_model || '' }, r.model || r.requested_model || '-')
                   ),
                   el('td', { className: 'nowrap' },
+                    r.route_backend
+                      ? el('span', { className: 'pill mono', title: r.route_reason || '' }, r.route_backend)
+                      : el('span', { className: 'muted' }, '-')
+                  ),
+                  el('td', { className: 'nowrap' },
                     el('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
                       statusBadge(r.status),
                       r.error_code ? el('span', { className: 'mono muted', style: { fontSize: '12px' } }, r.error_code) : null
@@ -245,7 +253,7 @@ export function renderLogs(container, ctx) {
                       : el('span', { className: 'muted' }, '-')
                   ),
                   el('td', { className: 'td-right num', style: { whiteSpace: 'nowrap' } },
-                    `${fmtNum(r.latency_ms)}ms${r.ttft_ms ? ` / ${r.ttft_ms}ms` : ''}`
+                    `${fmtNum(r.latency_ms)}ms${r.ttft_ms ? ` / ${fmtNum(r.ttft_ms)}ms` : ''}`
                   )
                 )
               )

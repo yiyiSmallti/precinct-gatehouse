@@ -115,6 +115,10 @@ function trapFocus(container, onEsc) {
   });
   const onKeyDown = (e) => {
     if (e.key === 'Escape') {
+      const modalRoot = document.getElementById('modal-root');
+      if (modalRoot && modalRoot.childElementCount > 0 && !container.closest('#modal-root')) {
+        return;
+      }
       e.preventDefault();
       onEsc();
       return;
