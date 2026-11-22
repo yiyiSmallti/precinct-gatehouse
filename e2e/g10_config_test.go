@@ -276,7 +276,9 @@ func TestG10ConfigReload(t *testing.T) {
 	// 11. /admin/api/flow matches exact request counts across all gate stages
 	// Generate controlled requests covering 401, 403, 429, redaction_blocked, upstream 502.
 	outK := g.CLI(t, "apikey", "create", "--name", "flow-key", "--models", "p1/m1", "--rpm", "1", "--json")
-	var fk struct{ Key string `json:"key"` }
+	var fk struct {
+		Key string `json:"key"`
+	}
 	_ = json.Unmarshal([]byte(outK[strings.Index(outK, "{"):]), &fk)
 
 	// 401 (bad key)

@@ -372,7 +372,9 @@ func TestG8Compat(t *testing.T) {
 
 	// Rate limit check on compat protocols (rpm=1 on a fresh key)
 	limOut := g.CLI(t, "apikey", "create", "--name", "compat-rpm1", "--rpm", "1", "--json")
-	var limKey struct{ Key string `json:"key"` }
+	var limKey struct {
+		Key string `json:"key"`
+	}
 	if err := json.Unmarshal([]byte(limOut[strings.Index(limOut, "{"):]), &limKey); err != nil {
 		t.Fatalf("apikey create lim: %s", limOut)
 	}

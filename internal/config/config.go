@@ -73,12 +73,12 @@ type Org struct {
 type Provider struct {
 	Name         string             `yaml:"name,omitempty" json:"name,omitempty"`
 	BaseURL      string             `yaml:"base_url,omitempty" json:"base_url,omitempty"`
-	Plugin       string             `yaml:"plugin,omitempty" json:"plugin,omitempty"`     // name of a provider plugin; replaces base_url
-	KeyRef       string             `yaml:"key_ref,omitempty" json:"key_ref,omitempty"`   // env:NAME | keychain:NAME | file:PATH | db:NAME | empty
-	Target       string             `yaml:"target,omitempty" json:"target,omitempty"`     // local | external; default: local for loopback base_url, otherwise external
-	Models       []string           `yaml:"models,omitempty" json:"models,omitempty"`     // model ids exposed as <provider>/<model>
-	Pricing      map[string]Pricing `yaml:"pricing,omitempty" json:"pricing,omitempty"`   // per model id, currency units per 1M tokens
-	Timeout      Duration           `yaml:"timeout,omitempty" json:"timeout,omitempty"`   // per upstream request, default 300s
+	Plugin       string             `yaml:"plugin,omitempty" json:"plugin,omitempty"`   // name of a provider plugin; replaces base_url
+	KeyRef       string             `yaml:"key_ref,omitempty" json:"key_ref,omitempty"` // env:NAME | keychain:NAME | file:PATH | db:NAME | empty
+	Target       string             `yaml:"target,omitempty" json:"target,omitempty"`   // local | external; default: local for loopback base_url, otherwise external
+	Models       []string           `yaml:"models,omitempty" json:"models,omitempty"`   // model ids exposed as <provider>/<model>
+	Pricing      map[string]Pricing `yaml:"pricing,omitempty" json:"pricing,omitempty"` // per model id, currency units per 1M tokens
+	Timeout      Duration           `yaml:"timeout,omitempty" json:"timeout,omitempty"` // per upstream request, default 300s
 	SystemPrompt string             `yaml:"system_prompt,omitempty" json:"system_prompt,omitempty"`
 	ExtraBody    map[string]any     `yaml:"extra_body,omitempty" json:"extra_body,omitempty"`
 	Tiered       *TieredConfig      `yaml:"tiered,omitempty" json:"tiered,omitempty"`
@@ -154,10 +154,10 @@ type Rule struct {
 
 // Redaction configures the redaction stage.
 type Redaction struct {
-	ModeByTarget    map[string]string `yaml:"mode_by_target,omitempty" json:"mode_by_target,omitempty"`     // local|external -> off|audit|mask|warn|block
-	Categories      map[string]string `yaml:"categories,omitempty" json:"categories,omitempty"`             // category -> keep|mask|warn|block (default mask)
-	Dictionary      string            `yaml:"dictionary,omitempty" json:"dictionary,omitempty"`             // file, one term per line
-	Terms           []string          `yaml:"terms,omitempty" json:"terms,omitempty"`                       // inline dictionary
+	ModeByTarget    map[string]string `yaml:"mode_by_target,omitempty" json:"mode_by_target,omitempty"` // local|external -> off|audit|mask|warn|block
+	Categories      map[string]string `yaml:"categories,omitempty" json:"categories,omitempty"`         // category -> keep|mask|warn|block (default mask)
+	Dictionary      string            `yaml:"dictionary,omitempty" json:"dictionary,omitempty"`         // file, one term per line
+	Terms           []string          `yaml:"terms,omitempty" json:"terms,omitempty"`                   // inline dictionary
 	NeverMask       []string          `yaml:"never_mask,omitempty" json:"never_mask,omitempty"`
 	InternalDomains []string          `yaml:"internal_domains,omitempty" json:"internal_domains,omitempty"` // suffixes, default .internal .corp .lan .local .intra
 	Detectors       []string          `yaml:"detectors,omitempty" json:"detectors,omitempty"`               // names of detector plugins that must be available

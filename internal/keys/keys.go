@@ -38,17 +38,17 @@ type Limits struct {
 
 // Key is one API key record (plaintext secret is never stored).
 type Key struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	KeyPrefix  string   `json:"key_prefix"`
-	CreatedAt  int64    `json:"created_at"`
-	ExpiresAt  int64    `json:"expires_at"`
-	Enabled    bool     `json:"enabled"`
-	Models     []string `json:"models"`
-	Groups     []string `json:"groups"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	KeyPrefix string   `json:"key_prefix"`
+	CreatedAt int64    `json:"created_at"`
+	ExpiresAt int64    `json:"expires_at"`
+	Enabled   bool     `json:"enabled"`
+	Models    []string `json:"models"`
+	Groups    []string `json:"groups"`
 	Limits
-	Note       string   `json:"note"`
-	LastUsedAt int64    `json:"last_used_at"`
+	Note       string `json:"note"`
+	LastUsedAt int64  `json:"last_used_at"`
 }
 
 // CreateOpts configures a new API key.

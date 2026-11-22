@@ -337,8 +337,8 @@ routing_groups:
 	// 2. Long request -> tier2 (with system+user+assistant+user >= 200 tokens, plus verify SSE stream)
 	sessSys := "Session system context baseline anchor. " + strings.Repeat("Context clause ", 22) // ~110 tokens
 	sessU1 := "User turn one prompt. " + strings.Repeat("Details about module ", 14)              // ~80 tokens (sys+u1 ~190 -> in [120, 200))
-	longA1 := "Assistant turn one answer. " + strings.Repeat("Analysis paragraph ", 18)        // ~95 tokens
-	longU2 := "User turn two follow up question asking for final summary."                      // total ~290 tokens >= 200
+	longA1 := "Assistant turn one answer. " + strings.Repeat("Analysis paragraph ", 18)           // ~95 tokens
+	longU2 := "User turn two follow up question asking for final summary."                        // total ~290 tokens >= 200
 	longReq := map[string]any{
 		"model": "ds/deepseek-v3",
 		"messages": []any{
