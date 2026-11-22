@@ -405,6 +405,11 @@ tr:last-child td {
   color: var(--warn);
 }
 
+.alert-info {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 /* Tabs */
 .tabs {
   display: inline-flex;

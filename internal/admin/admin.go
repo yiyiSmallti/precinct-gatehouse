@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bufio"
 	"crypto/subtle"
 	"database/sql"
 	"embed"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,7 +18,10 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/limit"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/provider"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact/rules"
 )
 
 //go:embed ui/*
@@ -24,12 +29,15 @@ var uiFiles embed.FS
 
 // Deps holds the dependencies required by the admin server.
 type Deps struct {
-	DB         *sql.DB
-	Keys       *keys.Store
-	Limiter    *limit.Limiter
-	Reg        *provider.Registry
-	Cfg        *config.Config
-	SessionTTL time.Duration
+	DB               *sql.DB
+	Keys             *keys.Store
+	Limiter          *limit.Limiter
+	Reg              *provider.Registry
+	Cfg              *config.Config
+	Redactor         *redact.Engine
+	MissingDetectors []string
+	UserKey          []byte
+	SessionTTL       time.Duration
 }
 
 // Server serves the /admin/ Web UI and /admin/api/* JSON API.
@@ -87,6 +95,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/api/logs", s.guard(s.logs))
 	s.mux.HandleFunc("GET /admin/api/usage", s.guard(s.usage))
 	s.mux.HandleFunc("GET /admin/api/channels", s.guard(s.channels))
+	s.mux.HandleFunc("GET /admin/api/redaction", s.guard(s.redactionInfo))
+	s.mux.HandleFunc("POST /admin/api/redaction/try", s.guard(s.redactionTry))
 }
 
 func (s *Server) serveUI(name, contentType string) http.HandlerFunc {
@@ -514,7 +524,8 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {
 		}
 	}
 	sqlStr := `SELECT id,request_id,ts,day,key_id,key_name,protocol,client_ip,requested_model,model,
-		status,error_code,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,admitted
+		status,error_code,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,admitted,
+		redaction_mode,redaction_count
 		FROM request_log`
 	if len(where) > 0 {
 		sqlStr += " WHERE " + strings.Join(where, " AND ")
@@ -549,6 +560,8 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {
 		LatencyMS        int64  `json:"latency_ms"`
 		TTFTMS           int64  `json:"ttft_ms"`
 		Admitted         bool   `json:"admitted"`
+		RedactionMode    string `json:"redaction_mode"`
+		RedactionCount   int    `json:"redaction_count"`
 	}
 	out := []logRow{}
 	hasMore := false
@@ -558,7 +571,8 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {
 		if err := rows.Scan(&row.ID, &row.RequestID, &row.TS, &row.Day, &row.KeyID, &row.KeyName,
 			&row.Protocol, &row.ClientIP, &row.RequestedModel, &row.Model,
 			&row.Status, &row.ErrorCode, &streamInt, &row.PromptTokens, &row.CompletionTokens,
-			&row.CachedTokens, &row.LatencyMS, &row.TTFTMS, &admInt); err != nil {
+			&row.CachedTokens, &row.LatencyMS, &row.TTFTMS, &admInt,
+			&row.RedactionMode, &row.RedactionCount); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -762,4 +776,241 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": msg})
+}
+
+func (s *Server) redactionMode(target, class string) string {
+	if s.deps.Redactor != nil {
+		return s.deps.Redactor.Mode(target, class)
+	}
+	if class == "confidential" && target == "external" {
+		return redact.ModeBlock
+	}
+	if m := s.deps.Cfg.Redaction.ModeByTarget[target]; m != "" {
+		return m
+	}
+	return redact.ModeMask
+}
+
+func (s *Server) redactionInfo(w http.ResponseWriter, _ *http.Request, _ string) {
+	rc := s.deps.Cfg.Redaction
+	modeByTarget := map[string]string{
+		"local":    s.redactionMode("local", "internal"),
+		"external": s.redactionMode("external", "internal"),
+	}
+	for k, v := range rc.ModeByTarget {
+		modeByTarget[k] = v
+	}
+
+	classes := []string{"public", "internal", "confidential"}
+	targets := []string{"local", "external"}
+	matrix := map[string]map[string]string{}
+	for _, tgt := range targets {
+		row := map[string]string{}
+		for _, cl := range classes {
+			row[cl] = s.redactionMode(tgt, cl)
+		}
+		matrix[tgt] = row
+	}
+
+	type catEntry struct {
+		Key         string `json:"key"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Action      string `json:"action"`
+		DefaultUsed bool   `json:"default_used"`
+	}
+	builtins := []struct {
+		key, name, desc string
+	}{
+		{strings.ToLower(rules.Phone), rules.Phone, "中国大陆手机号"},
+		{strings.ToLower(rules.IDCard), rules.IDCard, "居民身份证号"},
+		{strings.ToLower(rules.BankCard), rules.BankCard, "银行卡号"},
+		{strings.ToLower(rules.USCC), rules.USCC, "统一社会信用代码"},
+		{strings.ToLower(rules.Email), rules.Email, "电子邮箱"},
+		{strings.ToLower(rules.Plate), rules.Plate, "车牌号"},
+		{strings.ToLower(rules.IP), rules.IP, "内网 IP 地址"},
+		{strings.ToLower(rules.Domain), rules.Domain, "内网域名"},
+		{strings.ToLower(rules.Secret), rules.Secret, "密钥与令牌"},
+		{strings.ToLower(redact.Term), redact.Term, "自定义词典词条"},
+		{"image", "image", "图像输入"},
+	}
+	seenCats := map[string]bool{}
+	cats := make([]catEntry, 0, len(builtins)+len(rc.Categories))
+	for _, b := range builtins {
+		seenCats[b.key] = true
+		act := rc.Categories[b.key]
+		defUsed := false
+		if act == "" {
+			act = "mask"
+			defUsed = true
+		}
+		cats = append(cats, catEntry{Key: b.key, Name: b.name, Description: b.desc, Action: act, DefaultUsed: defUsed})
+	}
+	var extraKeys []string
+	for k := range rc.Categories {
+		if !seenCats[k] {
+			extraKeys = append(extraKeys, k)
+		}
+	}
+	sort.Strings(extraKeys)
+	for _, k := range extraKeys {
+		cats = append(cats, catEntry{Key: k, Name: strings.ToUpper(k), Description: "自定义类别", Action: rc.Categories[k]})
+	}
+
+	dictCount := 0
+	dictErr := ""
+	if rc.Dictionary != "" {
+		f, err := os.Open(rc.Dictionary)
+		if err != nil {
+			dictErr = err.Error()
+		} else {
+			sc := bufio.NewScanner(f)
+			for sc.Scan() {
+				t := strings.TrimSpace(sc.Text())
+				if t != "" && !strings.HasPrefix(t, "#") {
+					dictCount++
+				}
+			}
+			if err := sc.Err(); err != nil {
+				dictErr = err.Error()
+			}
+			f.Close()
+		}
+	}
+	termsCount := 0
+	for _, t := range rc.Terms {
+		if strings.TrimSpace(t) != "" {
+			termsCount++
+		}
+	}
+
+	neverMask := rc.NeverMask
+	if neverMask == nil {
+		neverMask = []string{}
+	}
+	internalDomains := rc.InternalDomains
+	if len(internalDomains) == 0 {
+		internalDomains = []string{".internal", ".corp", ".lan", ".local", ".intra"}
+	}
+	detectors := rc.Detectors
+	if detectors == nil {
+		detectors = []string{}
+	}
+	missing := s.deps.MissingDetectors
+	if missing == nil {
+		missing = []string{}
+	}
+	stripFields := append([]string{"dsh_session_log"}, rc.StripFields...)
+
+	type provMode struct {
+		Name          string `json:"name"`
+		Target        string `json:"target"`
+		EffectiveMode string `json:"effective_mode"`
+	}
+	provs := make([]provMode, 0, len(s.deps.Cfg.Providers))
+	for _, p := range s.deps.Cfg.Providers {
+		provs = append(provs, provMode{
+			Name:          p.Name,
+			Target:        p.Target,
+			EffectiveMode: s.redactionMode(p.Target, "internal"),
+		})
+	}
+
+	type modeStat struct {
+		Mode     string `json:"mode"`
+		Requests int64  `json:"requests"`
+		Count    int64  `json:"count"`
+	}
+	stats := []modeStat{}
+	cutoff := time.Now().Add(-24 * time.Hour).Unix()
+	rows, err := s.deps.DB.Query(`
+		SELECT redaction_mode, COUNT(*), COALESCE(SUM(redaction_count), 0)
+		FROM request_log
+		WHERE ts >= ? AND redaction_mode != ''
+		GROUP BY redaction_mode ORDER BY COUNT(*) DESC`, cutoff)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var ms modeStat
+			if rows.Scan(&ms.Mode, &ms.Requests, &ms.Count) == nil {
+				stats = append(stats, ms)
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"mode_by_target": modeByTarget,
+		"matrix":         matrix,
+		"categories":     cats,
+		"dictionary": map[string]any{
+			"path":  rc.Dictionary,
+			"count": dictCount,
+			"error": dictErr,
+		},
+		"terms_count":           termsCount,
+		"never_mask":            neverMask,
+		"internal_domains":      internalDomains,
+		"detectors":             detectors,
+		"detectors_unavailable": missing,
+		"fail_closed":           rc.FailClosedOn(),
+		"strip_fields":          stripFields,
+		"vault_ttl":             rc.VaultTTL.D(24 * time.Hour).String(),
+		"providers":             provs,
+		"stats_24h":             stats,
+	})
+}
+
+func (s *Server) redactionTry(w http.ResponseWriter, r *http.Request, _ string) {
+	if s.deps.Redactor == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "redactor unavailable")
+		return
+	}
+	var req struct {
+		Text      string `json:"text"`
+		Target    string `json:"target"`
+		DataClass string `json:"data_class"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if len(req.Text) > 64<<10 {
+		writeJSONError(w, http.StatusBadRequest, "text exceeds 64KB limit")
+		return
+	}
+	if req.Target == "" {
+		req.Target = "external"
+	}
+	if req.Target != "local" && req.Target != "external" {
+		writeJSONError(w, http.StatusBadRequest, "target must be local or external")
+		return
+	}
+	if req.DataClass == "" {
+		req.DataClass = "internal"
+	}
+	if req.DataClass != "public" && req.DataClass != "internal" && req.DataClass != "confidential" {
+		writeJSONError(w, http.StatusBadRequest, "data_class must be public, internal or confidential")
+		return
+	}
+
+	mode := s.deps.Redactor.Mode(req.Target, req.DataClass)
+	oaiReq := oai.Object{"messages": []any{map[string]any{"role": "user", "content": req.Text}}}
+	res, aerr := s.deps.Redactor.Apply(r.Context(), oaiReq, mode, s.deps.UserKey, "admin-try")
+	outText := ""
+	errMsg := ""
+	if aerr != nil {
+		errMsg = aerr.Error()
+	} else {
+		outText = oai.Text(oai.Messages(oaiReq)[0])
+	}
+	var report any
+	if res != nil {
+		report = res.Report
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"mode":   mode,
+		"text":   outText,
+		"report": report,
+		"error":  errMsg,
+	})
 }

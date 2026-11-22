@@ -127,6 +127,15 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 	}
 	st.rec.LatencyMS = time.Since(st.start).Milliseconds()
 	if p.Meter != nil {
+		var redMode string
+		var redCount int
+		if st.rec.Redaction != nil {
+			redMode = st.rec.Redaction.Mode
+			redCount = st.rec.Redaction.Masked + st.rec.Redaction.Warned
+			if st.rec.Redaction.Blocked {
+				redCount++
+			}
+		}
 		if err := p.Meter.LogRequest(meter.RequestLogEntry{
 			RequestID:        st.id,
 			Time:             st.start,
@@ -145,6 +154,8 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 			LatencyMS:        st.rec.LatencyMS,
 			TTFTMS:           st.ttft.Milliseconds(),
 			Admitted:         st.admitted,
+			RedactionMode:    redMode,
+			RedactionCount:   redCount,
 		}); err != nil {
 			p.Log.Error("request log write failed", "err", err)
 		}

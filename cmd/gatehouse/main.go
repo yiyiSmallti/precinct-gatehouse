@@ -189,12 +189,15 @@ Next steps:
 			log.Warn("admin password is not set; run `gatehouse admin set-password`")
 		}
 		adm := admin.New(admin.Deps{
-			DB:         srv.DB,
-			Keys:       srv.Keys,
-			Limiter:    srv.Limiter,
-			Reg:        srv.Reg,
-			Cfg:        cfg,
-			SessionTTL: cfg.Admin.SessionTTL.D(12 * time.Hour),
+			DB:               srv.DB,
+			Keys:             srv.Keys,
+			Limiter:          srv.Limiter,
+			Reg:              srv.Reg,
+			Cfg:              cfg,
+			Redactor:         srv.Redactor,
+			MissingDetectors: srv.Missing,
+			UserKey:          srv.UserKey,
+			SessionTTL:       cfg.Admin.SessionTTL.D(12 * time.Hour),
 		})
 		admLn, err := net.Listen("tcp", cfg.Admin.Listen)
 		if err != nil {

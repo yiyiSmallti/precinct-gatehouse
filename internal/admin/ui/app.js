@@ -46,20 +46,32 @@
         headers['Content-Type'] = 'application/json';
       }
     }
-    const res = await fetch(path, {
-      method,
-      headers,
-      credentials: 'same-origin',
-      body: opts.body,
-    });
+    let res;
+    try {
+      res = await fetch(path, {
+        method,
+        headers,
+        credentials: 'same-origin',
+        body: opts.body,
+      });
+    } catch (err) {
+      if (err instanceof TypeError) {
+        throw new Error('无法连接网关服务，请确认 gatehouse 正在运行');
+      }
+      throw err;
+    }
     const data = await res.json().catch(() => ({}));
     if (res.status === 401 && path !== '/admin/api/login') {
       state.user = null;
       navigate('login');
-      throw new Error(data.error || '未登录或会话已过期');
+      const e = new Error(data.error || '未登录或会话已过期');
+      e.status = 401;
+      throw e;
     }
     if (!res.ok) {
-      throw new Error(data.error || `请求失败 (${res.status})`);
+      const e = new Error(data.error || `请求失败 (${res.status})`);
+      e.status = res.status;
+      throw e;
     }
     return data;
   }
@@ -114,7 +126,7 @@
 
   function parseRoute() {
     const h = (location.hash || '').replace(/^#\/?/, '');
-    if (['overview', 'keys', 'logs', 'usage', 'channels', 'login'].includes(h)) {
+    if (['overview', 'keys', 'logs', 'usage', 'channels', 'redaction', 'login'].includes(h)) {
       return h;
     }
     return 'overview';
@@ -170,6 +182,7 @@
       ['logs', '请求日志'],
       ['usage', '用量统计'],
       ['channels', '渠道与路由'],
+      ['redaction', '脱敏策略'],
     ];
     app.innerHTML = `
       <div class="shell">
@@ -558,6 +571,11 @@
         }
         return `<span class="badge badge-danger" title="${esc(r.error_code)}">${r.status}${r.error_code ? ' ' + esc(r.error_code) : ''}</span>`;
       };
+      const redCell = (r) => {
+        if (!r.redaction_mode) return '<span class="muted">-</span>';
+        const cnt = r.redaction_count > 0 ? ` (${r.redaction_count})` : '';
+        return `${modeBadge(r.redaction_mode)}${cnt ? `<span class="num muted">${cnt}</span>` : ''}`;
+      };
       document.getElementById('page-body').innerHTML = `
         <div class="card">
           <form class="filter-bar" id="log-filter">
@@ -586,6 +604,7 @@
                   <th>协议</th>
                   <th>请求模型 → 实际模型</th>
                   <th>状态</th>
+                  <th>脱敏</th>
                   <th>Tokens (入/出/缓)</th>
                   <th>首字 / 总耗时</th>
                   <th>输出速率</th>
@@ -599,11 +618,12 @@
                     <td><span class="badge badge-muted">${esc(r.protocol || 'chat')}</span></td>
                     <td class="mono">${esc(r.requested_model || '-')} → ${esc(r.model || '-')}</td>
                     <td>${statusBadge(r)}</td>
+                    <td>${redCell(r)}</td>
                     <td class="num">${fmtNum(r.prompt_tokens)} / ${fmtNum(r.completion_tokens)} / ${fmtNum(r.cached_tokens)}</td>
                     <td class="num">${r.ttft_ms} / ${r.latency_ms} ms</td>
                     <td class="num">${speed(r)}</td>
                   </tr>
-                `).join('') : `<tr><td colspan="8" class="muted">暂无日志记录</td></tr>`}
+                `).join('') : `<tr><td colspan="9" class="muted">暂无日志记录</td></tr>`}
               </tbody>
             </table>
           </div>
@@ -804,6 +824,196 @@
     }
   }
 
+  function modeBadge(m) {
+    const cls = {
+      off: 'badge-muted',
+      audit: 'badge-accent',
+      mask: 'badge-ok',
+      warn: 'badge-warn',
+      block: 'badge-danger',
+      keep: 'badge-muted',
+    }[m] || 'badge-muted';
+    return `<span class="badge ${cls}">${esc(m)}</span>`;
+  }
+
+  async function loadRedaction() {
+    renderShell('脱敏策略', `<button class="btn" id="r-refresh">刷新</button>`, `<div class="card">加载中...</div>`);
+    document.getElementById('r-refresh').onclick = loadRedaction;
+    try {
+      const d = await apiFetch('/admin/api/redaction');
+      const m = d.matrix || {};
+      const loc = m.local || {};
+      const ext = m.external || {};
+      const dict = d.dictionary || {};
+      const unavail = d.detectors_unavailable || [];
+      const cats = d.categories || [];
+      const provs = d.providers || [];
+      const stats = d.stats_24h || [];
+
+      document.getElementById('page-body').innerHTML = `
+        <div class="alert alert-info">配置只读，修改请编辑 <span class="mono">config.yaml</span> 的 <span class="mono">redaction</span> 段后重启 gatehouse。</div>
+
+        <div class="two-col" style="margin-top:0">
+          <div class="card">
+            <div class="card-title"><span>目标 × 数据分级 有效模式</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>目标</th><th>public</th><th>internal</th><th>confidential</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><strong>local</strong></td>
+                    <td>${modeBadge(loc.public || '-')}</td>
+                    <td>${modeBadge(loc.internal || '-')}</td>
+                    <td>${modeBadge(loc.confidential || '-')}</td>
+                  </tr>
+                  <tr>
+                    <td><strong>external</strong></td>
+                    <td>${modeBadge(ext.public || '-')}</td>
+                    <td>${modeBadge(ext.internal || '-')}</td>
+                    <td>${modeBadge(ext.confidential || '-')}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title"><span>Provider 目标与有效模式（internal）</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>名称</th><th>Target</th><th>有效模式</th></tr></thead>
+                <tbody>
+                  ${provs.length ? provs.map((p) => `
+                    <tr>
+                      <td><strong>${esc(p.name)}</strong></td>
+                      <td><span class="badge ${p.target === 'local' ? 'badge-accent' : 'badge-muted'}">${esc(p.target)}</span></td>
+                      <td>${modeBadge(p.effective_mode)}</td>
+                    </tr>
+                  `).join('') : `<tr><td colspan="3" class="muted">暂无 Provider</td></tr>`}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-title"><span>类别动作</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>类别</th><th>说明</th><th>动作</th><th>来源</th></tr></thead>
+                <tbody>
+                  ${cats.map((c) => `
+                    <tr>
+                      <td class="mono">${esc(c.name)}</td>
+                      <td>${esc(c.description)}</td>
+                      <td>${modeBadge(c.action)}</td>
+                      <td class="muted">${c.default_used ? '默认' : '配置'}</td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:16px">
+            <div class="card">
+              <div class="card-title"><span>词典与策略参数</span></div>
+              <div class="table-wrap">
+                <table>
+                  <tbody>
+                    <tr>
+                      <th>词典文件</th>
+                      <td class="mono">${dict.path ? `${esc(dict.path)} (${fmtNum(dict.count)} 条)` : '<span class="muted">未配置</span>'}${dict.error ? ` <span class="badge badge-danger">${esc(dict.error)}</span>` : ''}</td>
+                    </tr>
+                    <tr><th>内联词条 (terms)</th><td class="num">${fmtNum(d.terms_count)} 条</td></tr>
+                    <tr><th>豁免词 (never_mask)</th><td class="mono">${(d.never_mask || []).length ? esc(d.never_mask.join(', ')) : '<span class="muted">无</span>'}</td></tr>
+                    <tr><th>内网域名后缀</th><td class="mono">${esc((d.internal_domains || []).join(', '))}</td></tr>
+                    <tr><th>必需检测器插件</th><td class="mono">${(d.detectors || []).length ? esc(d.detectors.join(', ')) : '<span class="muted">无</span>'}</td></tr>
+                    <tr><th>不可用检测器</th><td>${unavail.length ? unavail.map((x) => `<span class="badge badge-danger">${esc(x)}</span>`).join(' ') : '<span class="badge badge-ok">全部就绪</span>'}</td></tr>
+                    <tr><th>fail_closed</th><td>${d.fail_closed ? '<span class="badge badge-ok">开启</span>' : '<span class="badge badge-warn">关闭</span>'}</td></tr>
+                    <tr><th>strip_fields</th><td class="mono">${esc((d.strip_fields || []).join(', '))}</td></tr>
+                    <tr><th>vault_ttl</th><td class="mono">${esc(d.vault_ttl || '-')}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title"><span>近 24 小时脱敏统计</span></div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>模式</th><th>请求数</th><th>触发脱敏/告警/拦截次数</th></tr></thead>
+                  <tbody>
+                    ${stats.length ? stats.map((s) => `
+                      <tr>
+                        <td>${modeBadge(s.mode)}</td>
+                        <td class="num">${fmtNum(s.requests)}</td>
+                        <td class="num">${fmtNum(s.count)}</td>
+                      </tr>
+                    `).join('') : `<tr><td colspan="3" class="muted">近 24 小时暂无记录</td></tr>`}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-title"><span>在线试运行（redact try）</span></div>
+          <form id="try-form">
+            <label class="field">测试文本（最多 64KB）
+              <textarea id="try-text" rows="3" placeholder="输入测试文本，例如：联系人 13812345678，密码: abc12345"></textarea>
+            </label>
+            <div class="filter-bar" style="margin-bottom:0">
+              <select id="try-target">
+                <option value="external">external（外部）</option>
+                <option value="local">local（本地）</option>
+              </select>
+              <select id="try-class">
+                <option value="internal">internal</option>
+                <option value="public">public</option>
+                <option value="confidential">confidential</option>
+              </select>
+              <button class="btn btn-primary" type="submit" id="try-btn">试运行</button>
+            </div>
+          </form>
+          <div id="try-result" style="margin-top:14px"></div>
+        </div>
+      `;
+
+      document.getElementById('try-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const text = document.getElementById('try-text').value;
+        const target = document.getElementById('try-target').value;
+        const data_class = document.getElementById('try-class').value;
+        const box = document.getElementById('try-result');
+        box.innerHTML = `<div class="muted">检测中...</div>`;
+        try {
+          const res = await apiFetch('/admin/api/redaction/try', {
+            method: 'POST',
+            body: JSON.stringify({ text, target, data_class }),
+          });
+          const rep = res.report || {};
+          const counts = rep.counts || {};
+          const countKeys = Object.keys(counts);
+          const alerts = rep.alerts || [];
+          box.innerHTML = `
+            <div style="margin-bottom:8px">有效模式：${modeBadge(res.mode)}
+              ${countKeys.length ? countKeys.map((k) => `<span class="badge badge-muted" style="margin-left:6px">${esc(k)}: ${counts[k]}</span>`).join('') : '<span class="muted" style="margin-left:8px">未命中敏感项</span>'}
+            </div>
+            ${res.error || rep.blocked ? `<div class="alert alert-danger">${esc(res.error || '请求被脱敏策略拦截 (blocked)')}</div>` : `<div class="secret-box">${esc(res.text)}</div>`}
+            ${alerts.length ? alerts.map((a) => `<div class="alert alert-warn">${esc(a)}</div>`).join('') : ''}
+          `;
+        } catch (err) {
+          box.innerHTML = `<div class="alert alert-danger">${esc(err.message)}</div>`;
+        }
+      };
+    } catch (err) {
+      document.getElementById('page-body').innerHTML = `<div class="alert alert-danger">${esc(err.message)}</div>`;
+    }
+  }
+
   function render() {
     state.route = parseRoute();
     if (!state.user || state.route === 'login') {
@@ -823,6 +1033,9 @@
       case 'channels':
         loadChannels();
         break;
+      case 'redaction':
+        loadRedaction();
+        break;
       default:
         state.route = 'overview';
         loadOverview();
@@ -840,9 +1053,9 @@
       } else {
         render();
       }
-    } catch (_) {
+    } catch (err) {
       state.user = null;
-      renderLogin('');
+      renderLogin(err && err.status !== 401 ? err.message : '');
     }
   })();
 })();

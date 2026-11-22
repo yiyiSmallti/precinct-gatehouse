@@ -25,6 +25,10 @@ providers:
     base_url: %s
     target: local
     models: [deepseek-chat]
+  - name: cloud
+    base_url: %s
+    target: external
+    models: [deepseek-chat]
 default_group: main
 routing_groups:
   main:
@@ -32,15 +36,19 @@ routing_groups:
 model_aliases:
   - match: "claude-sonnet-4-5"
     use: main
+redaction:
+  mode_by_target:
+    local: off
+    external: mask
 `
 
 func TestG9Admin(t *testing.T) {
 	rep := newReport(t, "G9-admin", "G9 Web 控制面板与管理 API",
-		"验证管理员密码设置、登录鉴权与防暴力破解、CSRF 头校验、API Key 在线增改启停立即生效、请求日志、概览/用量/渠道接口以及内嵌前端页面。")
+		"验证管理员密码设置、登录鉴权与防暴力破解、CSRF 头校验、API Key 在线增改启停立即生效、请求日志、概览/用量/渠道/脱敏策略接口以及内嵌前端页面。")
 
 	fake := startFake(t, "ds")
 	adminAddr := freePort(t)
-	g := startGateway(t, fmt.Sprintf(g9Config, adminAddr, fake.URL), nil)
+	g := startGateway(t, fmt.Sprintf(g9Config, adminAddr, fake.URL, fake.URL), nil)
 	adminBase := "http://" + adminAddr
 
 	// Wait briefly for admin listener if still binding right after /healthz.
@@ -153,7 +161,7 @@ func TestG9Admin(t *testing.T) {
 	rep.Check("/overview、/usage、/channels 返回 200 且结构正确",
 		sOv == 200 && len(ovHourly) == 24 && ovToday["requests"].(float64) >= 4 &&
 			sUse == 200 && len(useRows) >= 1 &&
-			sCh == 200 && len(chProvs) == 1 && len(chAliases) == 1,
+			sCh == 200 && len(chProvs) == 2 && len(chAliases) == 1,
 		"ov=%d(hourly=%d) use=%d(rows=%d) ch=%d(provs=%d)", sOv, len(ovHourly), sUse, len(useRows), sCh, len(chProvs))
 
 	// 9. GET /admin/ HTML includes app.js and GET /admin/app.js serves JS
@@ -173,4 +181,27 @@ func TestG9Admin(t *testing.T) {
 		respHTML.StatusCode == 200 && strings.Contains(string(htmlBytes), "/admin/app.js") &&
 			respJS.StatusCode == 200 && len(jsBytes) > 1000,
 		"html=%d js=%d(%d bytes)", respHTML.StatusCode, respJS.StatusCode, len(jsBytes))
+
+	// 10. Redaction info & live try
+	sRed, redBody, _ := doAdm(http.MethodGet, "/admin/api/redaction", nil, nil)
+	mat, _ := redBody["matrix"].(map[string]any)
+	matLoc, _ := mat["local"].(map[string]any)
+	matExt, _ := mat["external"].(map[string]any)
+	rep.Check("GET /admin/api/redaction 返回矩阵 local/internal=off, external/internal=mask",
+		sRed == 200 && matLoc["internal"] == "off" && matExt["internal"] == "mask",
+		"status=%d local=%v external=%v", sRed, matLoc["internal"], matExt["internal"])
+
+	sTryCSRF, _, _ := doAdm(http.MethodPost, "/admin/api/redaction/try", map[string]any{
+		"text": "13812345678", "target": "external", "data_class": "internal",
+	}, nil)
+	sTry, tryBody, _ := doAdm(http.MethodPost, "/admin/api/redaction/try", map[string]any{
+		"text": "请联系 13812345678", "target": "external", "data_class": "internal",
+	}, admHdr)
+	tryText, _ := tryBody["text"].(string)
+	tryRep, _ := tryBody["report"].(map[string]any)
+	tryCounts, _ := tryRep["counts"].(map[string]any)
+	phoneCnt, _ := tryCounts["phone"].(float64)
+	rep.Check("POST /admin/api/redaction/try 脱敏手机号且校验 CSRF",
+		sTryCSRF == 403 && sTry == 200 && strings.Contains(tryText, "{{PHONE_") && phoneCnt == 1,
+		"csrf=%d status=%d phone=%.0f text=%q", sTryCSRF, sTry, phoneCnt, tryText)
 }

@@ -42,6 +42,8 @@ type Server struct {
 	Keys       *keys.Store
 	Limiter    *limit.Limiter
 	Reg        *provider.Registry
+	Redactor   *redact.Engine
+	UserKey    []byte
 	Missing    []string // required detectors that are unavailable
 	PolicyDown bool     // org mode: the policy plugin did not start
 	closers    []func()
@@ -155,10 +157,12 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	if err != nil {
 		return nil, fmt.Errorf("redaction: %w", err)
 	}
+	s.Redactor = red
 	userKey, err := loadOrCreateKey(filepath.Join(cfg.DataDir, "user.key"))
 	if err != nil {
 		return nil, err
 	}
+	s.UserKey = userKey
 	rt := route.New(cfg, reg)
 	rt.Prepare = func(text, target, dataClass string) (string, error) {
 		// the classifier sees the last user message: redact it like any other outbound text
