@@ -1,6 +1,6 @@
 # G2 脱敏
 
-结果：**通过** · 运行于 2026-11-22 06:04:51 PST · darwin/arm64
+结果：**通过** · 运行于 2026-11-22 06:06:24 PST · darwin/arm64
 
 外部目标 `cloud/strong` 模式为 mask，本地目标为 audit。请求含手机号、身份证、银行卡、客户词典词「星辰科技」、订单号干扰项（11 位，形似手机号）、Never-mask 地址。断言外部假服务收到的请求体、回填后的响应与工具参数、审计文件。
 
@@ -10,7 +10,7 @@
 | 出站不含身份证 | ✅ | 外部假服务收到的请求体中 身份证 出现 0 次 |
 | 出站不含银行卡 | ✅ | 外部假服务收到的请求体中 银行卡 出现 0 次 |
 | 出站不含词典词 | ✅ | 外部假服务收到的请求体中 词典词 出现 0 次 |
-| 出站带占位符 | ✅ | 占位符 {{BANK_CARD_mzg2pclw}} {{ID_CARD_rjjam2zd}} {{PHONE_qxxr73th}} {{TERM_ej2j37gn}} |
+| 出站带占位符 | ✅ | 占位符 {{BANK_CARD_ksbteze5}} {{ID_CARD_sybrjqps}} {{PHONE_poqtc7vs}} {{TERM_otl2prs3}} |
 | 订单号未被误脱 | ✅ | 订单号后的 11 位数字原样发出 |
 | dsh_session_log 被剥掉 | ✅ | 该字段带完整明文会话日志，出站前删除 |
 | Never-mask 原样 | ✅ | team@example.com 原样发出 |
@@ -18,8 +18,8 @@
 | 响应文本回填为原值 | ✅ | 客户端收到：[cloud/strong] 请给星辰科技的联系人回电 13812345678，身份证 110101199003071233，卡号 6222021234567890128。订单号 13900001111 已发货。抄送 team@example.com。 |
 | tool_calls 参数回填且仍是合法 JSON | ✅ | arguments={"echo":"请给星辰科技的联系人回电 13812345678，身份证 110101199003071233，卡号 6222021234567890128。订单号 13900001111 已发货。抄送 team@example.com。"} |
 | 响应头说明脱敏 | ✅ | X-Gatehouse-Redaction: mask; bank_card=1; id_card=1; phone=3; term=1 |
-| 跨回合同一值同一占位符 | ✅ | {{PHONE_qxxr73th}} 在第二回合出现 2 次 |
-| 历史工具参数按 JSON 解码后脱敏 | ✅ | 出站 arguments={"company":"{{TERM_ej2j37gn}}","phone":"{{PHONE_qxxr73th}}"} |
+| 跨回合同一值同一占位符 | ✅ | {{PHONE_poqtc7vs}} 在第二回合出现 2 次 |
+| 历史工具参数按 JSON 解码后脱敏 | ✅ | 出站 arguments={"company":"{{TERM_otl2prs3}}","phone":"{{PHONE_poqtc7vs}}"} |
 | 工具参数里带键名的密码仍按 secret 处理 | ✅ | status=400 code=redaction_blocked |
 | 本地目标 audit：原样发出、只计数 | ✅ | X-Gatehouse-Redaction: audit; bank_card=1; id_card=1; phone=1; term=1 |
 | 密钥类别 block → 400 且不出站 | ✅ | status=400 code=redaction_blocked message=map[code:redaction_blocked message:request blocked by redaction policy: secret(40) type:invalid_request_error] |

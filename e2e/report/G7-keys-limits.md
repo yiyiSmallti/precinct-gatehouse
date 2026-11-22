@@ -1,12 +1,12 @@
 # G7 多 Key 与次数限额
 
-结果：**通过** · 运行于 2026-11-22 06:05:16 PST · darwin/arm64
+结果：**通过** · 运行于 2026-11-22 06:06:49 PST · darwin/arm64
 
 验证 CLI 管理 `sk-` API Key、启用/禁用/重置、RPM/RPD/并发限额、重启后 RPD 恢复、ght1 并发不再串行，以及请求体上限配置。
 
 | 步骤 | 结果 | 细节 |
 | --- | --- | --- |
-| CLI 创建 sk- key 并调用允许模型 → 200 | ✅ | prefix=sk-0OInhC status=200 |
+| CLI 创建 sk- key 并调用允许模型 → 200 | ✅ | prefix=sk-LlhW3L status=200 |
 | 越权模型 → 403 | ✅ | status=403 code=model_not_allowed |
 | disable 后 → 401 key_disabled | ✅ | status=401 code=key_disabled |
 | enable 后恢复 → 200 | ✅ | status=200 |
@@ -22,8 +22,8 @@ API Key 列表：
 
 ```
 ID                    NAME       PREFIX     STATE    RPM/RPD/CONC  MODELS     GROUPS  EXPIRES
-key_8d18f522d9878a00  rpd1-fail  sk-BHs0i7  enabled  0/1/0                            never
-key_70441dbdd9eca0e6  dev-a      sk-gB2SP8  enabled  0/0/0         p/model-a          never
-key_5cb8409468281507  conc1      sk-Z5Yi88  enabled  0/0/1                            never
-key_43f49e74463c6790  rpm2       sk-HRfq1g  enabled  2/0/0                            never
+key_72a1650fb0e462b5  rpd1-fail  sk-BxF2j5  enabled  0/1/0                            never
+key_8b6c3cddc3264cba  conc1      sk-7yit78  enabled  0/0/1                            never
+key_49abe9b1f830f80e  rpm2       sk-RdZbBr  enabled  2/0/0                            never
+key_27fab68eb26a57f5  dev-a      sk-2HcxBZ  enabled  0/0/0         p/model-a          never
 ```
