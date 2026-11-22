@@ -88,6 +88,7 @@ type Manager struct {
 	path    string
 	bootCfg *config.Config
 	build   func(cfg *config.Config, prev *Snapshot) (*Snapshot, error)
+	OnSwap  func(*Snapshot)
 
 	stateMu   sync.RWMutex
 	source    string
@@ -209,6 +210,9 @@ func (m *Manager) applyLocked(prev *Snapshot, newBytes []byte, source string) (A
 		m.lastSize = st.Size()
 	}
 	m.stateMu.Unlock()
+	if m.OnSwap != nil {
+		m.OnSwap(snap)
+	}
 
 	if restart == nil {
 		restart = []string{}
@@ -266,6 +270,9 @@ func (m *Manager) ReloadFromDisk(source string) (ApplyResult, bool, error) {
 		m.lastSize = st.Size()
 	}
 	m.stateMu.Unlock()
+	if m.OnSwap != nil {
+		m.OnSwap(snap)
+	}
 
 	if restart == nil {
 		restart = []string{}

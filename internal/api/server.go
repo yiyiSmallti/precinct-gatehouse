@@ -32,6 +32,7 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/route"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/store"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/tiered"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/token"
 	sdk "github.com/yiyiSmallti/precinct-gatehouse/plugin"
 )
@@ -41,6 +42,7 @@ type Server struct {
 	HTTP       *http.Server
 	Pipeline   *pipeline.Pipeline
 	Live       *live.Manager
+	Tiered     *tiered.Hub
 	DB         *sql.DB
 	Keys       *keys.Store
 	Limiter    *limit.Limiter
@@ -170,6 +172,10 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	}
 	s.UserKey = userKey
 
+	hub := tiered.NewHub(cfg.DataDir, log)
+	s.Tiered = hub
+	s.closers = append(s.closers, func() { _ = hub.Close() })
+
 	resolveKey := func(ref string) (string, error) {
 		return ResolveKey(db, ref)
 	}
@@ -177,6 +183,11 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		reg, err := provider.NewRegistry(nextCfg, resolveKey)
 		if err != nil {
 			return nil, err
+		}
+		for _, pc := range nextCfg.Providers {
+			if pc.Tiered != nil {
+				reg.SetTransport(pc.Name, hub.Transport(pc.Name, nil))
+			}
 		}
 		for _, pc := range nextCfg.Providers {
 			if pc.Plugin == "" {
@@ -223,6 +234,10 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		return nil, err
 	}
 	s.Live = liveMgr
+	liveMgr.OnSwap = func(snap *live.Snapshot) {
+		hub.Activate(snap.Cfg)
+	}
+	hub.Activate(liveMgr.Current().Cfg)
 	watchCtx, cancelWatch := context.WithCancel(context.Background())
 	s.closers = append(s.closers, cancelWatch)
 	go liveMgr.Watch(watchCtx, log)

@@ -193,6 +193,7 @@ Next steps:
 			Keys:             srv.Keys,
 			Limiter:          srv.Limiter,
 			Live:             srv.Live,
+			Tiered:           srv.Tiered,
 			MissingDetectors: srv.Missing,
 			UserKey:          srv.UserKey,
 			SessionTTL:       cfg.Admin.SessionTTL.D(12 * time.Hour),

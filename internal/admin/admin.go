@@ -22,6 +22,7 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact/rules"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/tiered"
 )
 
 //go:embed ui
@@ -33,6 +34,7 @@ type Deps struct {
 	Keys             *keys.Store
 	Limiter          *limit.Limiter
 	Live             *live.Manager
+	Tiered           *tiered.Hub
 	MissingDetectors []string
 	UserKey          []byte
 	SessionTTL       time.Duration
@@ -107,6 +109,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /admin/api/providers/{name}/key", s.guard(s.deleteProviderKey))
 	s.mux.HandleFunc("POST /admin/api/password", s.guard(s.changePassword))
 	s.mux.HandleFunc("GET /admin/api/flow", s.guard(s.flow))
+	s.mux.HandleFunc("GET /admin/api/tiered", s.guard(s.getTiered))
+	s.mux.HandleFunc("GET /admin/api/tiered/{provider}/starters", s.guard(s.getTieredStarters))
+	s.mux.HandleFunc("POST /admin/api/tiered/{provider}/starters/pin", s.guard(s.pinTieredStarter))
+	s.mux.HandleFunc("DELETE /admin/api/tiered/{provider}/starters/{hash}", s.guard(s.deleteTieredStarter))
+	s.mux.HandleFunc("POST /admin/api/tiered/{provider}/starters/warm", s.guard(s.warmTieredStarters))
+	s.mux.HandleFunc("POST /admin/api/tiered/{provider}/shadow/reset", s.guard(s.resetTieredShadow))
 }
 
 func (s *Server) guard(next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
@@ -518,7 +526,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {
 	}
 	sqlStr := `SELECT id,request_id,ts,day,key_id,key_name,protocol,client_ip,requested_model,model,
 		status,error_code,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,admitted,
-		redaction_mode,redaction_count
+		redaction_mode,redaction_count,route_backend,route_reason
 		FROM request_log`
 	if len(where) > 0 {
 		sqlStr += " WHERE " + strings.Join(where, " AND ")
@@ -555,6 +563,8 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {
 		Admitted         bool   `json:"admitted"`
 		RedactionMode    string `json:"redaction_mode"`
 		RedactionCount   int    `json:"redaction_count"`
+		RouteBackend     string `json:"route_backend"`
+		RouteReason      string `json:"route_reason"`
 	}
 	out := []logRow{}
 	hasMore := false
@@ -565,7 +575,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {
 			&row.Protocol, &row.ClientIP, &row.RequestedModel, &row.Model,
 			&row.Status, &row.ErrorCode, &streamInt, &row.PromptTokens, &row.CompletionTokens,
 			&row.CachedTokens, &row.LatencyMS, &row.TTFTMS, &admInt,
-			&row.RedactionMode, &row.RedactionCount); err != nil {
+			&row.RedactionMode, &row.RedactionCount, &row.RouteBackend, &row.RouteReason); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -665,6 +675,8 @@ func (s *Server) channels(w http.ResponseWriter, _ *http.Request, _ string) {
 		Timeout         string        `json:"timeout"`
 		HasSystemPrompt bool          `json:"has_system_prompt"`
 		HasExtraBody    bool          `json:"has_extra_body"`
+		HasTiered       bool          `json:"has_tiered"`
+		TieredMode      string        `json:"tiered_mode,omitempty"`
 		Models          []modelHealth `json:"models"`
 	}
 	provs := make([]provView, 0, len(cfg.Providers))
@@ -681,6 +693,12 @@ func (s *Server) channels(w http.ResponseWriter, _ *http.Request, _ string) {
 		base := p.BaseURL
 		if p.Plugin != "" {
 			base = "plugin:" + p.Plugin
+		} else if base == "" && p.Tiered != nil {
+			base = "tiered:" + p.Tiered.Mode
+		}
+		tmode := ""
+		if p.Tiered != nil {
+			tmode = p.Tiered.Mode
 		}
 		provs = append(provs, provView{
 			Name:            p.Name,
@@ -689,6 +707,8 @@ func (s *Server) channels(w http.ResponseWriter, _ *http.Request, _ string) {
 			Timeout:         p.Timeout.D(300 * time.Second).String(),
 			HasSystemPrompt: p.SystemPrompt != "",
 			HasExtraBody:    len(p.ExtraBody) > 0,
+			HasTiered:       p.Tiered != nil,
+			TieredMode:      tmode,
 			Models:          ms,
 		})
 	}

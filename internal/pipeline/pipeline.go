@@ -91,6 +91,8 @@ type reqState struct {
 	errorCode    string
 	clientStream bool
 	cachedTokens int
+	routeBackend string
+	routeReason  string
 }
 
 // ServeHTTP handles POST /v1/chat/completions.
@@ -154,6 +156,8 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 			Admitted:         st.admitted,
 			RedactionMode:    redMode,
 			RedactionCount:   redCount,
+			RouteBackend:     st.routeBackend,
+			RouteReason:      st.routeReason,
 		}); err != nil {
 			p.Log.Error("request log write failed", "err", err)
 		}
@@ -541,6 +545,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 				return oai.Errorf(http.StatusBadGateway, "upstream_unavailable", "%s: %s", ref, ue.Error())
 			}
 			// a client error from the provider is returned as is
+			copyRouterHeaders(st, ue.Header)
 			st.rec.Status = ue.Status
 			st.errorCode = "upstream_error"
 			st.w.Header().Set("Content-Type", "application/json")
@@ -550,6 +555,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			return nil
 		}
 		st.snap.Reg.MarkOK(ref)
+		copyRouterHeaders(st, resp.Header)
 		st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: resp.StatusCode})
 		var usage oai.Usage
 		if upStream {
@@ -870,4 +876,24 @@ func newID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return "req_" + hex.EncodeToString(b)
+}
+
+func copyRouterHeaders(st *reqState, hdr http.Header) {
+	if len(hdr) == 0 {
+		return
+	}
+	for k, vs := range hdr {
+		if len(vs) == 0 {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(k), "x-router-") {
+			st.w.Header().Set(k, vs[0])
+		}
+	}
+	if b := hdr.Get("X-Router-Backend"); b != "" {
+		st.routeBackend = b
+	}
+	if rs := hdr.Get("X-Router-Reason"); rs != "" {
+		st.routeReason = rs
+	}
 }

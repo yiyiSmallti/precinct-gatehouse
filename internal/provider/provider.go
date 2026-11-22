@@ -59,8 +59,12 @@ func NewRegistry(cfg *config.Config, resolve func(ref string) (string, error)) (
 		if err != nil {
 			return nil, fmt.Errorf("provider %s: %w", pc.Name, err)
 		}
+		baseURL := pc.BaseURL
+		if baseURL == "" && pc.Tiered != nil {
+			baseURL = "http://tiered.invalid/v1"
+		}
 		r.byName[pc.Name] = &Provider{
-			Name: pc.Name, BaseURL: pc.BaseURL, Target: pc.Target, Models: pc.Models, Pricing: pc.Pricing,
+			Name: pc.Name, BaseURL: baseURL, Target: pc.Target, Models: pc.Models, Pricing: pc.Pricing,
 			SystemPrompt: pc.SystemPrompt, ExtraBody: pc.ExtraBody, key: key,
 			client: &http.Client{
 				Timeout: pc.Timeout.D(300 * time.Second),
@@ -71,6 +75,13 @@ func NewRegistry(cfg *config.Config, resolve func(ref string) (string, error)) (
 		}
 	}
 	return r, nil
+}
+
+// SetTransport overrides the underlying HTTP RoundTripper for a named provider.
+func (r *Registry) SetTransport(name string, rt http.RoundTripper) {
+	if p := r.byName[name]; p != nil && rt != nil {
+		p.client.Transport = rt
+	}
 }
 
 // Lookup splits "<provider>/<model>" and returns the provider and model id.
@@ -117,6 +128,7 @@ func (p *Provider) Cost(model string, prompt, completion int) float64 {
 type UpstreamError struct {
 	Status    int
 	Body      []byte
+	Header    http.Header
 	Err       error
 	Retryable bool
 }
@@ -151,7 +163,7 @@ func (p *Provider) Chat(ctx context.Context, body []byte) (*http.Response, error
 	if resp.StatusCode/100 != 2 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
-		return nil, &UpstreamError{Status: resp.StatusCode, Body: b, Retryable: resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 408}
+		return nil, &UpstreamError{Status: resp.StatusCode, Body: b, Header: resp.Header.Clone(), Retryable: resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 408}
 	}
 	return resp, nil
 }

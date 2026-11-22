@@ -81,7 +81,45 @@ type Provider struct {
 	Timeout      Duration           `yaml:"timeout,omitempty" json:"timeout,omitempty"`   // per upstream request, default 300s
 	SystemPrompt string             `yaml:"system_prompt,omitempty" json:"system_prompt,omitempty"`
 	ExtraBody    map[string]any     `yaml:"extra_body,omitempty" json:"extra_body,omitempty"`
+	Tiered       *TieredConfig      `yaml:"tiered,omitempty" json:"tiered,omitempty"`
 	HasKey       bool               `yaml:"-" json:"has_key"`
+}
+
+// TieredConfig configures built-in tiered routing and starter prefix caching for a provider.
+type TieredConfig struct {
+	Mode               string              `yaml:"mode,omitempty" json:"mode,omitempty"` // shadow | active
+	HeavyMissThreshold int                 `yaml:"heavy_miss_threshold,omitempty" json:"heavy_miss_threshold,omitempty"`
+	HealthIntervalSec  int                 `yaml:"health_interval_sec,omitempty" json:"health_interval_sec,omitempty"`
+	ZhThinkAnchor      *bool               `yaml:"zh_think_anchor,omitempty" json:"zh_think_anchor,omitempty"`
+	Backends           []TieredBackend     `yaml:"backends,omitempty" json:"backends,omitempty"`
+	StarterCache       *TieredStarterCache `yaml:"starter_cache,omitempty" json:"starter_cache,omitempty"`
+}
+
+// TieredBackend defines one backend tier inside a tiered provider.
+type TieredBackend struct {
+	ID               string `yaml:"id" json:"id"`
+	URL              string `yaml:"url" json:"url"`
+	Tier             int    `yaml:"tier" json:"tier"`
+	MaxContextTokens int    `yaml:"max_context_tokens,omitempty" json:"max_context_tokens,omitempty"`
+	MaxSafeInput     int    `yaml:"max_safe_input" json:"max_safe_input"`
+	PromoteAt        int    `yaml:"promote_at" json:"promote_at"`
+	DemoteBelow      int    `yaml:"demote_below,omitempty" json:"demote_below,omitempty"`
+	SpeedScore       int    `yaml:"speed_score,omitempty" json:"speed_score,omitempty"`
+}
+
+// TieredStarterCache configures starter prompt observation and idle warm-up.
+type TieredStarterCache struct {
+	Enabled           bool   `yaml:"enabled" json:"enabled"`
+	CanonicalizeTools bool   `yaml:"canonicalize_tools" json:"canonicalize_tools"`
+	MinTokens         int    `yaml:"min_tokens,omitempty" json:"min_tokens,omitempty"`
+	MaxTokens         int    `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
+	MinHits           int    `yaml:"min_hits,omitempty" json:"min_hits,omitempty"`
+	MaxEntries        int    `yaml:"max_entries,omitempty" json:"max_entries,omitempty"`
+	KeepAliveSec      int    `yaml:"keepalive_sec,omitempty" json:"keepalive_sec,omitempty"`
+	CheckIntervalSec  int    `yaml:"check_interval_sec,omitempty" json:"check_interval_sec,omitempty"`
+	StartupDelaySec   int    `yaml:"startup_delay_sec,omitempty" json:"startup_delay_sec,omitempty"`
+	EntryTTLHours     int    `yaml:"entry_ttl_hours,omitempty" json:"entry_ttl_hours,omitempty"`
+	PersistPath       string `yaml:"persist_path,omitempty" json:"persist_path,omitempty"`
 }
 
 // Pricing is the price per one million tokens.
@@ -353,6 +391,20 @@ func (c *Config) applyDefaults() {
 	for i := range c.Providers {
 		p := &c.Providers[i]
 		p.BaseURL = strings.TrimRight(p.BaseURL, "/")
+		if p.Tiered != nil {
+			if p.Tiered.Mode == "" {
+				p.Tiered.Mode = "shadow"
+			}
+			for j := range p.Tiered.Backends {
+				p.Tiered.Backends[j].URL = strings.TrimRight(p.Tiered.Backends[j].URL, "/")
+			}
+			if p.Tiered.StarterCache != nil && p.Tiered.StarterCache.PersistPath != "" {
+				p.Tiered.StarterCache.PersistPath = ExpandHome(p.Tiered.StarterCache.PersistPath)
+			}
+			if p.Target == "" {
+				p.Target = "local"
+			}
+		}
 		if p.Target == "" {
 			if isLoopbackURL(p.BaseURL) {
 				p.Target = "local"
@@ -409,6 +461,49 @@ var (
 	timeWindow = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$`)
 )
 
+func validateTiered(add func(string, ...any), pr *Provider) {
+	t := pr.Tiered
+	if t.Mode != "shadow" && t.Mode != "active" {
+		add("providers.%s.tiered.mode: must be shadow or active, got %q", pr.Name, t.Mode)
+	}
+	if t.Mode == "shadow" {
+		if !strings.HasPrefix(pr.BaseURL, "http://") && !strings.HasPrefix(pr.BaseURL, "https://") {
+			add("providers.%s.base_url: required (http:// or https://) when tiered.mode is shadow", pr.Name)
+		}
+	} else if pr.BaseURL != "" && !strings.HasPrefix(pr.BaseURL, "http://") && !strings.HasPrefix(pr.BaseURL, "https://") {
+		add("providers.%s.base_url: must start with http:// or https:// when set", pr.Name)
+	}
+	if len(t.Backends) == 0 {
+		add("providers.%s.tiered.backends: at least one backend is required", pr.Name)
+		return
+	}
+	seenID := map[string]bool{}
+	seenTier := map[int]bool{}
+	for j, b := range t.Backends {
+		if strings.TrimSpace(b.ID) == "" {
+			add("providers.%s.tiered.backends[%d].id: required", pr.Name, j)
+		} else if seenID[b.ID] {
+			add("providers.%s.tiered.backends[%d].id: duplicate %q", pr.Name, j, b.ID)
+		}
+		seenID[b.ID] = true
+		if b.Tier <= 0 {
+			add("providers.%s.tiered.backends[%d].tier: must be > 0", pr.Name, j)
+		} else if seenTier[b.Tier] {
+			add("providers.%s.tiered.backends[%d].tier: duplicate tier %d", pr.Name, j, b.Tier)
+		}
+		seenTier[b.Tier] = true
+		if !strings.HasPrefix(b.URL, "http://") && !strings.HasPrefix(b.URL, "https://") {
+			add("providers.%s.tiered.backends[%d].url: must start with http:// or https://", pr.Name, j)
+		}
+		if b.MaxSafeInput <= 0 {
+			add("providers.%s.tiered.backends[%d].max_safe_input: must be > 0", pr.Name, j)
+		}
+		if b.PromoteAt <= 0 {
+			add("providers.%s.tiered.backends[%d].promote_at: must be > 0", pr.Name, j)
+		}
+	}
+}
+
 func set(v ...string) map[string]bool {
 	m := map[string]bool{}
 	for _, s := range v {
@@ -461,9 +556,14 @@ func (c *Config) Validate() []string {
 			if pr.BaseURL != "" {
 				add("providers.%s: set base_url or plugin, not both", pr.Name)
 			}
+			if pr.Tiered != nil {
+				add("providers.%s: tiered cannot be used together with plugin", pr.Name)
+			}
 			if !c.hasPlugin(pr.Plugin, "provider") {
 				add("providers.%s.plugin: %q is not declared under plugins with kind provider", pr.Name, pr.Plugin)
 			}
+		} else if pr.Tiered != nil {
+			validateTiered(add, pr)
 		} else if !strings.HasPrefix(pr.BaseURL, "http://") && !strings.HasPrefix(pr.BaseURL, "https://") {
 			add("providers.%s.base_url: must start with http:// or https://", pr.Name)
 		}

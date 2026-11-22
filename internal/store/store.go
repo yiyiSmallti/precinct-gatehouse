@@ -76,7 +76,9 @@ CREATE TABLE IF NOT EXISTS request_log (
   ttft_ms           INTEGER NOT NULL DEFAULT 0,
   admitted          INTEGER NOT NULL DEFAULT 0,
   redaction_mode    TEXT NOT NULL DEFAULT '',
-  redaction_count   INTEGER NOT NULL DEFAULT 0
+  redaction_count   INTEGER NOT NULL DEFAULT 0,
+  route_backend     TEXT NOT NULL DEFAULT '',
+  route_reason      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS request_log_key_day ON request_log(key_id, day);
 CREATE INDEX IF NOT EXISTS request_log_ts ON request_log(ts);
@@ -110,6 +112,14 @@ func Open(dataDir string) (*sql.DB, error) {
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
 	}
 	if err := ensureColumn(db, "request_log", "redaction_count", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	if err := ensureColumn(db, "request_log", "route_backend", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	if err := ensureColumn(db, "request_log", "route_reason", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
 	}

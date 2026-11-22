@@ -120,6 +120,8 @@ type RequestLogEntry struct {
 	Admitted         bool
 	RedactionMode    string
 	RedactionCount   int
+	RouteBackend     string
+	RouteReason      string
 }
 
 // LogRequest records one client request in request_log.
@@ -136,12 +138,12 @@ func (m *Meter) LogRequest(e RequestLogEntry) error {
 	_, err := m.db.Exec(`INSERT INTO request_log(
 		request_id,ts,day,key_id,key_name,protocol,client_ip,requested_model,model,
 		status,error_code,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,admitted,
-		redaction_mode,redaction_count)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		redaction_mode,redaction_count,route_backend,route_reason)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.RequestID, e.Time.Unix(), e.Time.Local().Format("2006-01-02"), e.KeyID, e.KeyName,
 		e.Protocol, e.ClientIP, e.RequestedModel, e.Model,
 		e.Status, e.ErrorCode, stream, e.PromptTokens, e.CompletionTokens, e.CachedTokens,
-		e.LatencyMS, e.TTFTMS, admitted, e.RedactionMode, e.RedactionCount)
+		e.LatencyMS, e.TTFTMS, admitted, e.RedactionMode, e.RedactionCount, e.RouteBackend, e.RouteReason)
 	m.mu.Unlock()
 	return err
 }
