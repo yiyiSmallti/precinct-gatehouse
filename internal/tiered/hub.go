@@ -446,6 +446,10 @@ func (r *Router) roundTripShadow(req *http.Request, upstream http.RoundTripper) 
 
 	actualID := resp.Header.Get("X-Router-Backend")
 	actualReason := resp.Header.Get("X-Router-Reason")
+	if predID != "" {
+		resp.Header.Set("X-Router-Shadow-Backend", predID)
+		resp.Header.Set("X-Router-Shadow-Reason", predReason)
+	}
 	r.recordShadow(predID, predReason, actualID, actualReason, an)
 
 	actualBackend := r.backendByID(actualID)
