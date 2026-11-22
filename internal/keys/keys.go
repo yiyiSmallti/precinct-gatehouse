@@ -138,20 +138,53 @@ func (s *Store) clearCache() {
 
 // Create generates and stores a new API key, returning the plaintext once.
 func (s *Store) Create(opts CreateOpts) (string, Key, error) {
-	name := strings.TrimSpace(opts.Name)
-	if name == "" {
-		return "", Key{}, fmt.Errorf("name is required")
-	}
-	if opts.RPM < 0 || opts.RPD < 0 || opts.Concurrency < 0 {
-		return "", Key{}, fmt.Errorf("limits must be >= 0")
-	}
-	id, err := newKeyID()
-	if err != nil {
+	if err := validateCreateOpts(opts); err != nil {
 		return "", Key{}, err
 	}
 	plain, err := newSecret()
 	if err != nil {
 		return "", Key{}, err
+	}
+	k, err := s.insertKey(plain, opts)
+	if err != nil {
+		return "", Key{}, err
+	}
+	return plain, k, nil
+}
+
+// Import stores an operator-supplied plaintext sk- key without generating a new secret.
+func (s *Store) Import(plain string, opts CreateOpts) (Key, error) {
+	if !strings.HasPrefix(plain, "sk-") || len(plain) < 20 {
+		return Key{}, fmt.Errorf("imported key must start with sk- and be at least 20 characters")
+	}
+	if err := validateCreateOpts(opts); err != nil {
+		return Key{}, err
+	}
+	var exists int
+	err := s.db.QueryRow(`SELECT 1 FROM api_keys WHERE key_hash=?`, hashSecret(plain)).Scan(&exists)
+	if err == nil {
+		return Key{}, fmt.Errorf("key already exists")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Key{}, err
+	}
+	return s.insertKey(plain, opts)
+}
+
+func validateCreateOpts(opts CreateOpts) error {
+	if strings.TrimSpace(opts.Name) == "" {
+		return fmt.Errorf("name is required")
+	}
+	if opts.RPM < 0 || opts.RPD < 0 || opts.Concurrency < 0 {
+		return fmt.Errorf("limits must be >= 0")
+	}
+	return nil
+}
+
+func (s *Store) insertKey(plain string, opts CreateOpts) (Key, error) {
+	id, err := newKeyID()
+	if err != nil {
+		return Key{}, err
 	}
 	now := s.now().Unix()
 	models := nonNilStrings(opts.Models)
@@ -160,7 +193,7 @@ func (s *Store) Create(opts CreateOpts) (string, Key, error) {
 	gj, _ := json.Marshal(groups)
 	k := Key{
 		ID:        id,
-		Name:      name,
+		Name:      strings.TrimSpace(opts.Name),
 		KeyPrefix: plain[:9],
 		CreatedAt: now,
 		ExpiresAt: opts.ExpiresAt,
@@ -179,10 +212,10 @@ func (s *Store) Create(opts CreateOpts) (string, Key, error) {
 		k.ID, k.Name, hashSecret(plain), k.KeyPrefix, k.CreatedAt, k.ExpiresAt, string(mj), string(gj),
 		k.RPM, k.RPD, k.Concurrency, k.Note)
 	if err != nil {
-		return "", Key{}, err
+		return Key{}, err
 	}
 	s.clearCache()
-	return plain, k, nil
+	return k, nil
 }
 
 // Lookup resolves a plaintext key, validating existence, enabled state and expiry.

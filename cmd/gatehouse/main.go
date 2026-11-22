@@ -569,7 +569,7 @@ func splitFlagsAndPos(args []string, boolFlags map[string]bool) []string {
 
 func apikeyCmd(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("apikey: want create, list, update, enable, disable, reset or delete")
+		return fmt.Errorf("apikey: want create, import, list, update, enable, disable, reset or delete")
 	}
 	sub := args[0]
 	fs, cfgPath := newFlags("apikey " + sub)
@@ -627,6 +627,36 @@ func apikeyCmd(args []string) error {
 		}
 		fmt.Println(plain)
 		fmt.Fprintf(os.Stderr, "created %s (%s, prefix %s)\n", k.ID, k.Name, k.KeyPrefix)
+	case "import":
+		if strings.TrimSpace(*name) == "" {
+			return fmt.Errorf("apikey import: --name is required")
+		}
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		plain := strings.TrimSpace(line)
+		var exp int64
+		if *ttl > 0 {
+			exp = time.Now().Add(*ttl).Unix()
+		}
+		k, err := ks.Import(plain, keys.CreateOpts{
+			Name:        *name,
+			ExpiresAt:   exp,
+			Models:      splitList(*models),
+			Groups:      splitList(*groups),
+			RPM:         *rpm,
+			RPD:         *rpd,
+			Concurrency: *conc,
+			Note:        *note,
+		})
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{"api_key": k})
+		}
+		fmt.Fprintf(os.Stderr, "imported %s (%s, prefix %s)\n", k.ID, k.Name, k.KeyPrefix)
 	case "list":
 		list, err := ks.List()
 		if err != nil {

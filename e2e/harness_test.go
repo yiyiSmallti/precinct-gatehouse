@@ -335,13 +335,27 @@ func (g *Gateway) Stop() {
 // CLI runs a gatehouse subcommand against this gateway's config.
 func (g *Gateway) CLI(t *testing.T, args ...string) string {
 	t.Helper()
-	args = append(args, "--config", filepath.Join(g.Dir, "config.yaml"))
-	// flags must precede positional args for the flag package; move --config after the subcommand words
-	out, err := exec.Command(gatehouse, reorder(args)...).CombinedOutput()
+	out, err := g.runCLI("", args...)
 	if err != nil {
 		t.Fatalf("gatehouse %v: %v\n%s", args, err, out)
 	}
-	return string(out)
+	return out
+}
+
+// CLIStdin runs a gatehouse subcommand with stdin input, returning combined output and error.
+func (g *Gateway) CLIStdin(stdin string, args ...string) (string, error) {
+	return g.runCLI(stdin, args...)
+}
+
+func (g *Gateway) runCLI(stdin string, args ...string) (string, error) {
+	args = append(args, "--config", filepath.Join(g.Dir, "config.yaml"))
+	// flags must precede positional args for the flag package; move --config after the subcommand words
+	cmd := exec.Command(gatehouse, reorder(args)...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 func reorder(args []string) []string {
@@ -369,7 +383,7 @@ func reorder(args []string) []string {
 func isWord(s string) bool {
 	switch s {
 	case "token", "issue", "revoke", "list", "config", "check", "redact", "try", "report", "key", "set", "delete",
-		"apikey", "create", "update", "enable", "disable", "reset", "admin", "set-password":
+		"apikey", "create", "import", "update", "enable", "disable", "reset", "admin", "set-password":
 		return true
 	}
 	return false

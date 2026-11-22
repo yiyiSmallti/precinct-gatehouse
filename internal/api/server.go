@@ -236,6 +236,8 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	mux.HandleFunc("POST /v1/messages", s.anthropicMessages)
 	mux.HandleFunc("POST /v1/messages/count_tokens", s.anthropicCountTokens)
 	mux.HandleFunc("GET /v1/models", s.models)
+	mux.HandleFunc("GET /api/usage/token", s.newapiTokenUsage)
+	mux.HandleFunc("GET /api/usage/token/", s.newapiTokenUsage)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	s.HTTP = &http.Server{Addr: cfg.Listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	cleanupOnErr = false
@@ -442,6 +444,61 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(oai.Encode(map[string]any{"object": "list", "data": data}))
+}
+
+func (s *Server) newapiTokenUsage(w http.ResponseWriter, r *http.Request) {
+	tok := pipeline.Bearer(r)
+	if tok == "" {
+		if raw := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(raw, "sk-") {
+			tok = raw
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if s.Keys == nil || !strings.HasPrefix(tok, "sk-") {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write(oai.Encode(map[string]any{"code": false, "message": "invalid token", "data": nil}))
+		return
+	}
+	k, err := s.Keys.Lookup(tok)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write(oai.Encode(map[string]any{"code": false, "message": "invalid token", "data": nil}))
+		return
+	}
+	modelLimits := map[string]bool{}
+	for _, m := range k.Models {
+		modelLimits[m] = true
+	}
+	unlimitedQuota := true
+	totalGranted := 500000000
+	totalUsed := 0
+	if k.RPD > 0 {
+		unlimitedQuota = false
+		totalGranted = k.RPD
+		if s.Limiter != nil {
+			totalUsed = s.Limiter.Snapshot(k.ID, time.Now()).TodayUsed
+		}
+	}
+	totalAvailable := max(0, totalGranted-totalUsed)
+	w.Write(oai.Encode(map[string]any{
+		"code":    true,
+		"message": "ok",
+		"data": map[string]any{
+			"expires_at":           k.ExpiresAt,
+			"model_limits":         modelLimits,
+			"model_limits_enabled": len(k.Models) > 0,
+			"name":                 k.Name,
+			"object":               "token_usage",
+			"total_available":      totalAvailable,
+			"total_granted":        totalGranted,
+			"total_used":           totalUsed,
+			"unlimited_quota":      unlimitedQuota,
+			"user_quota": map[string]any{
+				"total_available": totalAvailable,
+				"total_used":      totalUsed,
+			},
+		},
+	}))
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
