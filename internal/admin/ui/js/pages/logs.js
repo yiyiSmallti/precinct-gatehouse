@@ -101,9 +101,11 @@ export function renderLogs(container, ctx) {
       rows = append ? [...rows, ...list] : list;
       hasMore = Boolean(res.has_more);
       nextBeforeId = res.next_before_id || 0;
-      paint();
     } catch (e) {
       if (e.status !== 401) toast(`读取日志失败: ${e.message}`, 'err');
+    } finally {
+      loadingMore = false;
+      paint();
     }
   };
 
@@ -266,10 +268,12 @@ export function renderLogs(container, ctx) {
               type: 'button',
               className: 'btn',
               disabled: loadingMore,
-              onClick: async () => {
+              onClick: async (e) => {
+                if (loadingMore) return;
                 loadingMore = true;
+                e.currentTarget.disabled = true;
+                e.currentTarget.textContent = '加载中...';
                 await fetchLogs(true);
-                loadingMore = false;
               },
             }, loadingMore ? '加载中...' : '加载更多记录')
           )

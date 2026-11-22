@@ -1091,6 +1091,9 @@ func (sc *StarterCache) warmOne(entry *StarterEntry, backend *BackendState) Warm
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "dsv41-smart-router-warmer/1.0")
+	if apiKey := sc.router.getAPIKey(); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 
 	backend.activeReqs.Add(1)
 	resp, err := sc.router.transport.RoundTrip(req)

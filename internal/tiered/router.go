@@ -167,6 +167,7 @@ type Router struct {
 	cfgMu        sync.RWMutex
 	cfg          RouterConfig
 	target       string
+	apiKey       string
 	warmupFilter WarmupFilterFunc
 	backends     []*BackendState
 	byID         map[string]*BackendState
@@ -240,10 +241,10 @@ func newDefaultTransport() *http.Transport {
 }
 
 func newRouter(name string, cfg RouterConfig, defaultPersist string, tr *http.Transport, logger *slog.Logger) (*Router, error) {
-	return newRouterWithTarget(name, "", cfg, defaultPersist, tr, logger)
+	return newRouterWithTarget(name, "", "", cfg, defaultPersist, tr, logger)
 }
 
-func newRouterWithTarget(name, target string, cfg RouterConfig, defaultPersist string, tr *http.Transport, logger *slog.Logger) (*Router, error) {
+func newRouterWithTarget(name, target, apiKey string, cfg RouterConfig, defaultPersist string, tr *http.Transport, logger *slog.Logger) (*Router, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -261,6 +262,7 @@ func newRouterWithTarget(name, target string, cfg RouterConfig, defaultPersist s
 		transport:      tr,
 		cfg:            norm,
 		target:         target,
+		apiKey:         apiKey,
 		byID:           make(map[string]*BackendState),
 		prefixes:       make(map[string]*PrefixEntry, 4096),
 		sessions:       make(map[string]*SessionEntry, 1024),
@@ -310,12 +312,12 @@ func (r *Router) rebuildBackends(list []BackendConfig) error {
 	r.cfgMu.Unlock()
 
 	if len(toProbe) > 0 {
-		probeBackends(toProbe, &http.Client{Timeout: 4000 * time.Millisecond}, r.log, r.name)
+		probeBackends(toProbe, r.getAPIKey(), &http.Client{Timeout: 4000 * time.Millisecond}, r.log, r.name)
 	}
 	return nil
 }
 
-func (r *Router) apply(target string, cfg RouterConfig) error {
+func (r *Router) apply(target, apiKey string, cfg RouterConfig) error {
 	norm := normalizeRouterConfig(cfg, r.defaultDB)
 	if target == "" {
 		target = config.DefaultProviderTarget(&config.Provider{Tiered: &norm})
@@ -323,6 +325,7 @@ func (r *Router) apply(target string, cfg RouterConfig) error {
 	r.cfgMu.Lock()
 	r.cfg = norm
 	r.target = target
+	r.apiKey = apiKey
 	r.cfgMu.Unlock()
 
 	if err := r.rebuildBackends(norm.Backends); err != nil {
@@ -346,6 +349,16 @@ func (r *Router) getTarget() string {
 		return "local"
 	}
 	return t
+}
+
+func (r *Router) getAPIKey() string {
+	if r == nil {
+		return ""
+	}
+	r.cfgMu.RLock()
+	k := r.apiKey
+	r.cfgMu.RUnlock()
+	return k
 }
 
 func (r *Router) setWarmupFilter(fn WarmupFilterFunc) {
@@ -456,7 +469,7 @@ func isTimeoutErr(err error) bool {
 	return strings.Contains(err.Error(), "Client.Timeout") || strings.Contains(err.Error(), "deadline exceeded")
 }
 
-func probeBackends(backends []*BackendState, client *http.Client, logger *slog.Logger, routerName string) {
+func probeBackends(backends []*BackendState, apiKey string, client *http.Client, logger *slog.Logger, routerName string) {
 	var wg sync.WaitGroup
 	for _, b := range backends {
 		wg.Add(1)
@@ -464,7 +477,14 @@ func probeBackends(backends []*BackendState, client *http.Client, logger *slog.L
 			defer wg.Done()
 			prevHealthy := b.healthy.Load()
 			bCfg := b.config()
-			resp, err := client.Get(strings.TrimRight(bCfg.URL, "/") + "/get_server_info")
+			req, err := http.NewRequest(http.MethodGet, strings.TrimRight(bCfg.URL, "/")+"/get_server_info", nil)
+			var resp *http.Response
+			if err == nil {
+				if apiKey != "" {
+					req.Header.Set("Authorization", "Bearer "+apiKey)
+				}
+				resp, err = client.Do(req)
+			}
 			if err != nil {
 				fails := b.healthFails.Add(1)
 				maxTimeouts := int32(2)
@@ -516,7 +536,7 @@ func (r *Router) startBackgroundLoops(ctx context.Context) {
 				tk.Stop()
 				return
 			case <-tk.C:
-				probeBackends(r.getBackends(), client, r.log, r.name)
+				probeBackends(r.getBackends(), r.getAPIKey(), client, r.log, r.name)
 			}
 		}
 	}()
@@ -825,8 +845,10 @@ func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh in
 	}
 	if len(eligible) == 0 {
 		if len(allHealthy) == 0 {
-			if len(backends) > 0 {
-				return &backends[len(backends)-1], "fallback-unhealthy", false
+			for i := len(backends) - 1; i >= 0; i-- {
+				if !exclude[backends[i].cfg.ID] {
+					return &backends[i], "fallback-unhealthy", false
+				}
 			}
 			return nil, "no-backends", false
 		}

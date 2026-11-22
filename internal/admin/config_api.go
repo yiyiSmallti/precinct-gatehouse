@@ -423,6 +423,45 @@ func (s *Server) testProvider(w http.ResponseWriter, r *http.Request, _ string) 
 	})
 }
 
+var errProviderNotFound = errors.New("provider not found")
+
+func (s *Server) updateProviderKey(w http.ResponseWriter, providerName, baseHash string, applyChange func(raw *config.Config, idx int) (rollback func(), err error)) {
+	res, err := s.deps.Live.ApplySerialized("web:providers", baseHash, func(prev *live.Snapshot) ([]byte, func(), error) {
+		raw := prev.Cfg.RawCopy()
+		idx := -1
+		for i := range raw.Providers {
+			if raw.Providers[i].Name == providerName {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, nil, errProviderNotFound
+		}
+		rollback, err := applyChange(raw, idx)
+		if err != nil {
+			return nil, nil, err
+		}
+		yamlBytes, err := config.MarshalRaw(raw)
+		if err != nil {
+			if rollback != nil {
+				rollback()
+			}
+			return nil, nil, err
+		}
+		return yamlBytes, rollback, nil
+	})
+	if err != nil {
+		if errors.Is(err, errProviderNotFound) {
+			writeJSONError(w, http.StatusNotFound, "provider not found")
+			return
+		}
+		s.writeApplyErr(w, err)
+		return
+	}
+	s.writeApplyOK(w, res)
+}
+
 func (s *Server) putProviderKey(w http.ResponseWriter, r *http.Request, _ string) {
 	name := r.PathValue("name")
 	var req struct {
@@ -437,79 +476,50 @@ func (s *Server) putProviderKey(w http.ResponseWriter, r *http.Request, _ string
 		writeJSONError(w, http.StatusBadRequest, "key is required")
 		return
 	}
-	st := s.deps.Live.Status()
-	raw := st.Snapshot.Cfg.RawCopy()
-	idx := -1
-	for i := range raw.Providers {
-		if raw.Providers[i].Name == name {
-			idx = i
-			break
+	s.updateProviderKey(w, name, req.BaseHash, func(raw *config.Config, idx int) (func(), error) {
+		prevVal, prevErr := getSetting(s.deps.DB, "provider_key:"+name)
+		if err := setSetting(s.deps.DB, "provider_key:"+name, req.Key); err != nil {
+			return nil, err
 		}
-	}
-	if idx < 0 {
-		writeJSONError(w, http.StatusNotFound, "provider not found")
-		return
-	}
-	prevVal, prevErr := getSetting(s.deps.DB, "provider_key:"+name)
-	if err := setSetting(s.deps.DB, "provider_key:"+name, req.Key); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	raw.Providers[idx].KeyRef = "db:" + name
-	yamlBytes, err := config.MarshalRaw(raw)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	baseHash := req.BaseHash
-	if baseHash == "" {
-		baseHash = st.Hash
-	}
-	res, err := s.deps.Live.Apply(yamlBytes, "web:providers", baseHash)
-	if err != nil {
-		if prevErr == nil {
-			_ = setSetting(s.deps.DB, "provider_key:"+name, prevVal)
-		} else {
-			_, _ = s.deps.DB.Exec(`DELETE FROM settings WHERE k=?`, "provider_key:"+name)
+		raw.Providers[idx].KeyRef = "db:" + name
+		rollback := func() {
+			if prevErr == nil {
+				_ = setSetting(s.deps.DB, "provider_key:"+name, prevVal)
+			} else {
+				_, _ = s.deps.DB.Exec(`DELETE FROM settings WHERE k=?`, "provider_key:"+name)
+			}
 		}
-		s.writeApplyErr(w, err)
-		return
-	}
-	s.writeApplyOK(w, res)
+		return rollback, nil
+	})
 }
 
 func (s *Server) deleteProviderKey(w http.ResponseWriter, r *http.Request, _ string) {
 	name := r.PathValue("name")
-	st := s.deps.Live.Status()
-	raw := st.Snapshot.Cfg.RawCopy()
-	idx := -1
-	for i := range raw.Providers {
-		if raw.Providers[i].Name == name {
-			idx = i
-			break
+	baseHash := strings.TrimSpace(r.URL.Query().Get("base_hash"))
+	if baseHash == "" && r.Body != nil {
+		var req struct {
+			BaseHash string `json:"base_hash"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err == nil {
+			baseHash = strings.TrimSpace(req.BaseHash)
+		} else if !errors.Is(err, io.EOF) {
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
+			return
 		}
 	}
-	if idx < 0 {
-		writeJSONError(w, http.StatusNotFound, "provider not found")
-		return
-	}
-	prevVal, prevErr := getSetting(s.deps.DB, "provider_key:"+name)
-	_, _ = s.deps.DB.Exec(`DELETE FROM settings WHERE k=?`, "provider_key:"+name)
-	raw.Providers[idx].KeyRef = ""
-	yamlBytes, err := config.MarshalRaw(raw)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	res, err := s.deps.Live.Apply(yamlBytes, "web:providers", st.Hash)
-	if err != nil {
-		if prevErr == nil {
-			_ = setSetting(s.deps.DB, "provider_key:"+name, prevVal)
+	s.updateProviderKey(w, name, baseHash, func(raw *config.Config, idx int) (func(), error) {
+		prevVal, prevErr := getSetting(s.deps.DB, "provider_key:"+name)
+		if _, err := s.deps.DB.Exec(`DELETE FROM settings WHERE k=?`, "provider_key:"+name); err != nil {
+			return nil, err
 		}
-		s.writeApplyErr(w, err)
-		return
-	}
-	s.writeApplyOK(w, res)
+		raw.Providers[idx].KeyRef = ""
+		rollback := func() {
+			if prevErr == nil {
+				_ = setSetting(s.deps.DB, "provider_key:"+name, prevVal)
+			}
+		}
+		return rollback, nil
+	})
 }
 
 func (s *Server) changePassword(w http.ResponseWriter, r *http.Request, user string) {
@@ -544,12 +554,13 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request, user str
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	tok, err := s.auth.createSession(storedUser, newPassHash, time.Now())
+	ttl := s.sessionTTL()
+	tok, err := s.auth.createSession(storedUser, newPassHash, ttl, time.Now())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.setSessionCookie(w, r, tok)
+	s.setSessionCookie(w, r, tok, ttl)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

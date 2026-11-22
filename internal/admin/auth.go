@@ -107,6 +107,7 @@ func getSetting(db *sql.DB, k string) (string, error) {
 type session struct {
 	user     string
 	passHash string
+	issued   time.Time
 	expires  time.Time
 }
 
@@ -155,7 +156,10 @@ func (a *authStore) clearFails(ip string) {
 	a.mu.Unlock()
 }
 
-func (a *authStore) createSession(user, passHash string, now time.Time) (string, error) {
+func (a *authStore) createSession(user, passHash string, ttl time.Duration, now time.Time) (string, error) {
+	if ttl <= 0 {
+		ttl = a.ttl
+	}
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -167,12 +171,12 @@ func (a *authStore) createSession(user, passHash string, now time.Time) (string,
 			delete(a.sessions, k)
 		}
 	}
-	a.sessions[tok] = session{user: user, passHash: passHash, expires: now.Add(a.ttl)}
+	a.sessions[tok] = session{user: user, passHash: passHash, issued: now, expires: now.Add(ttl)}
 	a.mu.Unlock()
 	return tok, nil
 }
 
-func (a *authStore) verifySession(tok, currentPassHash string, now time.Time) (string, bool) {
+func (a *authStore) verifySession(tok, currentPassHash string, maxTTL time.Duration, now time.Time) (string, bool) {
 	if tok == "" || currentPassHash == "" {
 		return "", false
 	}
@@ -182,7 +186,9 @@ func (a *authStore) verifySession(tok, currentPassHash string, now time.Time) (s
 	if !ok {
 		return "", false
 	}
-	if now.After(s.expires) || subtle.ConstantTimeCompare([]byte(s.passHash), []byte(currentPassHash)) != 1 {
+	if now.After(s.expires) ||
+		(maxTTL > 0 && !s.issued.IsZero() && now.Sub(s.issued) > maxTTL) ||
+		subtle.ConstantTimeCompare([]byte(s.passHash), []byte(currentPassHash)) != 1 {
 		delete(a.sessions, tok)
 		return "", false
 	}

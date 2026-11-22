@@ -158,6 +158,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	resolveKey := func(ref string) (string, error) {
 		return ResolveKey(db, ref)
 	}
+	hub.SetKeyResolver(resolveKey)
 	buildSnapshot := func(nextCfg *config.Config, prev *live.Snapshot) (*live.Snapshot, error) {
 		reg, err := provider.NewRegistry(nextCfg, resolveKey)
 		if err != nil {

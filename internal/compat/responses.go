@@ -74,19 +74,21 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 					"tool_calls": []any{tc},
 				})
 			case typ == "function_call_output":
-				outStr := ""
+				var outVal any = ""
 				switch ov := item["output"].(type) {
 				case string:
-					outStr = ov
+					outVal = ov
+				case []any:
+					outVal = convertResponseInputContent(ov)
 				case nil:
-					outStr = ""
+					outVal = ""
 				default:
-					outStr = string(oai.Encode(ov))
+					outVal = string(oai.Encode(ov))
 				}
 				msgs = append(msgs, map[string]any{
 					"role":         "tool",
 					"tool_call_id": oai.Str(item, "call_id"),
-					"content":      outStr,
+					"content":      outVal,
 				})
 			case typ == "reasoning":
 				// dropped

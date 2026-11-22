@@ -233,3 +233,175 @@ func TestStarterCacheTrustBoundaryOnReload(t *testing.T) {
 		t.Fatalf("expected no warmup to extSrv from legacy starter, got res=%+v extHits=%d", res, extHits.Load())
 	}
 }
+
+func TestStarterWarmupUsesProviderAPIKey(t *testing.T) {
+	const wantKey = "secret-tiered-backend-key"
+	t.Setenv("TEST_TIERED_KEY", wantKey)
+
+	var unauthCount, warmOK atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+wantKey {
+			unauthCount.Add(1)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		if strings.Contains(r.Header.Get("User-Agent"), "warmer") {
+			warmOK.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":0}}}`))
+	}))
+	defer up.Close()
+
+	dir := t.TempDir()
+	hub := NewHub(dir, nil)
+	defer func() { _ = hub.Close() }()
+
+	f := false
+	tc := config.TieredConfig{
+		Mode:               "active",
+		HeavyMissThreshold: 24000,
+		HealthIntervalSec:  60,
+		ZhThinkAnchor:      &f,
+		StarterCache: &config.TieredStarterCache{
+			Enabled:          true,
+			MinTokens:        32,
+			MaxTokens:        100000,
+			MinHits:          1,
+			CheckIntervalSec: 600,
+			StartupDelaySec:  600,
+			PersistPath:      filepath.Join(dir, "starters.json"),
+		},
+		Backends: []config.TieredBackend{
+			{
+				ID:               "b1",
+				URL:              up.URL,
+				Tier:             1,
+				MaxContextTokens: 64000,
+				MaxSafeInput:     50000,
+				PromoteAt:        64000,
+				SpeedScore:       100,
+			},
+		},
+	}
+
+	tr, err := hub.Transport("p", "local", &tc, nil)
+	if err != nil {
+		t.Fatalf("Transport: %v", err)
+	}
+	hub.Activate(&config.Config{Providers: []config.Provider{{
+		Name:   "p",
+		Target: "local",
+		KeyRef: "env:TEST_TIERED_KEY",
+		Tiered: &tc,
+	}}})
+
+	r, ok := hub.Router("p")
+	if !ok {
+		t.Fatal("expected router p")
+	}
+	if !r.getBackends()[0].healthy.Load() {
+		t.Fatalf("expected authenticated /get_server_info probe to mark backend healthy (unauth=%d)", unauthCount.Load())
+	}
+
+	sysPrompt := strings.Repeat("Authenticated starter warmup prefix instruction. ", 12)
+	chatBody, _ := json.Marshal(map[string]any{
+		"model": "m1",
+		"messages": []map[string]any{
+			{"role": "system", "content": sysPrompt},
+			{"role": "user", "content": "hi"},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader(chatBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+wantKey)
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	starters := r.Starters()
+	if len(starters) != 1 {
+		t.Fatalf("expected 1 starter captured, got %d", len(starters))
+	}
+	warmRes, err := r.WarmStarter(starters[0].Hash, true)
+	if err != nil || len(warmRes) != 1 || warmRes[0].Error != "" {
+		t.Fatalf("expected authenticated warmup to succeed, got err=%v res=%+v", err, warmRes)
+	}
+	if warmOK.Load() != 1 || unauthCount.Load() != 0 {
+		t.Fatalf("expected warmOK=1 unauthCount=0, got warmOK=%d unauthCount=%d", warmOK.Load(), unauthCount.Load())
+	}
+}
+
+func TestUnhealthyFallbackHonorsExclusions(t *testing.T) {
+	var smallHits, largeHits atomic.Int32
+	smallSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		smallHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"from-small"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`))
+	}))
+	defer smallSrv.Close()
+
+	largeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		largeHits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"busy"}`))
+	}))
+	defer largeSrv.Close()
+
+	hub := NewHub(t.TempDir(), nil)
+	defer func() { _ = hub.Close() }()
+
+	f := false
+	tc := config.TieredConfig{
+		Mode:               "active",
+		HeavyMissThreshold: 24000,
+		HealthIntervalSec:  60,
+		ZhThinkAnchor:      &f,
+		StarterCache:       &config.TieredStarterCache{Enabled: false},
+		Backends: []config.TieredBackend{
+			{ID: "small", URL: smallSrv.URL, Tier: 1, MaxContextTokens: 64000, MaxSafeInput: 50000, PromoteAt: 50000, SpeedScore: 100},
+			{ID: "large", URL: largeSrv.URL, Tier: 2, MaxContextTokens: 128000, MaxSafeInput: 100000, PromoteAt: 100000, SpeedScore: 50},
+		},
+	}
+
+	tr, err := hub.Transport("p", "local", &tc, nil)
+	if err != nil {
+		t.Fatalf("Transport: %v", err)
+	}
+	hub.Activate(&config.Config{Providers: []config.Provider{{Name: "p", Target: "local", Tiered: &tc}}})
+
+	req, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","messages":[{"role":"user","content":"hi"}]}`)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "from-small") {
+		t.Fatalf("expected failover from unhealthy large(503) to unhealthy small(200), got status=%d body=%s", resp.StatusCode, body)
+	}
+	if largeHits.Load() != 1 || smallHits.Load() != 1 {
+		t.Fatalf("expected 1 attempt on large and 1 failover attempt on small, got large=%d small=%d", largeHits.Load(), smallHits.Load())
+	}
+}

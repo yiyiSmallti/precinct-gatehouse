@@ -153,17 +153,8 @@ func convertAnthropicUserBlocks(role string, blocks []any) []any {
 		case "text":
 			parts = append(parts, map[string]any{"type": "text", "text": oai.Str(blk, "text")})
 		case "image":
-			src, _ := blk["source"].(map[string]any)
-			switch oai.Str(src, "type") {
-			case "base64":
-				mt := oai.Str(src, "media_type")
-				if mt == "" {
-					mt = "image/png"
-				}
-				url := fmt.Sprintf("data:%s;base64,%s", mt, oai.Str(src, "data"))
-				parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
-			case "url":
-				parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": oai.Str(src, "url")}})
+			if img, ok := convertAnthropicImageBlock(blk); ok {
+				parts = append(parts, img)
 			}
 		}
 	}
@@ -233,19 +224,52 @@ func convertAnthropicAssistantBlocks(blocks []any) []any {
 	return []any{msg}
 }
 
-func extractToolResultContent(v any) string {
+func convertAnthropicImageBlock(blk map[string]any) (map[string]any, bool) {
+	src, _ := blk["source"].(map[string]any)
+	switch oai.Str(src, "type") {
+	case "base64":
+		mt := oai.Str(src, "media_type")
+		if mt == "" {
+			mt = "image/png"
+		}
+		url := fmt.Sprintf("data:%s;base64,%s", mt, oai.Str(src, "data"))
+		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}, true
+	case "url":
+		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": oai.Str(src, "url")}}, true
+	}
+	return nil, false
+}
+
+func extractToolResultContent(v any) any {
 	switch c := v.(type) {
 	case string:
 		return c
 	case []any:
-		var parts []string
+		var textParts []string
+		var parts []any
+		hasImage := false
 		for _, item := range c {
-			if m, ok := item.(map[string]any); ok && oai.Str(m, "type") == "text" {
-				parts = append(parts, oai.Str(m, "text"))
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch oai.Str(m, "type") {
+			case "text":
+				txt := oai.Str(m, "text")
+				textParts = append(textParts, txt)
+				parts = append(parts, map[string]any{"type": "text", "text": txt})
+			case "image":
+				if img, ok := convertAnthropicImageBlock(m); ok {
+					hasImage = true
+					parts = append(parts, img)
+				}
 			}
 		}
-		if len(parts) > 0 {
-			return strings.Join(parts, "\n")
+		if hasImage {
+			return parts
+		}
+		if len(textParts) > 0 {
+			return strings.Join(textParts, "\n")
 		}
 		return string(oai.Encode(c))
 	case nil:

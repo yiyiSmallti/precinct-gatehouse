@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/keystore"
 )
 
 type ctxKey int
@@ -42,6 +43,7 @@ type Hub struct {
 	mu           sync.RWMutex
 	routers      map[string]*Router
 	warmupFilter WarmupFilterFunc
+	resolveKey   func(ref string) (string, error)
 }
 
 // SetWarmupFilter installs a filter invoked on starter warm-up payloads before dispatch.
@@ -58,16 +60,24 @@ func (h *Hub) SetWarmupFilter(fn WarmupFilterFunc) {
 	}
 }
 
+// SetKeyResolver installs a resolver for provider key_ref values used by probes and starter warmups.
+func (h *Hub) SetKeyResolver(fn func(ref string) (string, error)) {
+	h.mu.Lock()
+	h.resolveKey = fn
+	h.mu.Unlock()
+}
+
 // NewHub builds a Hub for managing tiered provider routers. No goroutines start until Activate.
 func NewHub(dataDir string, log *slog.Logger) *Hub {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Hub{
-		dataDir:   dataDir,
-		log:       log,
-		transport: newDefaultTransport(),
-		routers:   make(map[string]*Router),
+		dataDir:    dataDir,
+		log:        log,
+		transport:  newDefaultTransport(),
+		routers:    make(map[string]*Router),
+		resolveKey: keystore.Resolve,
 	}
 }
 
@@ -167,6 +177,7 @@ func (h *Hub) Activate(cfg *config.Config) {
 	type desiredSpec struct {
 		tc     *config.TieredConfig
 		target string
+		keyRef string
 	}
 	desired := map[string]desiredSpec{}
 	for i := range cfg.Providers {
@@ -176,12 +187,13 @@ func (h *Hub) Activate(cfg *config.Config) {
 			if tgt == "" {
 				tgt = config.DefaultProviderTarget(pc)
 			}
-			desired[pc.Name] = desiredSpec{tc: pc.Tiered, target: tgt}
+			desired[pc.Name] = desiredSpec{tc: pc.Tiered, target: tgt, keyRef: pc.KeyRef}
 		}
 	}
 
 	h.mu.Lock()
 	filter := h.warmupFilter
+	resolveFn := h.resolveKey
 	var toClose []*Router
 	for name, r := range h.routers {
 		if _, keep := desired[name]; !keep {
@@ -200,15 +212,24 @@ func (h *Hub) Activate(cfg *config.Config) {
 	}
 
 	for name, spec := range desired {
+		apiKey := ""
+		if spec.keyRef != "" && resolveFn != nil {
+			k, err := resolveFn(spec.keyRef)
+			if err != nil {
+				h.log.Warn("tiered provider key resolve failed", "provider", name, "err", err)
+			} else {
+				apiKey = k
+			}
+		}
 		if r, ok := existing[name]; ok {
 			r.setWarmupFilter(filter)
-			if err := r.apply(spec.target, *spec.tc); err != nil {
+			if err := r.apply(spec.target, apiKey, *spec.tc); err != nil {
 				h.log.Error("tiered router apply failed", "provider", name, "err", err)
 			}
 			continue
 		}
 		defPath := filepath.Join(h.dataDir, "tiered", name+"-starters.json")
-		r, err := newRouterWithTarget(name, spec.target, *spec.tc, defPath, h.transport, h.log)
+		r, err := newRouterWithTarget(name, spec.target, apiKey, *spec.tc, defPath, h.transport, h.log)
 		if err != nil {
 			h.log.Error("tiered router init failed", "provider", name, "err", err)
 			continue
@@ -221,7 +242,7 @@ func (h *Hub) Activate(cfg *config.Config) {
 			h.mu.Unlock()
 			r.close()
 			old.setWarmupFilter(filter)
-			_ = old.apply(spec.target, *spec.tc)
+			_ = old.apply(spec.target, apiKey, *spec.tc)
 			continue
 		}
 		h.routers[name] = r
@@ -408,6 +429,9 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 	for attempt := 0; attempt < len(resolved); attempt++ {
 		rb, reason, isHeavy := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, an, exclude)
 		if rb == nil {
+			if attempt > 0 {
+				break
+			}
 			return syntheticJSONResp(req, http.StatusServiceUnavailable, `{"error":{"message":"no healthy backend available","type":"tiered_unavailable"}}`), nil
 		}
 		bCfg, targetURL, backend := rb.cfg, rb.target, rb.state

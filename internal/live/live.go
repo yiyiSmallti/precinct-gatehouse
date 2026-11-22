@@ -173,10 +173,66 @@ func (m *Manager) Apply(newBytes []byte, source, baseHash string) (ApplyResult, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	prev := m.cur.Load()
+	if err := m.verifyDiskMatchesLocked(baseHash); err != nil {
+		return ApplyResult{}, err
+	}
 	if baseHash != prev.Cfg.Hash() {
 		return ApplyResult{}, ErrConflict
 	}
 	return m.applyLocked(prev, newBytes, source)
+}
+
+// ApplySerialized runs prepare under Manager's serialization lock after verifying both
+// memory and on-disk configuration hashes match baseHash (or prev's hash if baseHash is empty).
+// If config build or write fails, rollback is invoked before releasing the lock.
+func (m *Manager) ApplySerialized(source, baseHash string, prepare func(prev *Snapshot) (newBytes []byte, rollback func(), err error)) (ApplyResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prev := m.cur.Load()
+	expectHash := baseHash
+	if expectHash == "" {
+		expectHash = prev.Cfg.Hash()
+	}
+	if err := m.verifyDiskMatchesLocked(expectHash); err != nil {
+		return ApplyResult{}, err
+	}
+	if expectHash != prev.Cfg.Hash() {
+		return ApplyResult{}, ErrConflict
+	}
+	newBytes, rollback, err := prepare(prev)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	res, err := m.applyLocked(prev, newBytes, source)
+	if err != nil {
+		if rollback != nil {
+			rollback()
+		}
+		return ApplyResult{}, err
+	}
+	return res, nil
+}
+
+func (m *Manager) verifyDiskMatchesLocked(expectedHash string) error {
+	if m.path == "" {
+		return nil
+	}
+	b, err := os.ReadFile(m.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(b)
+	diskHash := hex.EncodeToString(sum[:])
+	if diskHash != expectedHash {
+		if prev := m.cur.Load(); prev != nil && diskHash != prev.Cfg.Hash() {
+			_, _, _ = m.reloadFromDiskLocked("file")
+		}
+		return ErrConflict
+	}
+	return nil
 }
 
 func (m *Manager) applyLocked(prev *Snapshot, newBytes []byte, source string) (ApplyResult, error) {
@@ -225,6 +281,10 @@ func (m *Manager) applyLocked(prev *Snapshot, newBytes []byte, source string) (A
 func (m *Manager) ReloadFromDisk(source string) (ApplyResult, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.reloadFromDiskLocked(source)
+}
+
+func (m *Manager) reloadFromDiskLocked(source string) (ApplyResult, bool, error) {
 
 	prev := m.cur.Load()
 	b, err := os.ReadFile(m.path)

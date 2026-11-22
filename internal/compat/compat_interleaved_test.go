@@ -174,3 +174,57 @@ func TestAnthropicTranslatorInterleavedToolCalls(t *testing.T) {
 		t.Fatalf("block 1 mismatch: start=%v delta=%q", starts[1], deltas[1].String())
 	}
 }
+
+func TestDecodeAnthropicToolResultPreservesImages(t *testing.T) {
+	body := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"max_tokens": 128,
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "tool_result",
+						"tool_use_id": "toolu_1",
+						"content": [
+							{"type": "text", "text": "Screenshot captured"},
+							{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+						]
+					},
+					{
+						"type": "tool_result",
+						"tool_use_id": "toolu_2",
+						"content": [{"type": "text", "text": "plain text tool output"}]
+					}
+				]
+			}
+		]
+	}`)
+
+	req, model, err := DecodeAnthropic(body)
+	if err != nil {
+		t.Fatalf("DecodeAnthropic: %v", err)
+	}
+	if model != "claude-sonnet-4-5" {
+		t.Fatalf("unexpected model: %s", model)
+	}
+	if !oai.HasImage(req) {
+		t.Fatalf("expected oai.HasImage(req)=true when tool_result includes an image block")
+	}
+	msgs := oai.Messages(req)
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 tool messages, got %d: %#v", len(msgs), msgs)
+	}
+	parts, ok := msgs[0]["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("expected 2 content parts in first tool message, got %#v", msgs[0]["content"])
+	}
+	if p1, _ := parts[1].(map[string]any); oai.Str(p1, "type") != "image_url" {
+		t.Fatalf("expected image_url part, got %#v", parts[1])
+	} else if iu, _ := p1["image_url"].(map[string]any); oai.Str(iu, "url") != "data:image/png;base64,iVBORw0KGgo=" {
+		t.Fatalf("unexpected image_url value: %#v", iu)
+	}
+	if s, ok := msgs[1]["content"].(string); !ok || s != "plain text tool output" {
+		t.Fatalf("expected text-only tool_result content to remain string, got %#v", msgs[1]["content"])
+	}
+}
