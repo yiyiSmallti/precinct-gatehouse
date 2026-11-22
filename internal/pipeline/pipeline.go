@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -31,6 +32,8 @@ import (
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/limit"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/meter"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/policy"
@@ -52,6 +55,8 @@ const (
 type Pipeline struct {
 	Cfg      *config.Config
 	Tokens   *token.Issuer
+	Keys     *keys.Store
+	Limiter  *limit.Limiter
 	Meter    *meter.Meter
 	Router   *route.Router
 	Reg      *provider.Registry
@@ -64,25 +69,30 @@ type Pipeline struct {
 }
 
 type principal struct {
-	ID    string
-	Name  string
-	Scope token.Scope
-	IsKey bool
+	ID     string
+	Name   string
+	Scope  token.Scope
+	Limits keys.Limits
+	IsKey  bool
 }
 
 type reqState struct {
-	id        string
-	start     time.Time
-	protocol  string
-	decode    func([]byte) (oai.Object, error)
-	principal principal
-	claims    token.Claims
-	org       *policy.Context // org mode
-	rec       audit.Record
-	w         http.ResponseWriter
-	written   bool
-	ttft      time.Duration
-	release   func(status int)
+	id           string
+	start        time.Time
+	protocol     string
+	decode       func([]byte) (oai.Object, error)
+	principal    principal
+	claims       token.Claims
+	org          *policy.Context // org mode
+	rec          audit.Record
+	w            http.ResponseWriter
+	written      bool
+	ttft         time.Duration
+	release      func(status int)
+	admitted     bool
+	errorCode    string
+	clientStream bool
+	cachedTokens int
 }
 
 // ServeHTTP handles POST /v1/chat/completions.
@@ -106,6 +116,7 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 			oe = oai.Errorf(http.StatusInternalServerError, "internal_error", "%v", err)
 		}
 		st.rec.Status = oe.Status
+		st.errorCode = oe.Code
 		st.rec.Error = oe.Code + ": " + oe.Message
 		if !st.written {
 			oai.WriteError(w, oe)
@@ -115,6 +126,29 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 		st.release(st.rec.Status)
 	}
 	st.rec.LatencyMS = time.Since(st.start).Milliseconds()
+	if p.Meter != nil {
+		if err := p.Meter.LogRequest(meter.RequestLogEntry{
+			RequestID:        st.id,
+			Time:             st.start,
+			KeyID:            st.rec.TokenID,
+			KeyName:          st.rec.TokenName,
+			Protocol:         st.protocol,
+			ClientIP:         clientIP(r),
+			RequestedModel:   st.rec.RequestedModel,
+			Model:            st.rec.Model,
+			Status:           st.rec.Status,
+			ErrorCode:        st.errorCode,
+			Stream:           st.clientStream,
+			PromptTokens:     st.rec.PromptTokens,
+			CompletionTokens: st.rec.CompletionTokens,
+			CachedTokens:     st.cachedTokens,
+			LatencyMS:        st.rec.LatencyMS,
+			TTFTMS:           st.ttft.Milliseconds(),
+			Admitted:         st.admitted,
+		}); err != nil {
+			p.Log.Error("request log write failed", "err", err)
+		}
+	}
 	if err := p.Audit.Write(st.rec); err != nil {
 		p.Log.Error("audit write failed", "err", err)
 	}
@@ -138,22 +172,54 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 		return oai.Errorf(http.StatusUnauthorized, "missing_token", "missing gateway token (Authorization: Bearer <token>)")
 	}
 	if p.Policy != nil {
+		if strings.HasPrefix(tok, "sk-") {
+			return oai.Errorf(http.StatusUnauthorized, "invalid_token", "api keys are not supported in org mode")
+		}
 		return p.handleOrg(ctx, st, r, tok)
 	}
-	claims, err := p.Tokens.Verify(tok)
-	if err != nil {
-		st.rec.TokenID = claims.ID
-		code := "invalid_token"
-		if errors.Is(err, token.ErrExpired) {
-			code = "token_expired"
-		} else if errors.Is(err, token.ErrRevoked) {
-			code = "token_revoked"
+	if strings.HasPrefix(tok, "sk-") {
+		if p.Keys == nil {
+			return oai.Errorf(http.StatusUnauthorized, "invalid_api_key", "invalid api key")
 		}
-		return oai.Errorf(http.StatusUnauthorized, code, "%v", err)
+		k, err := p.Keys.Lookup(tok)
+		if err != nil {
+			if k.ID != "" {
+				st.rec.TokenID, st.rec.TokenName = k.ID, k.Name
+			}
+			code := "invalid_api_key"
+			if errors.Is(err, keys.ErrDisabled) {
+				code = "key_disabled"
+			} else if errors.Is(err, keys.ErrExpired) {
+				code = "key_expired"
+			}
+			return oai.Errorf(http.StatusUnauthorized, code, "%v", err)
+		}
+		st.principal = principal{
+			ID:     k.ID,
+			Name:   k.Name,
+			Scope:  token.Scope{Models: k.Models, Groups: k.Groups, DataClass: "internal"},
+			Limits: k.Limits,
+			IsKey:  true,
+		}
+		st.claims = token.Claims{ID: k.ID, Name: k.Name, Scope: st.principal.Scope}
+		st.rec.TokenID, st.rec.TokenName = k.ID, k.Name
+		p.Keys.Touch(k.ID)
+	} else {
+		claims, err := p.Tokens.Verify(tok)
+		if err != nil {
+			st.rec.TokenID = claims.ID
+			code := "invalid_token"
+			if errors.Is(err, token.ErrExpired) {
+				code = "token_expired"
+			} else if errors.Is(err, token.ErrRevoked) {
+				code = "token_revoked"
+			}
+			return oai.Errorf(http.StatusUnauthorized, code, "%v", err)
+		}
+		st.claims = claims
+		st.principal = principal{ID: claims.ID, Name: claims.Name, Scope: claims.Scope}
+		st.rec.TokenID, st.rec.TokenName = claims.ID, claims.Name
 	}
-	st.claims = claims
-	st.principal = principal{ID: claims.ID, Name: claims.Name, Scope: claims.Scope}
-	st.rec.TokenID, st.rec.TokenName = claims.ID, claims.Name
 
 	req, err := p.readRequest(st, r)
 	if err != nil {
@@ -167,21 +233,21 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 	if isGroup {
 		scopeName = p.Router.ResolveGroupName(requested)
 	}
-	if !claims.Scope.AllowsModel(scopeName, isGroup) {
-		return oai.Errorf(http.StatusForbidden, "model_not_allowed", "token %s may not use %q", claims.Name, requested)
+	if !st.principal.Scope.AllowsModel(scopeName, isGroup) {
+		return oai.Errorf(http.StatusForbidden, "model_not_allowed", "token %s may not use %q", st.principal.Name, requested)
 	}
-	if claims.Scope.MaxTokens > 0 {
+	if !st.principal.IsKey && st.principal.Scope.MaxTokens > 0 {
 		// Intentionally unlocked so concurrent requests on the same token are not
 		// serialized; parallel in-flight requests may exceed MaxTokens slightly.
-		used, err := p.Meter.TokensUsed(claims.ID)
+		used, err := p.Meter.TokensUsed(st.principal.ID)
 		if err != nil {
 			return err
 		}
-		if used >= claims.Scope.MaxTokens {
-			return oai.Errorf(http.StatusForbidden, "token_budget_exceeded", "token %s used %d of %d tokens", claims.Name, used, claims.Scope.MaxTokens)
+		if used >= st.principal.Scope.MaxTokens {
+			return oai.Errorf(http.StatusForbidden, "token_budget_exceeded", "token %s used %d of %d tokens", st.principal.Name, used, st.principal.Scope.MaxTokens)
 		}
 	}
-	maxClass := claims.Scope.DataClass
+	maxClass := st.principal.Scope.DataClass
 	if maxClass == "" {
 		maxClass = "internal"
 	}
@@ -190,9 +256,22 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 		return err
 	}
 	if token.ClassRank(dataClass) > token.ClassRank(maxClass) {
-		return oai.Errorf(http.StatusForbidden, "data_class_not_allowed", "token %s may send at most %s data", claims.Name, maxClass)
+		return oai.Errorf(http.StatusForbidden, "data_class_not_allowed", "token %s may send at most %s data", st.principal.Name, maxClass)
 	}
 	st.rec.DataClass = dataClass
+	if st.principal.IsKey && p.Limiter != nil {
+		rel, lerr := p.Limiter.Acquire(st.principal.ID, st.principal.Limits, time.Now())
+		if lerr != nil {
+			if lerr.RetryAfter > 0 {
+				st.w.Header().Set("Retry-After", strconv.Itoa(lerr.RetryAfter))
+			}
+			return lerr.Err
+		}
+		st.release = func(status int) {
+			rel(status > 0 && status < 500)
+		}
+	}
+	st.admitted = true
 	return p.serve(ctx, st, r, req, dataClass, p.UserKey, nil)
 }
 
@@ -244,6 +323,7 @@ func (p *Pipeline) handleOrg(ctx context.Context, st *reqState, r *http.Request,
 		dataClass = pc.DataClass
 	}
 	st.rec.DataClass = dataClass
+	st.admitted = true
 	mac := hmac.New(sha256.New, p.UserKey)
 	mac.Write([]byte(pc.Tenant + "\x00" + pc.User))
 	return p.serve(ctx, st, r, req, dataClass, mac.Sum(nil), allowed)
@@ -290,6 +370,7 @@ func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error
 	}
 	origModel := oai.Str(req, "model")
 	st.rec.RequestedModel = origModel
+	st.clientStream = oai.Bool(req, "stream")
 	if origModel != "" {
 		if resolved := p.Cfg.ResolveAlias(origModel); resolved != origModel {
 			req["model"] = resolved
@@ -311,10 +392,21 @@ func requestClass(r *http.Request, def string) (string, error) {
 
 func clientIP(r *http.Request) string {
 	host := r.RemoteAddr
-	if i := strings.LastIndexByte(host, ':'); i > 0 {
-		host = host[:i]
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
-	return strings.Trim(host, "[]")
+	host = strings.Trim(host, "[]")
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if rip := strings.TrimSpace(r.Header.Get("X-Real-IP")); rip != "" {
+			return rip
+		}
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if first, _, _ := strings.Cut(xff, ","); strings.TrimSpace(first) != "" {
+				return strings.TrimSpace(first)
+			}
+		}
+	}
+	return host
 }
 
 func contains(list []string, v string) bool {
@@ -441,6 +533,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			}
 			// a client error from the provider is returned as is
 			st.rec.Status = ue.Status
+			st.errorCode = "upstream_error"
 			st.w.Header().Set("Content-Type", "application/json")
 			st.w.WriteHeader(ue.Status)
 			st.w.Write(ue.Body)
@@ -462,11 +555,14 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			if errors.As(err, &oe) {
 				status = oe.Status
 			}
+			st.rec.PromptTokens, st.rec.CompletionTokens = usage.PromptTokens, usage.CompletionTokens
+			st.cachedTokens = usage.CachedTokens
 			p.meterRecord(st, ref, prov.Target, usage, prov.Cost(model, usage.PromptTokens, usage.CompletionTokens), status, time.Since(callStart))
 			return err
 		}
 		st.rec.Status = http.StatusOK
 		st.rec.PromptTokens, st.rec.CompletionTokens = usage.PromptTokens, usage.CompletionTokens
+		st.cachedTokens = usage.CachedTokens
 		cost := prov.Cost(model, usage.PromptTokens, usage.CompletionTokens)
 		p.meterRecord(st, ref, prov.Target, usage, cost, http.StatusOK, time.Since(callStart))
 		p.Router.Account(ref, usage.PromptTokens+usage.CompletionTokens)

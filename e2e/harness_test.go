@@ -162,6 +162,9 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	model, _ := req["model"].(string)
 	user := lastUser(req)
+	if strings.Contains(user, "#slow") {
+		time.Sleep(1 * time.Second)
+	}
 	if f.RedirectTo != "" && strings.Contains(user, "#redirect") {
 		http.Redirect(w, r, f.RedirectTo+"/chat/completions", http.StatusTemporaryRedirect)
 		return
@@ -322,7 +325,8 @@ func reorder(args []string) []string {
 
 func isWord(s string) bool {
 	switch s {
-	case "token", "issue", "revoke", "list", "config", "check", "redact", "try", "report", "key", "set", "delete":
+	case "token", "issue", "revoke", "list", "config", "check", "redact", "try", "report", "key", "set", "delete",
+		"apikey", "create", "update", "enable", "disable", "reset", "admin", "set-password":
 		return true
 	}
 	return false

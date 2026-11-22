@@ -26,8 +26,9 @@ type Config struct {
 	Listen        string                   `yaml:"listen"`
 	Mode          string                   `yaml:"mode"`     // personal | org (org: an auth_policy plugin authorises every request)
 	DataDir       string                   `yaml:"data_dir"` // default: directory of the config file
-	MaxBodyMB     *int                     `yaml:"max_body_mb"`
-	Providers     []Provider               `yaml:"providers"`
+	MaxBodyMB      *int                     `yaml:"max_body_mb"`
+	RequestLogDays *int                     `yaml:"request_log_days"`
+	Providers      []Provider               `yaml:"providers"`
 	RoutingGroups map[string]*RoutingGroup `yaml:"routing_groups"`
 	DefaultGroup  string                   `yaml:"default_group"` // used when the request model is "auto" or empty
 	ModelAliases  []ModelAlias             `yaml:"model_aliases"`
@@ -305,6 +306,9 @@ func (c *Config) Validate() []string {
 	if c.MaxBodyMB != nil && *c.MaxBodyMB < 0 {
 		add("max_body_mb: must be >= 0")
 	}
+	if c.RequestLogDays != nil && *c.RequestLogDays < 0 {
+		add("request_log_days: must be >= 0")
+	}
 	if c.Mode != "personal" && c.Mode != "org" {
 		add("mode: must be personal or org, got %q", c.Mode)
 	}
@@ -525,6 +529,14 @@ func (c *Config) MaxBodyBytes() int64 {
 		return 0
 	}
 	return int64(*c.MaxBodyMB) << 20
+}
+
+// LogRetentionDays returns how many days request_log rows are kept (default 90; 0 = forever).
+func (c *Config) LogRetentionDays() int {
+	if c.RequestLogDays == nil {
+		return 90
+	}
+	return *c.RequestLogDays
 }
 
 // ResolveAlias maps an incoming model name to the first matching alias target,

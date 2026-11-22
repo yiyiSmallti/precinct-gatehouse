@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/limit"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/meter"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/pipeline"
@@ -33,6 +36,10 @@ import (
 type Server struct {
 	HTTP       *http.Server
 	Pipeline   *pipeline.Pipeline
+	DB         *sql.DB
+	Keys       *keys.Store
+	Limiter    *limit.Limiter
+	Reg        *provider.Registry
 	Missing    []string // required detectors that are unavailable
 	PolicyDown bool     // org mode: the policy plugin did not start
 	closers    []func()
@@ -45,7 +52,12 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{closers: []func(){func() { db.Close() }}}
+	s := &Server{DB: db, closers: []func(){func() { db.Close() }}}
+	keyStore := keys.NewStore(db)
+	s.Keys = keyStore
+	s.closers = append(s.closers, keyStore.Close)
+	limiter := limit.New(db)
+	s.Limiter = limiter
 	issuer, err := token.NewIssuer(cfg.DataDir, db)
 	if err != nil {
 		return nil, err
@@ -54,7 +66,29 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	if err != nil {
 		return nil, err
 	}
+	s.Reg = reg
 	m := meter.New(db)
+	if days := cfg.LogRetentionDays(); days > 0 {
+		if err := m.PruneRequestLog(days, time.Now()); err != nil {
+			log.Warn("request_log prune failed", "err", err)
+		}
+		pruneCtx, cancelPrune := context.WithCancel(context.Background())
+		s.closers = append(s.closers, cancelPrune)
+		go func() {
+			tk := time.NewTicker(24 * time.Hour)
+			defer tk.Stop()
+			for {
+				select {
+				case <-pruneCtx.Done():
+					return
+				case now := <-tk.C:
+					if err := m.PruneRequestLog(days, now); err != nil {
+						log.Warn("request_log prune failed", "err", err)
+					}
+				}
+			}
+		}()
+	}
 	if cfg.Meter.OTLP != nil {
 		o, err := meter.NewOTLP(cfg.Meter.OTLP, version)
 		if err != nil {
@@ -133,7 +167,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		}
 		return oai.Text(oai.Messages(req)[0]), nil
 	}
-	p := &pipeline.Pipeline{Cfg: cfg, Tokens: issuer, Meter: m, Router: rt, Reg: reg, Redactor: red, Audit: sink, UserKey: userKey, Log: log, Policy: resolver, Hooks: hooks}
+	p := &pipeline.Pipeline{Cfg: cfg, Tokens: issuer, Keys: keyStore, Limiter: limiter, Meter: m, Router: rt, Reg: reg, Redactor: red, Audit: sink, UserKey: userKey, Log: log, Policy: resolver, Hooks: hooks}
 	s.Pipeline = p
 
 	mux := http.NewServeMux()
@@ -164,6 +198,10 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	tok := pipeline.Bearer(r)
 	var claims token.Claims
 	if pol := s.Pipeline.Policy; pol != nil {
+		if strings.HasPrefix(tok, "sk-") {
+			oai.WriteError(w, oai.Errorf(http.StatusUnauthorized, "invalid_token", "api keys are not supported in org mode"))
+			return
+		}
 		pc, err := pol.Resolve(r.Context(), tok, &sdk.RequestMeta{})
 		if err != nil {
 			var pe *policy.Error
@@ -179,6 +217,19 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		for _, g := range pc.AllowedGroups {
 			claims.Scope.Models = append(claims.Scope.Models, s.Pipeline.Router.Members(g)...)
 		}
+	} else if strings.HasPrefix(tok, "sk-") {
+		k, err := s.Keys.Lookup(tok)
+		if err != nil {
+			code := "invalid_api_key"
+			if errors.Is(err, keys.ErrDisabled) {
+				code = "key_disabled"
+			} else if errors.Is(err, keys.ErrExpired) {
+				code = "key_expired"
+			}
+			oai.WriteError(w, oai.Errorf(http.StatusUnauthorized, code, "%v", err))
+			return
+		}
+		claims.Scope = token.Scope{Models: k.Models, Groups: k.Groups}
 	} else {
 		c, err := s.Pipeline.Tokens.Verify(tok)
 		if err != nil {
