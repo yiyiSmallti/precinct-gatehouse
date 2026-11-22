@@ -46,6 +46,12 @@ go build -o gatehouse ./cmd/gatehouse   # Go 1.26+，无 cgo，单二进制
 
 端到端验收：`go test -v ./e2e/`，报告写到 [`e2e/report/`](e2e/report/)。
 
+### 内网自建模型部署提示
+
+- **非回环地址必须显式标注本地目标**：指向内网 vLLM/SGLang（如 `172.16.x.x` 或域名）的 provider 必须配置 `target: local`；否则网关默认按 `external` 处理，触发出站脱敏并整条缓冲响应，导致客户端失去流式输出。
+- **大上下文与长生成超时**：provider 默认 `timeout: 300s`（覆盖读取请求体到响应完成的全程），长上下文推理建议配置 `timeout: 3600s`；如有数十 MB 含图请求，可设置顶层 `max_body_mb: 0`（默认 `32` MiB）。
+- **本地目标关闭脱敏扫描**：对纯内网自建模型，建议设置 `redaction.mode_by_target.local: off`，避免对大请求体做正则扫描。
+
 ## org 模式
 
 `mode: org` 时令牌交给一个 `auth_policy` 插件解析（租户、用户、部门、数据分级、允许的路由组、预算），插件不可用就对所有请求返回 503。最小配置：

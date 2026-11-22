@@ -161,7 +161,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 }
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
-	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	tok := pipeline.Bearer(r)
 	var claims token.Claims
 	if pol := s.Pipeline.Policy; pol != nil {
 		pc, err := pol.Resolve(r.Context(), tok, &sdk.RequestMeta{})
@@ -193,8 +193,15 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := s.Pipeline.Cfg
 	var ids []string
+	seen := map[string]bool{}
+	addID := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
 	if cfg.DefaultGroup != "" && claims.Scope.AllowsModel(cfg.DefaultGroup, true) {
-		ids = append(ids, "auto")
+		addID("auto")
 	}
 	var groups []string
 	for g := range cfg.RoutingGroups {
@@ -203,15 +210,32 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(groups)
 	for _, g := range groups {
 		if claims.Scope.AllowsModel(g, true) {
-			ids = append(ids, g)
+			addID(g)
 		}
 	}
 	for _, pc := range cfg.Providers {
 		for _, m := range pc.Models {
 			ref := pc.Name + "/" + m
 			if claims.Scope.AllowsModel(ref, false) {
-				ids = append(ids, ref)
+				addID(ref)
 			}
+		}
+	}
+	for _, a := range cfg.ModelAliases {
+		if strings.ContainsAny(a.Match, "*?[\\") {
+			continue
+		}
+		allowed := false
+		switch {
+		case a.Use == "auto":
+			allowed = cfg.DefaultGroup != "" && claims.Scope.AllowsModel(cfg.DefaultGroup, true)
+		case cfg.RoutingGroups[a.Use] != nil:
+			allowed = claims.Scope.AllowsModel(a.Use, true)
+		default:
+			allowed = claims.Scope.AllowsModel(a.Use, false)
+		}
+		if allowed {
+			addID(a.Match)
 		}
 	}
 	data := make([]any, 0, len(ids))

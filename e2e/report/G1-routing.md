@@ -1,6 +1,6 @@
 # G1 个人模式路由
 
-结果：**通过** · 运行于 2026-11-01 17:06:15 UTC · linux/amd64
+结果：**通过** · 运行于 2026-11-22 05:48:22 PST · darwin/arm64
 
 两个假提供方：`local`（本地目标，托管分类器 small、备用 backup）与 `cloud`（外部目标，强模型 strong）。默认组 `order: [cloud/strong, local/backup]`，三条规则：闲聊意图 → local/small，估算 token > 3000 → cloud/strong，多步推理/长文意图 → cloud/strong。
 

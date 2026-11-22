@@ -27,7 +27,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
@@ -49,9 +48,6 @@ const (
 	HeaderDataClass = "X-Gatehouse-Data-Class" // public | internal | confidential
 )
 
-// MaxBody bounds request bodies.
-const MaxBody = 32 << 20
-
 // Pipeline holds the shared components.
 type Pipeline struct {
 	Cfg      *config.Config
@@ -65,28 +61,42 @@ type Pipeline struct {
 	Log      *slog.Logger
 	Policy   *policy.Resolver // org mode only
 	Hooks    []Hook           // OnRequest/OnResponse plugins, in config order
-
-	budgetLocks sync.Map // token id -> *sync.Mutex
 }
 
-func (p *Pipeline) budgetLock(tokenID string) *sync.Mutex {
-	v, _ := p.budgetLocks.LoadOrStore(tokenID, &sync.Mutex{})
-	return v.(*sync.Mutex)
+type principal struct {
+	ID    string
+	Name  string
+	Scope token.Scope
+	IsKey bool
 }
 
 type reqState struct {
-	id      string
-	start   time.Time
-	claims  token.Claims
-	org     *policy.Context // org mode
-	rec     audit.Record
-	w       http.ResponseWriter
-	written bool
+	id        string
+	start     time.Time
+	protocol  string
+	decode    func([]byte) (oai.Object, error)
+	principal principal
+	claims    token.Claims
+	org       *policy.Context // org mode
+	rec       audit.Record
+	w         http.ResponseWriter
+	written   bool
+	ttft      time.Duration
+	release   func(status int)
 }
 
 // ServeHTTP handles POST /v1/chat/completions.
 func (p *Pipeline) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	st := &reqState{id: newID(), start: time.Now(), w: w}
+	p.Serve(w, r, "chat", oai.Decode)
+}
+
+// Serve runs one request through the gateway pipeline using the supplied
+// protocol label and request decoder.
+func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string, decode func([]byte) (oai.Object, error)) {
+	if decode == nil {
+		decode = oai.Decode
+	}
+	st := &reqState{id: newID(), start: time.Now(), protocol: protocol, decode: decode, w: w}
 	st.rec = audit.Record{Time: st.start, RequestID: st.id, Source: r.Header.Get(HeaderSource)}
 	w.Header().Set("X-Gatehouse-Request-Id", st.id)
 	err := p.handle(r.Context(), st, r)
@@ -101,6 +111,9 @@ func (p *Pipeline) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			oai.WriteError(w, oe)
 		}
 	}
+	if st.release != nil {
+		st.release(st.rec.Status)
+	}
 	st.rec.LatencyMS = time.Since(st.start).Milliseconds()
 	if err := p.Audit.Write(st.rec); err != nil {
 		p.Log.Error("audit write failed", "err", err)
@@ -108,9 +121,19 @@ func (p *Pipeline) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.Log.Info("request", "id", st.id, "status", st.rec.Status, "model", st.rec.Model, "rule", st.rec.Rule, "ms", st.rec.LatencyMS)
 }
 
+// Bearer extracts the gateway credential from Authorization: Bearer or x-api-key.
+func Bearer(r *http.Request) string {
+	if auth := strings.TrimSpace(r.Header.Get("Authorization")); len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		if tok := strings.TrimSpace(auth[7:]); tok != "" {
+			return tok
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("x-api-key"))
+}
+
 func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) error {
 	// auth
-	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	tok := Bearer(r)
 	if tok == "" {
 		return oai.Errorf(http.StatusUnauthorized, "missing_token", "missing gateway token (Authorization: Bearer <token>)")
 	}
@@ -129,6 +152,7 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 		return oai.Errorf(http.StatusUnauthorized, code, "%v", err)
 	}
 	st.claims = claims
+	st.principal = principal{ID: claims.ID, Name: claims.Name, Scope: claims.Scope}
 	st.rec.TokenID, st.rec.TokenName = claims.ID, claims.Name
 
 	req, err := p.readRequest(st, r)
@@ -147,11 +171,8 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 		return oai.Errorf(http.StatusForbidden, "model_not_allowed", "token %s may not use %q", claims.Name, requested)
 	}
 	if claims.Scope.MaxTokens > 0 {
-		// serialize budget-limited requests per token through metering, so
-		// concurrent calls cannot all pass the check on the same total
-		mu := p.budgetLock(claims.ID)
-		mu.Lock()
-		defer mu.Unlock()
+		// Intentionally unlocked so concurrent requests on the same token are not
+		// serialized; parallel in-flight requests may exceed MaxTokens slightly.
 		used, err := p.Meter.TokensUsed(claims.ID)
 		if err != nil {
 			return err
@@ -244,13 +265,21 @@ func (p *Pipeline) orgAllowed(pc *policy.Context) map[string]bool {
 }
 
 func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error) {
-	body, err := io.ReadAll(http.MaxBytesReader(st.w, r.Body, MaxBody))
+	rc := r.Body
+	if maxBytes := p.Cfg.MaxBodyBytes(); maxBytes > 0 {
+		rc = http.MaxBytesReader(st.w, r.Body, maxBytes)
+	}
+	body, err := io.ReadAll(rc)
 	if err != nil {
 		return nil, oai.Errorf(http.StatusRequestEntityTooLarge, "body_too_large", "%v", err)
 	}
-	req, err := oai.Decode(body)
+	req, err := st.decode(body)
 	if err != nil {
-		return nil, oai.Errorf(http.StatusBadRequest, "invalid_json", "%v", err)
+		var oe *oai.Error
+		if errors.As(err, &oe) {
+			return nil, oe
+		}
+		return nil, oai.Errorf(http.StatusBadRequest, "invalid_request", "%v", err)
 	}
 	// fields that carry plaintext outside the redaction scope never leave the gateway
 	for _, f := range append([]string{"dsh_session_log"}, p.Cfg.Redaction.StripFields...) {
@@ -259,7 +288,13 @@ func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error
 	if len(oai.Messages(req)) == 0 {
 		return nil, oai.Errorf(http.StatusBadRequest, "invalid_request", "messages is required")
 	}
-	st.rec.RequestedModel = oai.Str(req, "model")
+	origModel := oai.Str(req, "model")
+	st.rec.RequestedModel = origModel
+	if origModel != "" {
+		if resolved := p.Cfg.ResolveAlias(origModel); resolved != origModel {
+			req["model"] = resolved
+		}
+	}
 	return req, nil
 }
 
@@ -355,6 +390,12 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 		out["model"] = model
 		if e := effortParam(dec.Effort); e != "" {
 			out["reasoning_effort"] = e
+		}
+		if prov.SystemPrompt != "" {
+			injectSystemPrompt(out, prov.SystemPrompt)
+		}
+		for k, v := range prov.ExtraBody {
+			out[k] = oai.Clone(v)
 		}
 		res, rerr := p.Redactor.Apply(ctx, out, mode, userKey, vaultKey)
 		st.rec.Redaction = res.Report
@@ -466,7 +507,7 @@ func (p *Pipeline) meterRecord(st *reqState, ref, target string, u oai.Usage, co
 	err := p.Meter.Add(meter.Record{
 		RequestID: st.id, Time: time.Now(), TokenID: st.claims.ID, TokenName: st.claims.Name,
 		RequestedModel: st.rec.RequestedModel, Model: ref, Target: target,
-		PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, Cost: cost, Status: status, Latency: lat,
+		PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, CachedTokens: u.CachedTokens, Cost: cost, Status: status, Latency: lat,
 	})
 	if err != nil {
 		p.Log.Error("meter write failed", "err", err)
@@ -510,6 +551,7 @@ func (p *Pipeline) relayBuffered(st *reqState, resp *http.Response, vaultKey str
 		go p.runResponseHooks(p.hookCtx(st, st.rec.DataClass), body, http.StatusOK)
 	}
 	st.written = true
+	st.ttft = time.Since(st.start)
 	if !clientStream {
 		st.w.Header().Set("Content-Type", "application/json")
 		st.w.WriteHeader(http.StatusOK)
@@ -588,7 +630,9 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		if len(line) > 0 {
 			event.Write(line)
 			if len(bytes.TrimSpace(line)) == 0 {
-				p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done)
+				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done) && st.ttft == 0 {
+					st.ttft = time.Since(st.start)
+				}
 				event.Reset()
 				if fl != nil {
 					fl.Flush()
@@ -597,7 +641,9 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		}
 		if err != nil {
 			if event.Len() > 0 {
-				p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done)
+				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done) && st.ttft == 0 {
+					st.ttft = time.Since(st.start)
+				}
 			}
 			if fl != nil {
 				fl.Flush()
@@ -614,7 +660,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 	}
 }
 
-func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool) {
+func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool) bool {
 	for _, l := range bytes.Split(ev, []byte("\n")) {
 		data, ok := bytes.CutPrefix(bytes.TrimSpace(l), []byte("data:"))
 		if !ok {
@@ -642,11 +688,38 @@ func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *o
 		if u, ok := oai.UsageOf(o); ok {
 			*usage = u
 			if ch, _ := o["choices"].([]any); len(ch) == 0 && !clientUsage {
-				return
+				return false
 			}
 		}
 	}
 	w.Write(ev)
+	return true
+}
+
+func injectSystemPrompt(req oai.Object, prompt string) {
+	raw, _ := req["messages"].([]any)
+	if len(raw) > 0 {
+		if first, ok := raw[0].(map[string]any); ok && oai.Str(first, "role") == "system" {
+			switch c := first["content"].(type) {
+			case string:
+				if c == "" {
+					first["content"] = prompt
+				} else {
+					first["content"] = prompt + "\n\n" + c
+				}
+				return
+			case []any:
+				part := map[string]any{"type": "text", "text": prompt}
+				first["content"] = append([]any{part}, c...)
+				return
+			default:
+				first["content"] = prompt
+				return
+			}
+		}
+	}
+	sys := map[string]any{"role": "system", "content": prompt}
+	req["messages"] = append([]any{sys}, raw...)
 }
 
 func effortParam(e string) string {

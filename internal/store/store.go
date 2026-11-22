@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS usage (
   target            TEXT NOT NULL,
   prompt_tokens     INTEGER NOT NULL,
   completion_tokens INTEGER NOT NULL,
+  cached_tokens     INTEGER NOT NULL DEFAULT 0,
   cost              REAL NOT NULL,
   status            INTEGER NOT NULL,
   latency_ms        INTEGER NOT NULL
@@ -54,5 +55,34 @@ func Open(dataDir string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
 	}
+	if err := ensureColumn(db, "usage", "cached_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
 	return db, nil
+}
+
+func ensureColumn(db *sql.DB, table, col, def string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == col {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + col + " " + def)
+	return err
 }

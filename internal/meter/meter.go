@@ -18,6 +18,7 @@ type Record struct {
 	Target           string // local | external
 	PromptTokens     int
 	CompletionTokens int
+	CachedTokens     int
 	Cost             float64
 	Status           int
 	Latency          time.Duration
@@ -44,10 +45,10 @@ func (m *Meter) AddExporter(e Exporter) { m.exporters = append(m.exporters, e) }
 // Add stores a record and forwards it to exporters.
 func (m *Meter) Add(r Record) error {
 	m.mu.Lock()
-	_, err := m.db.Exec(`INSERT INTO usage(request_id,ts,day,token_id,token_name,requested_model,model,target,prompt_tokens,completion_tokens,cost,status,latency_ms)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := m.db.Exec(`INSERT INTO usage(request_id,ts,day,token_id,token_name,requested_model,model,target,prompt_tokens,completion_tokens,cached_tokens,cost,status,latency_ms)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.RequestID, r.Time.Unix(), r.Time.Local().Format("2006-01-02"), r.TokenID, r.TokenName, r.RequestedModel, r.Model, r.Target,
-		r.PromptTokens, r.CompletionTokens, r.Cost, r.Status, r.Latency.Milliseconds())
+		r.PromptTokens, r.CompletionTokens, r.CachedTokens, r.Cost, r.Status, r.Latency.Milliseconds())
 	m.mu.Unlock()
 	if err != nil {
 		return err

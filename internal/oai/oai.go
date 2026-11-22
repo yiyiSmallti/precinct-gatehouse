@@ -182,6 +182,7 @@ func LastUserText(req Object) string {
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
+	CachedTokens     int `json:"cached_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
@@ -192,6 +193,9 @@ func UsageOf(resp Object) (Usage, bool) {
 		return Usage{}, false
 	}
 	us := Usage{PromptTokens: Int(u, "prompt_tokens"), CompletionTokens: Int(u, "completion_tokens"), TotalTokens: Int(u, "total_tokens")}
+	if ptd, ok := u["prompt_tokens_details"].(map[string]any); ok {
+		us.CachedTokens = Int(ptd, "cached_tokens")
+	}
 	if us.TotalTokens == 0 {
 		us.TotalTokens = us.PromptTokens + us.CompletionTokens
 	}

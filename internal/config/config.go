@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -16,14 +18,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DefaultMaxBodyMB is the default maximum request body size in MiB.
+const DefaultMaxBodyMB = 32
+
 // Config is the top-level configuration file (~/.gatehouse/config.yaml).
 type Config struct {
 	Listen        string                   `yaml:"listen"`
 	Mode          string                   `yaml:"mode"`     // personal | org (org: an auth_policy plugin authorises every request)
 	DataDir       string                   `yaml:"data_dir"` // default: directory of the config file
+	MaxBodyMB     *int                     `yaml:"max_body_mb"`
 	Providers     []Provider               `yaml:"providers"`
 	RoutingGroups map[string]*RoutingGroup `yaml:"routing_groups"`
 	DefaultGroup  string                   `yaml:"default_group"` // used when the request model is "auto" or empty
+	ModelAliases  []ModelAlias             `yaml:"model_aliases"`
 	Redaction     Redaction                `yaml:"redaction"`
 	Meter         Meter                    `yaml:"meter"`
 	Audit         Audit                    `yaml:"audit"`
@@ -34,6 +41,13 @@ type Config struct {
 	path string
 }
 
+// ModelAlias maps a requested model name (exact or path.Match pattern) to a
+// routing target ("auto", a routing group, or "<provider>/<model>").
+type ModelAlias struct {
+	Match string `yaml:"match"`
+	Use   string `yaml:"use"`
+}
+
 // Org configures org mode.
 type Org struct {
 	PolicyTimeout Duration `yaml:"policy_timeout"` // per Resolve call, default 3s
@@ -42,14 +56,16 @@ type Org struct {
 
 // Provider is one OpenAI-compatible upstream, or a provider plugin.
 type Provider struct {
-	Name    string             `yaml:"name"`
-	BaseURL string             `yaml:"base_url"`
-	Plugin  string             `yaml:"plugin"`  // name of a provider plugin; replaces base_url
-	KeyRef  string             `yaml:"key_ref"` // env:NAME | keychain:NAME | file:PATH | empty (no key)
-	Target  string             `yaml:"target"`  // local | external; default: local for loopback base_url, otherwise external
-	Models  []string           `yaml:"models"`  // model ids exposed as <provider>/<model>
-	Pricing map[string]Pricing `yaml:"pricing"` // per model id, currency units per 1M tokens
-	Timeout Duration           `yaml:"timeout"` // per upstream request, default 300s
+	Name         string             `yaml:"name"`
+	BaseURL      string             `yaml:"base_url"`
+	Plugin       string             `yaml:"plugin"`  // name of a provider plugin; replaces base_url
+	KeyRef       string             `yaml:"key_ref"` // env:NAME | keychain:NAME | file:PATH | empty (no key)
+	Target       string             `yaml:"target"`  // local | external; default: local for loopback base_url, otherwise external
+	Models       []string           `yaml:"models"`  // model ids exposed as <provider>/<model>
+	Pricing      map[string]Pricing `yaml:"pricing"` // per model id, currency units per 1M tokens
+	Timeout      Duration           `yaml:"timeout"` // per upstream request, default 300s
+	SystemPrompt string             `yaml:"system_prompt"`
+	ExtraBody    map[string]any     `yaml:"extra_body"`
 }
 
 // Pricing is the price per one million tokens.
@@ -224,6 +240,11 @@ func (c *Config) applyDefaults() {
 				p.Target = "external"
 			}
 		}
+		if p.ExtraBody != nil {
+			if m, ok := normalizeYAMLValue(p.ExtraBody).(map[string]any); ok {
+				p.ExtraBody = m
+			}
+		}
 	}
 	for _, g := range c.RoutingGroups {
 		if g.Type == "" {
@@ -281,6 +302,9 @@ func (c *Config) Validate() []string {
 	var p []string
 	add := func(f string, a ...any) { p = append(p, fmt.Sprintf(f, a...)) }
 
+	if c.MaxBodyMB != nil && *c.MaxBodyMB < 0 {
+		add("max_body_mb: must be >= 0")
+	}
 	if c.Mode != "personal" && c.Mode != "org" {
 		add("mode: must be personal or org, got %q", c.Mode)
 	}
@@ -397,6 +421,32 @@ func (c *Config) Validate() []string {
 	if c.DefaultGroup != "" && c.RoutingGroups[c.DefaultGroup] == nil {
 		add("default_group: %q is not a routing group", c.DefaultGroup)
 	}
+	isAliasModel := func(ref string) bool {
+		prov, mod, ok := strings.Cut(ref, "/")
+		if !ok || mod == "" {
+			return false
+		}
+		pr := provs[prov]
+		if pr == nil {
+			return false
+		}
+		return len(pr.Models) == 0 || slices.Contains(pr.Models, mod)
+	}
+	for i, a := range c.ModelAliases {
+		where := fmt.Sprintf("model_aliases[%d]", i)
+		if a.Match == "" {
+			add("%s.match: required", where)
+		} else if _, err := path.Match(a.Match, "x"); err != nil {
+			add("%s.match: invalid pattern %q: %v", where, a.Match, err)
+		}
+		switch {
+		case a.Use == "":
+			add("%s.use: required", where)
+		case a.Use == "auto", c.RoutingGroups[a.Use] != nil, isAliasModel(a.Use):
+		default:
+			add("%s.use: %q must be \"auto\", a routing group or an existing <provider>/<model>", where, a.Use)
+		}
+	}
 	for t, m := range c.Redaction.ModeByTarget {
 		if t != "local" && t != "external" {
 			add("redaction.mode_by_target: unknown target %q (local, external)", t)
@@ -464,6 +514,56 @@ func (c *Config) Provider(name string) *Provider {
 		}
 	}
 	return nil
+}
+
+// MaxBodyBytes returns the maximum allowed request body in bytes, or 0 for unlimited.
+func (c *Config) MaxBodyBytes() int64 {
+	if c.MaxBodyMB == nil {
+		return int64(DefaultMaxBodyMB) << 20
+	}
+	if *c.MaxBodyMB <= 0 {
+		return 0
+	}
+	return int64(*c.MaxBodyMB) << 20
+}
+
+// ResolveAlias maps an incoming model name to the first matching alias target,
+// or returns model unchanged if no alias matches.
+func (c *Config) ResolveAlias(model string) string {
+	for _, a := range c.ModelAliases {
+		if a.Match == model {
+			return a.Use
+		}
+		if ok, _ := path.Match(a.Match, model); ok {
+			return a.Use
+		}
+	}
+	return model
+}
+
+func normalizeYAMLValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = normalizeYAMLValue(val)
+		}
+		return out
+	case map[any]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[fmt.Sprint(k)] = normalizeYAMLValue(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = normalizeYAMLValue(val)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // Sample is written by `gatehouse serve` when no config exists.

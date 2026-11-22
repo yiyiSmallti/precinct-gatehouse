@@ -28,14 +28,16 @@ type Registry struct {
 
 // Provider is one upstream.
 type Provider struct {
-	Name    string
-	BaseURL string
-	Target  string
-	Models  []string
-	Pricing map[string]config.Pricing
-	key     string
-	client  *http.Client
-	plug    func(ctx context.Context, body []byte) (*http.Response, error)
+	Name         string
+	BaseURL      string
+	Target       string
+	Models       []string
+	Pricing      map[string]config.Pricing
+	SystemPrompt string
+	ExtraBody    map[string]any
+	key          string
+	client       *http.Client
+	plug         func(ctx context.Context, body []byte) (*http.Response, error)
 }
 
 // SetPlugin routes a provider's calls to a provider plugin.
@@ -54,7 +56,8 @@ func NewRegistry(cfg *config.Config) (*Registry, error) {
 			return nil, fmt.Errorf("provider %s: %w", pc.Name, err)
 		}
 		r.byName[pc.Name] = &Provider{
-			Name: pc.Name, BaseURL: pc.BaseURL, Target: pc.Target, Models: pc.Models, Pricing: pc.Pricing, key: key,
+			Name: pc.Name, BaseURL: pc.BaseURL, Target: pc.Target, Models: pc.Models, Pricing: pc.Pricing,
+			SystemPrompt: pc.SystemPrompt, ExtraBody: pc.ExtraBody, key: key,
 			client: &http.Client{
 				Timeout: pc.Timeout.D(300 * time.Second),
 				// never follow redirects: a redirect could replay the request
