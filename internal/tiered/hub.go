@@ -2,6 +2,7 @@ package tiered
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,14 +18,44 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 )
 
+type ctxKey int
+
+const dataClassCtxKey ctxKey = 1
+
+// WithDataClass annotates ctx with the request data classification so starter
+// prefix capture can exclude confidential prompts.
+func WithDataClass(ctx context.Context, dataClass string) context.Context {
+	return context.WithValue(ctx, dataClassCtxKey, dataClass)
+}
+
+func dataClassFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(dataClassCtxKey).(string)
+	return v
+}
+
 // Hub owns one Router per tiered-configured provider and manages lifecycle across config reloads.
 type Hub struct {
 	dataDir   string
 	log       *slog.Logger
 	transport *http.Transport
 
-	mu      sync.RWMutex
-	routers map[string]*Router
+	mu           sync.RWMutex
+	routers      map[string]*Router
+	warmupFilter WarmupFilterFunc
+}
+
+// SetWarmupFilter installs a filter invoked on starter warm-up payloads before dispatch.
+func (h *Hub) SetWarmupFilter(fn WarmupFilterFunc) {
+	h.mu.Lock()
+	h.warmupFilter = fn
+	list := make([]*Router, 0, len(h.routers))
+	for _, r := range h.routers {
+		list = append(list, r)
+	}
+	h.mu.Unlock()
+	for _, r := range list {
+		r.setWarmupFilter(fn)
+	}
 }
 
 // NewHub builds a Hub for managing tiered provider routers. No goroutines start until Activate.
@@ -48,12 +79,16 @@ type planBackend struct {
 
 type snapshotPlan struct {
 	provider string
+	target   string
 	cfg      RouterConfig
 	backends []planBackend
 }
 
-func newSnapshotPlan(provider string, tc config.TieredConfig, defaultPersist string) (*snapshotPlan, error) {
+func newSnapshotPlan(provider, target string, tc config.TieredConfig, defaultPersist string) (*snapshotPlan, error) {
 	norm := normalizeRouterConfig(tc, defaultPersist)
+	if target == "" {
+		target = config.DefaultProviderTarget(&config.Provider{Tiered: &norm})
+	}
 	backends := make([]planBackend, 0, len(norm.Backends))
 	for _, bc := range norm.Backends {
 		u, err := url.Parse(bc.URL)
@@ -73,6 +108,7 @@ func newSnapshotPlan(provider string, tc config.TieredConfig, defaultPersist str
 	})
 	return &snapshotPlan{
 		provider: provider,
+		target:   target,
 		cfg:      norm,
 		backends: backends,
 	}, nil
@@ -108,7 +144,7 @@ func pickHighestHealthyResolved(backends []resolvedBackend) *resolvedBackend {
 
 // Transport returns an http.RoundTripper bound to the given config snapshot for provider.
 // It is pure and safe to call during config preview/validation.
-func (h *Hub) Transport(provider string, cfg *config.TieredConfig, upstream http.RoundTripper) (http.RoundTripper, error) {
+func (h *Hub) Transport(provider, target string, cfg *config.TieredConfig, upstream http.RoundTripper) (http.RoundTripper, error) {
 	if upstream == nil {
 		upstream = http.DefaultTransport
 	}
@@ -116,7 +152,7 @@ func (h *Hub) Transport(provider string, cfg *config.TieredConfig, upstream http
 		return upstream, nil
 	}
 	defaultPersist := filepath.Join(h.dataDir, "tiered", provider+"-starters.json")
-	plan, err := newSnapshotPlan(provider, *cfg, defaultPersist)
+	plan, err := newSnapshotPlan(provider, target, *cfg, defaultPersist)
 	if err != nil {
 		return nil, err
 	}
@@ -128,15 +164,24 @@ func (h *Hub) Activate(cfg *config.Config) {
 	if cfg == nil {
 		return
 	}
-	desired := map[string]*config.TieredConfig{}
+	type desiredSpec struct {
+		tc     *config.TieredConfig
+		target string
+	}
+	desired := map[string]desiredSpec{}
 	for i := range cfg.Providers {
 		pc := &cfg.Providers[i]
 		if pc.Tiered != nil {
-			desired[pc.Name] = pc.Tiered
+			tgt := pc.Target
+			if tgt == "" {
+				tgt = config.DefaultProviderTarget(pc)
+			}
+			desired[pc.Name] = desiredSpec{tc: pc.Tiered, target: tgt}
 		}
 	}
 
 	h.mu.Lock()
+	filter := h.warmupFilter
 	var toClose []*Router
 	for name, r := range h.routers {
 		if _, keep := desired[name]; !keep {
@@ -154,26 +199,29 @@ func (h *Hub) Activate(cfg *config.Config) {
 		r.close()
 	}
 
-	for name, tc := range desired {
+	for name, spec := range desired {
 		if r, ok := existing[name]; ok {
-			if err := r.apply(*tc); err != nil {
+			r.setWarmupFilter(filter)
+			if err := r.apply(spec.target, *spec.tc); err != nil {
 				h.log.Error("tiered router apply failed", "provider", name, "err", err)
 			}
 			continue
 		}
 		defPath := filepath.Join(h.dataDir, "tiered", name+"-starters.json")
-		r, err := newRouter(name, *tc, defPath, h.transport, h.log)
+		r, err := newRouterWithTarget(name, spec.target, *spec.tc, defPath, h.transport, h.log)
 		if err != nil {
 			h.log.Error("tiered router init failed", "provider", name, "err", err)
 			continue
 		}
+		r.setWarmupFilter(filter)
 		r.ensureLoops()
 		h.mu.Lock()
 		// double-check race
 		if old, dup := h.routers[name]; dup {
 			h.mu.Unlock()
 			r.close()
-			_ = old.apply(*tc)
+			old.setWarmupFilter(filter)
+			_ = old.apply(spec.target, *spec.tc)
 			continue
 		}
 		h.routers[name] = r
@@ -326,8 +374,11 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 	}
 
 	var starterTmpl *StarterTemplate
-	if scCfg != nil && scCfg.Enabled {
+	if scCfg != nil && scCfg.Enabled && dataClassFromContext(req.Context()) != "confidential" {
 		starterTmpl = extractStarterTemplate(body, req.Header.Get("User-Agent"), scCfg.MinTokens, scCfg.MaxTokens)
+		if starterTmpl != nil {
+			starterTmpl.OriginTarget = t.plan.target
+		}
 	}
 
 	an, ok := r.analyzeChatBody(body)
@@ -493,8 +544,11 @@ func (t *hubTransport) roundTripShadow(req *http.Request, r *Router) (*http.Resp
 		}
 	}
 	var starterTmpl *StarterTemplate
-	if scCfg != nil && scCfg.Enabled {
+	if scCfg != nil && scCfg.Enabled && dataClassFromContext(req.Context()) != "confidential" {
 		starterTmpl = extractStarterTemplate(workBody, req.Header.Get("User-Agent"), scCfg.MinTokens, scCfg.MaxTokens)
+		if starterTmpl != nil {
+			starterTmpl.OriginTarget = t.plan.target
+		}
 	}
 	an, ok := r.analyzeChatBody(workBody)
 	resolved := t.plan.resolve(r)

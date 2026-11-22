@@ -15,6 +15,26 @@ import {
 } from '/admin/js/ui.js';
 import { store } from '/admin/js/store.js';
 
+const loopbackRe = /^https?:\/\/(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?(\/|$)/;
+
+function isLoopbackURL(u) {
+  return loopbackRe.test(String(u || ''));
+}
+
+function defaultProviderTarget(p) {
+  if (p?.target) return p.target;
+  if (p?.tiered) {
+    const backends = p.tiered.backends || [];
+    if (!backends.length) return 'external';
+    if (p.tiered.mode !== 'active' && !isLoopbackURL(p.base_url)) return 'external';
+    for (const b of backends) {
+      if (!isLoopbackURL(b.url)) return 'external';
+    }
+    return 'local';
+  }
+  return isLoopbackURL(p?.base_url) ? 'local' : 'external';
+}
+
 function findProviderReferences(name) {
   const routing = store.getSection('routing') || {};
   const aliases = store.getSection('aliases') || [];
@@ -88,6 +108,7 @@ export function renderChannels(container) {
     const orig = isNew
       ? { name: '', base_url: '', target: 'local', timeout: '60s', models: [], key_ref: '', plugin: '', system_prompt: '', extra_body: undefined, pricing: {}, has_key: false }
       : clone(list[index]);
+    if (!isNew) orig.target = defaultProviderTarget(orig);
 
     const existsOnServer = !isNew && (store.getServerSection('providers') || []).some((p) => p.name === orig.name);
     let extraBodyState = { valid: true, value: orig.extra_body };
@@ -472,12 +493,14 @@ export function renderChannels(container) {
 
                 const refs = findProviderReferences(p.name);
 
+                const targetEff = defaultProviderTarget(p);
+
                 return el('tr', null,
                   el('td', { className: 'nowrap' },
                     el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
                       el('strong', null, p.name),
-                      el('span', { className: `pill ${p.target === 'external' ? 'pill-brass' : 'pill-ok'}` },
-                        p.target === 'external' ? 'external' : 'local'
+                      el('span', { className: `pill ${targetEff === 'external' ? 'pill-brass' : 'pill-ok'}` },
+                        targetEff === 'external' ? 'external' : 'local'
                       ),
                       (p.tiered || rt?.has_tiered)
                         ? el('span', { className: 'pill pill-brass' }, '智能分层')

@@ -134,8 +134,8 @@ export function renderSettings(container) {
     });
     const ttlIn = el('input', {
       className: 'input mono',
-      value: gen.tokens?.default_ttl || '720h',
-      placeholder: '720h',
+      value: gen.tokens?.default_ttl || '',
+      placeholder: '24h（留空默认 24h）',
       onChange: (e) => {
         const next = clone(store.getSection('general'));
         next.tokens = { ...(next.tokens || {}), default_ttl: e.target.value.trim() };

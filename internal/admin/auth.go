@@ -105,8 +105,9 @@ func getSetting(db *sql.DB, k string) (string, error) {
 }
 
 type session struct {
-	user    string
-	expires time.Time
+	user     string
+	passHash string
+	expires  time.Time
 }
 
 type authStore struct {
@@ -154,7 +155,7 @@ func (a *authStore) clearFails(ip string) {
 	a.mu.Unlock()
 }
 
-func (a *authStore) createSession(user string, now time.Time) (string, error) {
+func (a *authStore) createSession(user, passHash string, now time.Time) (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -166,13 +167,13 @@ func (a *authStore) createSession(user string, now time.Time) (string, error) {
 			delete(a.sessions, k)
 		}
 	}
-	a.sessions[tok] = session{user: user, expires: now.Add(a.ttl)}
+	a.sessions[tok] = session{user: user, passHash: passHash, expires: now.Add(a.ttl)}
 	a.mu.Unlock()
 	return tok, nil
 }
 
-func (a *authStore) verifySession(tok string, now time.Time) (string, bool) {
-	if tok == "" {
+func (a *authStore) verifySession(tok, currentPassHash string, now time.Time) (string, bool) {
+	if tok == "" || currentPassHash == "" {
 		return "", false
 	}
 	a.mu.Lock()
@@ -181,11 +182,17 @@ func (a *authStore) verifySession(tok string, now time.Time) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	if now.After(s.expires) {
+	if now.After(s.expires) || subtle.ConstantTimeCompare([]byte(s.passHash), []byte(currentPassHash)) != 1 {
 		delete(a.sessions, tok)
 		return "", false
 	}
 	return s.user, true
+}
+
+func (a *authStore) clearSessions() {
+	a.mu.Lock()
+	a.sessions = map[string]session{}
+	a.mu.Unlock()
 }
 
 func (a *authStore) deleteSession(tok string) {

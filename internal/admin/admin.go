@@ -117,6 +117,18 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /admin/api/tiered/{provider}/shadow/reset", s.guard(s.resetTieredShadow))
 }
 
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, tok string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieName,
+		Value:    tok,
+		Path:     "/admin",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   isHTTPS(r),
+		MaxAge:   int(s.auth.ttl.Seconds()),
+	})
+}
+
 func (s *Server) guard(next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(cookieName)
@@ -124,7 +136,12 @@ func (s *Server) guard(next func(http.ResponseWriter, *http.Request, string)) ht
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		user, ok := s.auth.verifySession(c.Value, time.Now())
+		storedPass, errP := getSetting(s.deps.DB, "admin_pass")
+		if errP != nil || storedPass == "" {
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		user, ok := s.auth.verifySession(c.Value, storedPass, time.Now())
 		if !ok {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -168,20 +185,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auth.clearFails(ip)
-	tok, err := s.auth.createSession(storedUser, now)
+	tok, err := s.auth.createSession(storedUser, storedPass, now)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
-		Value:    tok,
-		Path:     "/admin",
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   isHTTPS(r),
-		MaxAge:   int(s.auth.ttl.Seconds()),
-	})
+	s.setSessionCookie(w, r, tok)
 	writeJSON(w, http.StatusOK, map[string]any{"username": storedUser})
 }
 

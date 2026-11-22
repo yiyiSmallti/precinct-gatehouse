@@ -60,8 +60,13 @@ export const store = {
     if (sec === 'aliases') return clone(raw.model_aliases || []);
     if (sec === 'redaction') {
       const r = raw.redaction || {};
+      const mbt = r.mode_by_target || {};
       return clone({
-        mode_by_target: r.mode_by_target || { local: 'off', external: 'mask' },
+        mode_by_target: {
+          ...mbt,
+          local: mbt.local || 'audit',
+          external: mbt.external || 'mask',
+        },
         categories: r.categories || {},
         dictionary: r.dictionary || '',
         terms: r.terms || [],
@@ -77,7 +82,7 @@ export const store = {
       return clone({
         max_body_mb: raw.max_body_mb ?? 32,
         request_log_days: raw.request_log_days ?? 90,
-        tokens: raw.tokens || { default_ttl: '720h' },
+        tokens: { default_ttl: raw.tokens?.default_ttl || '' },
       });
     }
     return {};

@@ -14,6 +14,8 @@ import { store } from '/admin/js/store.js';
 
 const MODE_LABELS = {
   off: { text: '关闭', cls: 'pill nowrap' },
+  audit: { text: '审计', cls: 'pill nowrap' },
+  warn: { text: '告警', cls: 'pill pill-warn nowrap' },
   mask: { text: '掩码', cls: 'pill pill-brass nowrap' },
   block: { text: '阻断', cls: 'pill pill-err nowrap' },
 };
@@ -33,7 +35,7 @@ const CAT_CN_NAMES = {
 };
 
 function computePreviewMatrix(modeByTarget = {}) {
-  const localMode = modeByTarget.local || 'mask';
+  const localMode = modeByTarget.local || 'audit';
   const extMode = modeByTarget.external || 'mask';
   return {
     local: {
@@ -213,7 +215,7 @@ export function renderRedaction(container) {
     clear(root);
     const draft = store.getSection('redaction');
     const modeByTarget = {
-      local: draft.mode_by_target?.local || 'off',
+      local: draft.mode_by_target?.local || 'audit',
       external: draft.mode_by_target?.external || 'mask',
     };
     const matrix = computePreviewMatrix(modeByTarget);
@@ -266,6 +268,8 @@ export function renderRedaction(container) {
               value: modeByTarget.local,
               options: [
                 { value: 'off', label: '关闭 off' },
+                { value: 'audit', label: '审计 audit' },
+                { value: 'warn', label: '告警 warn' },
                 { value: 'mask', label: '掩码 mask', tone: 'mask' },
                 { value: 'block', label: '阻断 block', tone: 'block' },
               ],
@@ -281,6 +285,8 @@ export function renderRedaction(container) {
               value: modeByTarget.external,
               options: [
                 { value: 'off', label: '关闭 off' },
+                { value: 'audit', label: '审计 audit' },
+                { value: 'warn', label: '告警 warn' },
                 { value: 'mask', label: '掩码 mask', tone: 'mask' },
                 { value: 'block', label: '阻断 block', tone: 'block' },
               ],
@@ -363,8 +369,9 @@ export function renderRedaction(container) {
                     value: curAction,
                     options: [
                       { value: 'mask', label: '掩码', tone: 'mask' },
+                      { value: 'warn', label: '告警' },
                       { value: 'block', label: '阻断', tone: 'block' },
-                      { value: 'ignore', label: '忽略' },
+                      { value: 'keep', label: '保留' },
                     ],
                     onChange: (val) => updateDraft((d) => {
                       d.categories = { ...(d.categories || {}), [c.key]: val };
@@ -388,7 +395,7 @@ export function renderRedaction(container) {
     const vaultIn = el('input', {
       className: 'input mono',
       value: draft.vault_ttl || '',
-      placeholder: '15m（留空使用默认 15 分钟）',
+      placeholder: '24h（留空使用默认 24 小时）',
       dataset: { fieldPath: 'redaction.vault_ttl' },
       onChange: (e) => updateDraft((d) => { d.vault_ttl = e.target.value.trim(); }),
     });

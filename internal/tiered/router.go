@@ -155,6 +155,8 @@ type ProviderStatus struct {
 	StarterCache       map[string]any  `json:"starter_cache"`
 }
 
+type WarmupFilterFunc func(ctx context.Context, provider, backendURL string, payload []byte) ([]byte, error)
+
 type Router struct {
 	name      string
 	defaultDB string
@@ -162,10 +164,12 @@ type Router struct {
 	transport *http.Transport
 	starters  *StarterCache
 
-	cfgMu    sync.RWMutex
-	cfg      RouterConfig
-	backends []*BackendState
-	byID     map[string]*BackendState
+	cfgMu        sync.RWMutex
+	cfg          RouterConfig
+	target       string
+	warmupFilter WarmupFilterFunc
+	backends     []*BackendState
+	byID         map[string]*BackendState
 
 	mu         sync.RWMutex
 	prefixes   map[string]*PrefixEntry
@@ -236,6 +240,10 @@ func newDefaultTransport() *http.Transport {
 }
 
 func newRouter(name string, cfg RouterConfig, defaultPersist string, tr *http.Transport, logger *slog.Logger) (*Router, error) {
+	return newRouterWithTarget(name, "", cfg, defaultPersist, tr, logger)
+}
+
+func newRouterWithTarget(name, target string, cfg RouterConfig, defaultPersist string, tr *http.Transport, logger *slog.Logger) (*Router, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -243,12 +251,16 @@ func newRouter(name string, cfg RouterConfig, defaultPersist string, tr *http.Tr
 		tr = newDefaultTransport()
 	}
 	norm := normalizeRouterConfig(cfg, defaultPersist)
+	if target == "" {
+		target = config.DefaultProviderTarget(&config.Provider{Tiered: &norm})
+	}
 	r := &Router{
 		name:           name,
 		defaultDB:      defaultPersist,
 		log:            logger,
 		transport:      tr,
 		cfg:            norm,
+		target:         target,
 		byID:           make(map[string]*BackendState),
 		prefixes:       make(map[string]*PrefixEntry, 4096),
 		sessions:       make(map[string]*SessionEntry, 1024),
@@ -256,6 +268,7 @@ func newRouter(name string, cfg RouterConfig, defaultPersist string, tr *http.Tr
 		shadowByActual: make(map[string]ShadowBackendCount),
 	}
 	r.starters = newStarterCache(*norm.StarterCache, r)
+	r.starters.enforceTarget(target)
 	if err := r.rebuildBackends(norm.Backends); err != nil {
 		return nil, err
 	}
@@ -302,19 +315,56 @@ func (r *Router) rebuildBackends(list []BackendConfig) error {
 	return nil
 }
 
-func (r *Router) apply(cfg RouterConfig) error {
+func (r *Router) apply(target string, cfg RouterConfig) error {
 	norm := normalizeRouterConfig(cfg, r.defaultDB)
+	if target == "" {
+		target = config.DefaultProviderTarget(&config.Provider{Tiered: &norm})
+	}
 	r.cfgMu.Lock()
 	r.cfg = norm
+	r.target = target
 	r.cfgMu.Unlock()
 
 	if err := r.rebuildBackends(norm.Backends); err != nil {
 		return err
 	}
 	r.starters.applyConfig(*norm.StarterCache)
+	r.starters.enforceTarget(target)
 	r.ensureLoops()
 	r.starters.syncWarmLoop(r.loopContext(), norm.Mode == "active" && norm.StarterCache.Enabled)
 	return nil
+}
+
+func (r *Router) getTarget() string {
+	if r == nil {
+		return "local"
+	}
+	r.cfgMu.RLock()
+	t := r.target
+	r.cfgMu.RUnlock()
+	if t == "" {
+		return "local"
+	}
+	return t
+}
+
+func (r *Router) setWarmupFilter(fn WarmupFilterFunc) {
+	if r == nil {
+		return
+	}
+	r.cfgMu.Lock()
+	r.warmupFilter = fn
+	r.cfgMu.Unlock()
+}
+
+func (r *Router) getWarmupFilter() WarmupFilterFunc {
+	if r == nil {
+		return nil
+	}
+	r.cfgMu.RLock()
+	fn := r.warmupFilter
+	r.cfgMu.RUnlock()
+	return fn
 }
 
 func (r *Router) loopContext() context.Context {

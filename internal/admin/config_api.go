@@ -538,6 +538,18 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request, user str
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.auth.clearSessions()
+	newPassHash, err := getSetting(s.deps.DB, "admin_pass")
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	tok, err := s.auth.createSession(storedUser, newPassHash, time.Now())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.setSessionCookie(w, r, tok)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

@@ -255,7 +255,51 @@ export function renderRouting(container) {
                     { v: 'low', l: 'low 低' },
                     { v: 'medium', l: 'medium 中' },
                     { v: 'high', l: 'high 高' },
+                    { v: 'xhigh', l: 'xhigh 极高' },
+                    { v: 'max', l: 'max 最高' },
                   ].map((o) => el('option', { value: o.v, selected: (rule.useEffort || '') === o.v }, o.l))
+                )
+              )
+            ),
+            el('div', { className: 'field-row' },
+              el('div', { className: 'field' },
+                el('span', { className: 'muted', style: { fontSize: '12px' } }, '图片条件 (has_image)'),
+                el('select', {
+                  className: 'select input-sm',
+                  onChange: (e) => {
+                    if (e.target.value === 'true') rule.has_image = true;
+                    else if (e.target.value === 'false') rule.has_image = false;
+                    else delete rule.has_image;
+                  },
+                },
+                  ...[
+                    { v: '', l: '不限' },
+                    { v: 'true', l: '包含图片 (true)' },
+                    { v: 'false', l: '不含图片 (false)' },
+                  ].map((o) => el('option', {
+                    value: o.v,
+                    selected: (typeof rule.has_image === 'boolean' ? String(rule.has_image) : '') === o.v,
+                  }, o.l))
+                )
+              ),
+              el('div', { className: 'field' },
+                el('span', { className: 'muted', style: { fontSize: '12px' } }, '推理条件 (reasoning)'),
+                el('select', {
+                  className: 'select input-sm',
+                  onChange: (e) => {
+                    if (e.target.value === 'true') rule.reasoning = true;
+                    else if (e.target.value === 'false') rule.reasoning = false;
+                    else delete rule.reasoning;
+                  },
+                },
+                  ...[
+                    { v: '', l: '不限' },
+                    { v: 'true', l: '要求推理 (true)' },
+                    { v: 'false', l: '非推理 (false)' },
+                  ].map((o) => el('option', {
+                    value: o.v,
+                    selected: (typeof rule.reasoning === 'boolean' ? String(rule.reasoning) : '') === o.v,
+                  }, o.l))
                 )
               )
             ),
@@ -340,6 +384,8 @@ export function renderRouting(container) {
         if (r.intent?.trim()) out.intent = r.intent.trim();
         if (r.tokens_gt > 0) out.tokens_gt = r.tokens_gt;
         if (r.tokens_lt > 0) out.tokens_lt = r.tokens_lt;
+        if (typeof r.has_image === 'boolean') out.has_image = r.has_image;
+        if (typeof r.reasoning === 'boolean') out.reasoning = r.reasoning;
         if (r.source?.trim()) out.source = r.source.trim();
         if (r.time?.trim()) out.time = r.time.trim();
         if (r.useEffort) out.useEffort = r.useEffort;

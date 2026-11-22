@@ -40,6 +40,7 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/provider"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/route"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/tiered"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/token"
 	sdk "github.com/yiyiSmallti/precinct-gatehouse/plugin"
 )
@@ -523,7 +524,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			delete(out, "stream_options")
 		}
 		callStart := time.Now()
-		resp, err := prov.Chat(ctx, oai.Encode(out))
+		resp, err := prov.Chat(tiered.WithDataClass(ctx, dataClass), oai.Encode(out))
 		if err != nil {
 			var ue *provider.UpstreamError
 			if !errors.As(err, &ue) {

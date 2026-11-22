@@ -165,7 +165,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		}
 		for _, pc := range nextCfg.Providers {
 			if pc.Tiered != nil {
-				tr, err := hub.Transport(pc.Name, pc.Tiered, nil)
+				tr, err := hub.Transport(pc.Name, pc.Target, pc.Tiered, nil)
 				if err != nil {
 					return nil, fmt.Errorf("provider %s tiered: %w", pc.Name, err)
 				}
@@ -260,6 +260,33 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 			}
 		}
 	}
+	hub.SetWarmupFilter(func(ctx context.Context, providerName, _ string, payload []byte) ([]byte, error) {
+		snap := liveMgr.Current()
+		if snap == nil || snap.Redactor == nil {
+			return payload, nil
+		}
+		p := snap.Cfg.Provider(providerName)
+		target := "external"
+		if p != nil && p.Target != "" {
+			target = p.Target
+		}
+		mode := snap.Redactor.Mode(target, "internal")
+		if mode == redact.ModeOff {
+			return payload, nil
+		}
+		obj, err := oai.Decode(payload)
+		if err != nil {
+			return nil, err
+		}
+		res, err := snap.Redactor.Apply(ctx, obj, mode, userKey, "tiered-warmup:"+providerName)
+		if err != nil {
+			return nil, err
+		}
+		if !res.Changed {
+			return payload, nil
+		}
+		return oai.Encode(obj), nil
+	})
 	hub.Activate(liveMgr.Current().Cfg)
 	watchCtx, cancelWatch := context.WithCancel(context.Background())
 	s.closers = append(s.closers, cancelWatch)

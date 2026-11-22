@@ -86,6 +86,7 @@ func applyStarterDefaults(c *StarterCacheConfig, defaultPersist string) {
 // StarterEntry represents one tracked system+tools starter prefix family.
 type StarterEntry struct {
 	Hash           string                     `json:"hash"`
+	OriginTarget   string                     `json:"origin_target,omitempty"`
 	Model          string                     `json:"model"`
 	ClientHint     string                     `json:"client_hint,omitempty"`
 	Label          string                     `json:"label,omitempty"`
@@ -133,14 +134,22 @@ type StarterView struct {
 }
 
 type StarterTemplate struct {
-	FamilyHash string
-	Model      string
-	ClientHint string
-	SystemMsgs []json.RawMessage
-	Tools      json.RawMessage
-	ToolsCount int
-	ExtraOpts  map[string]json.RawMessage
-	EstTokens  int
+	FamilyHash   string
+	OriginTarget string
+	Model        string
+	ClientHint   string
+	SystemMsgs   []json.RawMessage
+	Tools        json.RawMessage
+	ToolsCount   int
+	ExtraOpts    map[string]json.RawMessage
+	EstTokens    int
+}
+
+func normalizeOriginTarget(t string) string {
+	if t == "external" {
+		return "external"
+	}
+	return "local"
 }
 
 type StarterCache struct {
@@ -662,11 +671,34 @@ func (sc *StarterCache) Observe(tmpl *StarterTemplate) {
 	if !cfg.Enabled {
 		return
 	}
+	origin := normalizeOriginTarget(tmpl.OriginTarget)
+	if sc.router != nil && sc.router.getTarget() != "local" && origin != "external" {
+		return
+	}
 	now := time.Now()
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
 	if existing, ok := sc.entries[tmpl.FamilyHash]; ok {
+		if normalizeOriginTarget(existing.OriginTarget) != origin {
+			sc.entries[tmpl.FamilyHash] = &StarterEntry{
+				Hash:         tmpl.FamilyHash,
+				OriginTarget: origin,
+				Model:        tmpl.Model,
+				ClientHint:   tmpl.ClientHint,
+				SystemMsgs:   tmpl.SystemMsgs,
+				Tools:        tmpl.Tools,
+				ToolsCount:   tmpl.ToolsCount,
+				ExtraOpts:    tmpl.ExtraOpts,
+				EstTokens:    tmpl.EstTokens,
+				Hits:         1,
+				FirstSeen:    now,
+				LastSeen:     now,
+				LastUsed:     now,
+			}
+			sc.dirty = true
+			return
+		}
 		existing.Hits++
 		existing.LastSeen = now
 		existing.LastUsed = now
@@ -695,21 +727,44 @@ func (sc *StarterCache) Observe(tmpl *StarterTemplate) {
 	}
 
 	sc.entries[tmpl.FamilyHash] = &StarterEntry{
-		Hash:       tmpl.FamilyHash,
-		Model:      tmpl.Model,
-		ClientHint: tmpl.ClientHint,
-		SystemMsgs: tmpl.SystemMsgs,
-		Tools:      tmpl.Tools,
-		ToolsCount: tmpl.ToolsCount,
-		ExtraOpts:  tmpl.ExtraOpts,
-		EstTokens:  tmpl.EstTokens,
-		Hits:       1,
-		FirstSeen:  now,
-		LastSeen:   now,
-		LastUsed:   now,
+		Hash:         tmpl.FamilyHash,
+		OriginTarget: origin,
+		Model:        tmpl.Model,
+		ClientHint:   tmpl.ClientHint,
+		SystemMsgs:   tmpl.SystemMsgs,
+		Tools:        tmpl.Tools,
+		ToolsCount:   tmpl.ToolsCount,
+		ExtraOpts:    tmpl.ExtraOpts,
+		EstTokens:    tmpl.EstTokens,
+		Hits:         1,
+		FirstSeen:    now,
+		LastSeen:     now,
+		LastUsed:     now,
 	}
 	sc.trimLocked()
 	sc.dirty = true
+}
+
+func (sc *StarterCache) enforceTarget(routerTarget string) {
+	if routerTarget == "local" {
+		return
+	}
+	sc.mu.Lock()
+	removed := 0
+	for k, e := range sc.entries {
+		if normalizeOriginTarget(e.OriginTarget) != "external" {
+			delete(sc.entries, k)
+			removed++
+		}
+	}
+	if removed > 0 {
+		sc.dirty = true
+	}
+	sc.mu.Unlock()
+	if removed > 0 {
+		sc.router.log.Info("purged non-external starter prefixes after target change", "provider", sc.router.name, "removed", removed)
+		sc.saveToDisk()
+	}
 }
 
 func (sc *StarterCache) trimLocked() {
@@ -761,16 +816,28 @@ func (sc *StarterCache) loadFromDisk(path string) {
 		sc.router.log.Warn("starter parse failed", "provider", sc.router.name, "path", path, "err", err)
 		return
 	}
+	routerTarget := sc.router.getTarget()
 	sc.mu.Lock()
+	dropped := 0
 	for _, e := range list {
 		if e != nil && e.Hash != "" {
+			if routerTarget != "local" && normalizeOriginTarget(e.OriginTarget) != "external" {
+				dropped++
+				continue
+			}
 			e.LastWarmed = time.Time{}
 			e.NeedsWarm = true
 			sc.entries[e.Hash] = e
 		}
 	}
+	if dropped > 0 {
+		sc.dirty = true
+	}
 	count := len(sc.entries)
 	sc.mu.Unlock()
+	if dropped > 0 {
+		sc.saveToPath(path)
+	}
 	sc.router.log.Info("loaded starter prefixes", "provider", sc.router.name, "count", count, "path", path)
 }
 
@@ -980,6 +1047,17 @@ func (sc *StarterCache) WarmDue(force bool, onlyHash string) []WarmResult {
 func (sc *StarterCache) warmOne(entry *StarterEntry, backend *BackendState) WarmResult {
 	start := time.Now()
 	bCfg := backend.config()
+	routerTarget := sc.router.getTarget()
+	if routerTarget != "local" && normalizeOriginTarget(entry.OriginTarget) != "external" {
+		sc.mu.Lock()
+		delete(sc.entries, entry.Hash)
+		sc.dirty = true
+		sc.mu.Unlock()
+		sc.saveToDisk()
+		sc.totalWarmFails.Add(1)
+		sc.router.log.Warn("starter warmup skipped: trust boundary mismatch", "provider", sc.router.name, "hash", entry.Hash[:min(12, len(entry.Hash))], "origin", entry.OriginTarget, "target", routerTarget)
+		return WarmResult{Hash: entry.Hash, Backend: bCfg.ID, Error: "starter trust boundary mismatch"}
+	}
 	payload, err := sc.buildWarmupPayload(entry)
 	if err != nil {
 		sc.totalWarmFails.Add(1)
@@ -988,6 +1066,22 @@ func (sc *StarterCache) warmOne(entry *StarterEntry, backend *BackendState) Warm
 
 	ctx, cancel := context.WithTimeout(context.Background(), starterWarmTimeout)
 	defer cancel()
+
+	if fn := sc.router.getWarmupFilter(); fn != nil {
+		filtered, ferr := fn(ctx, sc.router.name, bCfg.URL, payload)
+		if ferr != nil {
+			errMsg := ferr.Error()
+			sc.totalWarmFails.Add(1)
+			sc.mu.Lock()
+			if cur, ok := sc.entries[entry.Hash]; ok {
+				cur.LastWarmErr = errMsg
+			}
+			sc.mu.Unlock()
+			sc.router.log.Warn("starter warmup blocked by redaction policy", "provider", sc.router.name, "hash", entry.Hash[:min(12, len(entry.Hash))], "backend", bCfg.ID, "err", errMsg)
+			return WarmResult{Hash: entry.Hash, Backend: bCfg.ID, Error: errMsg}
+		}
+		payload = filtered
+	}
 
 	targetURL := strings.TrimRight(bCfg.URL, "/") + "/v1/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(payload))

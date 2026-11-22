@@ -511,3 +511,157 @@ redaction:
 		t.Fatalf("expected expired bucket not to restore after vault_ttl reload, got %q (wanted %q)", got, "echo "+ph)
 	}
 }
+
+func TestStarterWarmupEnforcesConfidentialityAndRedaction(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	var lastWarmBody atomic.Value
+	var reqCount atomic.Int32
+	srvUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		reqCount.Add(1)
+		if strings.Contains(r.Header.Get("User-Agent"), "warmer") {
+			lastWarmBody.Store(string(b))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":150,"completion_tokens":2,"total_tokens":152}}`))
+	}))
+	defer srvUp.Close()
+
+	cfgText := func(target, terms, termAction string) string {
+		catLine := ""
+		if termAction != "" {
+			catLine = fmt.Sprintf("  categories: { term: %s }\n", termAction)
+		}
+		return fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: tierp
+    target: %s
+    models: [m1]
+    tiered:
+      mode: active
+      heavy_miss_threshold: 24000
+      health_interval_sec: 60
+      zh_think_anchor: false
+      starter_cache:
+        enabled: true
+        min_tokens: 32
+        max_tokens: 100000
+        min_hits: 1
+        check_interval_sec: 600
+        startup_delay_sec: 600
+      backends:
+        - id: b1
+          url: %s
+          tier: 1
+          max_context_tokens: 64000
+          max_safe_input: 50000
+          promote_at: 64000
+          speed_score: 100
+default_group: main
+routing_groups:
+  main:
+    members: [tierp/m1]
+redaction:
+  mode_by_target: { local: audit, external: mask }
+  terms: %s
+%s`, dir, target, srvUp.URL, terms, catLine)
+	}
+
+	raw0 := cfgText("local", "[]", "")
+	if err := os.WriteFile(cfgPath, []byte(raw0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(raw0), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sysPrompt := strings.Repeat("ProjectZeusSecret system context instruction block. ", 12)
+	sendChat := func(dataClass string) int {
+		payload, _ := json.Marshal(map[string]any{
+			"model": "tierp/m1",
+			"messages": []map[string]any{
+				{"role": "system", "content": sysPrompt},
+				{"role": "user", "content": "hello"},
+			},
+		})
+		req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		if dataClass != "" {
+			req.Header.Set("X-Gatehouse-Data-Class", dataClass)
+		}
+		rec := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// 1. Confidential request on local provider must not be captured into StarterCache.
+	if code := sendChat("confidential"); code != http.StatusOK {
+		t.Fatalf("expected confidential local chat 200, got %d", code)
+	}
+	rLocal, ok := srv.Tiered.Router("tierp")
+	if !ok || len(rLocal.Starters()) != 0 {
+		t.Fatalf("expected confidential request excluded from starters, got ok=%v count=%d", ok, len(rLocal.Starters()))
+	}
+
+	// 2. Switch to external provider, observe an internal prompt before ProjectZeusSecret is in dictionary.
+	if _, err := srv.Live.Apply([]byte(cfgText("external", "[]", "")), "test", srv.Live.Current().Cfg.Hash()); err != nil {
+		t.Fatalf("apply external: %v", err)
+	}
+	if code := sendChat("internal"); code != http.StatusOK {
+		t.Fatalf("expected internal external chat 200, got %d", code)
+	}
+	rExt, ok := srv.Tiered.Router("tierp")
+	if !ok || len(rExt.Starters()) != 1 {
+		t.Fatalf("expected 1 external starter captured, got ok=%v count=%d", ok, len(rExt.Starters()))
+	}
+	hash := rExt.Starters()[0].Hash
+
+	// 3. Hot reload adding ProjectZeusSecret as masked term: warm-up replay must redact it.
+	if _, err := srv.Live.Apply([]byte(cfgText("external", "[ProjectZeusSecret]", "mask")), "test", srv.Live.Current().Cfg.Hash()); err != nil {
+		t.Fatalf("apply masked term: %v", err)
+	}
+	warmRes, err := rExt.WarmStarter(hash, true)
+	if err != nil || len(warmRes) != 1 || warmRes[0].Error != "" {
+		t.Fatalf("expected masked warm-up success, got err=%v res=%+v", err, warmRes)
+	}
+	warmBody, _ := lastWarmBody.Load().(string)
+	if warmBody == "" || strings.Contains(warmBody, "ProjectZeusSecret") || !strings.Contains(warmBody, "{{TERM_") {
+		t.Fatalf("expected starter warm-up payload to mask ProjectZeusSecret, got %s", warmBody)
+	}
+
+	// 4. Hot reload making term action=block: warm-up replay must be blocked before any upstream request.
+	beforeReqs := reqCount.Load()
+	if _, err := srv.Live.Apply([]byte(cfgText("external", "[ProjectZeusSecret]", "block")), "test", srv.Live.Current().Cfg.Hash()); err != nil {
+		t.Fatalf("apply block term: %v", err)
+	}
+	warmRes, err = rExt.WarmStarter(hash, true)
+	if err != nil || len(warmRes) != 1 || warmRes[0].Error == "" {
+		t.Fatalf("expected blocked warm-up error result, got err=%v res=%+v", err, warmRes)
+	}
+	if reqCount.Load() != beforeReqs {
+		t.Fatalf("expected 0 upstream requests when warm-up blocked by redaction, got %d", reqCount.Load()-beforeReqs)
+	}
+}
