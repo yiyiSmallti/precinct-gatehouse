@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
@@ -64,14 +65,16 @@ type Engine struct {
 	never    map[string]bool
 	external []ExternalDetector
 	missing  []string // required detectors that are declared but unavailable
+	vaultTTL time.Duration
 	Vault    *Vault
 }
 
 // New builds the engine. `external` are the running detector plugins and
 // `missing` names required detectors that could not be started.
 func New(cfg config.Redaction, external []ExternalDetector, missing []string) (*Engine, error) {
+	vaultTTL := cfg.VaultTTL.D(24 * time.Hour)
 	e := &Engine{cfg: cfg, rules: rules.New(cfg.InternalDomains), never: map[string]bool{}, external: external, missing: missing,
-		Vault: NewVault(cfg.VaultTTL.D(24 * 3600e9))}
+		vaultTTL: vaultTTL, Vault: NewVault(vaultTTL)}
 	var terms []string
 	for _, t := range cfg.Terms {
 		if t = strings.TrimSpace(t); t != "" {
@@ -102,6 +105,19 @@ func New(cfg config.Redaction, external []ExternalDetector, missing []string) (*
 		e.never[strings.ToLower(strings.TrimSpace(v))] = true
 	}
 	return e, nil
+}
+
+// VaultTTL returns the vault expiration duration configured for this engine snapshot.
+func (e *Engine) VaultTTL() time.Duration {
+	return e.vaultTTL
+}
+
+// Missing returns the names of required detectors unavailable in this engine snapshot.
+func (e *Engine) Missing() []string {
+	if len(e.missing) == 0 {
+		return nil
+	}
+	return append([]string(nil), e.missing...)
 }
 
 // Mode returns the redaction mode for a target and data class. A
@@ -230,7 +246,7 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 		}
 		res.Report.Alerts = append(res.Report.Alerts, msg)
 	}
-	bucket := e.Vault.Bucket(vaultKey)
+	bucket := e.Vault.BucketWithTTL(vaultKey, e.vaultTTL)
 	masked := map[string]string{} // value -> placeholder, for thinking text
 	var blocked []string
 
@@ -613,7 +629,7 @@ func jsonEscape(v string) string {
 // Restore fills placeholders back into a non-streaming response: message
 // content, tool_calls arguments (kept valid JSON) and thinking text.
 func (e *Engine) Restore(resp oai.Object, vaultKey string, rep *audit.Redaction) {
-	bucket := e.Vault.Bucket(vaultKey)
+	bucket := e.Vault.BucketWithTTL(vaultKey, e.vaultTTL)
 	if bucket.Len() == 0 {
 		return
 	}

@@ -28,14 +28,16 @@ type Registry struct {
 
 // Provider is one upstream.
 type Provider struct {
-	Name    string
-	BaseURL string
-	Target  string
-	Models  []string
-	Pricing map[string]config.Pricing
-	key     string
-	client  *http.Client
-	plug    func(ctx context.Context, body []byte) (*http.Response, error)
+	Name         string
+	BaseURL      string
+	Target       string
+	Models       []string
+	Pricing      map[string]config.Pricing
+	SystemPrompt string
+	ExtraBody    map[string]any
+	key          string
+	client       *http.Client
+	plug         func(ctx context.Context, body []byte) (*http.Response, error)
 }
 
 // SetPlugin routes a provider's calls to a provider plugin.
@@ -46,15 +48,24 @@ func (r *Registry) SetPlugin(name string, fn func(ctx context.Context, body []by
 }
 
 // NewRegistry resolves keys and builds HTTP clients.
-func NewRegistry(cfg *config.Config) (*Registry, error) {
+// If resolve is nil, keystore.Resolve is used.
+func NewRegistry(cfg *config.Config, resolve func(ref string) (string, error)) (*Registry, error) {
+	if resolve == nil {
+		resolve = keystore.Resolve
+	}
 	r := &Registry{byName: map[string]*Provider{}}
 	for _, pc := range cfg.Providers {
-		key, err := keystore.Resolve(pc.KeyRef)
+		key, err := resolve(pc.KeyRef)
 		if err != nil {
 			return nil, fmt.Errorf("provider %s: %w", pc.Name, err)
 		}
+		baseURL := pc.BaseURL
+		if baseURL == "" && pc.Tiered != nil {
+			baseURL = "http://tiered.invalid/v1"
+		}
 		r.byName[pc.Name] = &Provider{
-			Name: pc.Name, BaseURL: pc.BaseURL, Target: pc.Target, Models: pc.Models, Pricing: pc.Pricing, key: key,
+			Name: pc.Name, BaseURL: baseURL, Target: pc.Target, Models: pc.Models, Pricing: pc.Pricing,
+			SystemPrompt: pc.SystemPrompt, ExtraBody: pc.ExtraBody, key: key,
 			client: &http.Client{
 				Timeout: pc.Timeout.D(300 * time.Second),
 				// never follow redirects: a redirect could replay the request
@@ -64,6 +75,13 @@ func NewRegistry(cfg *config.Config) (*Registry, error) {
 		}
 	}
 	return r, nil
+}
+
+// SetTransport overrides the underlying HTTP RoundTripper for a named provider.
+func (r *Registry) SetTransport(name string, rt http.RoundTripper) {
+	if p := r.byName[name]; p != nil && rt != nil {
+		p.client.Transport = rt
+	}
 }
 
 // Lookup splits "<provider>/<model>" and returns the provider and model id.
@@ -110,6 +128,7 @@ func (p *Provider) Cost(model string, prompt, completion int) float64 {
 type UpstreamError struct {
 	Status    int
 	Body      []byte
+	Header    http.Header
 	Err       error
 	Retryable bool
 }
@@ -144,7 +163,7 @@ func (p *Provider) Chat(ctx context.Context, body []byte) (*http.Response, error
 	if resp.StatusCode/100 != 2 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
-		return nil, &UpstreamError{Status: resp.StatusCode, Body: b, Retryable: resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 408}
+		return nil, &UpstreamError{Status: resp.StatusCode, Body: b, Header: resp.Header.Clone(), Retryable: resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 408}
 	}
 	return resp, nil
 }

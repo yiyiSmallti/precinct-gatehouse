@@ -23,21 +23,24 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
-	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/limit"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/live"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/meter"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/policy"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/provider"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/route"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/tiered"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/token"
 	sdk "github.com/yiyiSmallti/precinct-gatehouse/plugin"
 )
@@ -49,44 +52,62 @@ const (
 	HeaderDataClass = "X-Gatehouse-Data-Class" // public | internal | confidential
 )
 
-// MaxBody bounds request bodies.
-const MaxBody = 32 << 20
-
 // Pipeline holds the shared components.
 type Pipeline struct {
-	Cfg      *config.Config
-	Tokens   *token.Issuer
-	Meter    *meter.Meter
-	Router   *route.Router
-	Reg      *provider.Registry
-	Redactor *redact.Engine
-	Audit    audit.Sink
-	UserKey  []byte // personal mode: the single local user's placeholder key; org mode: derivation key
-	Log      *slog.Logger
-	Policy   *policy.Resolver // org mode only
-	Hooks    []Hook           // OnRequest/OnResponse plugins, in config order
-
-	budgetLocks sync.Map // token id -> *sync.Mutex
+	Live    *live.Manager
+	Tokens  *token.Issuer
+	Keys    *keys.Store
+	Limiter *limit.Limiter
+	Meter   *meter.Meter
+	Audit   audit.Sink
+	UserKey []byte // personal mode: the single local user's placeholder key; org mode: derivation key
+	Log     *slog.Logger
+	Policy  *policy.Resolver // org mode only
+	Hooks   []Hook           // OnRequest/OnResponse plugins, in config order
 }
 
-func (p *Pipeline) budgetLock(tokenID string) *sync.Mutex {
-	v, _ := p.budgetLocks.LoadOrStore(tokenID, &sync.Mutex{})
-	return v.(*sync.Mutex)
+type principal struct {
+	ID     string
+	Name   string
+	Scope  token.Scope
+	Limits keys.Limits
+	IsKey  bool
 }
 
 type reqState struct {
-	id      string
-	start   time.Time
-	claims  token.Claims
-	org     *policy.Context // org mode
-	rec     audit.Record
-	w       http.ResponseWriter
-	written bool
+	id           string
+	start        time.Time
+	snap         *live.Snapshot
+	protocol     string
+	decode       func([]byte) (oai.Object, error)
+	principal    principal
+	claims       token.Claims
+	org          *policy.Context // org mode
+	rec          audit.Record
+	w            http.ResponseWriter
+	written      bool
+	ttft         time.Duration
+	release      func(status int)
+	admitted     bool
+	errorCode    string
+	clientStream bool
+	cachedTokens int
+	routeBackend string
+	routeReason  string
 }
 
 // ServeHTTP handles POST /v1/chat/completions.
 func (p *Pipeline) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	st := &reqState{id: newID(), start: time.Now(), w: w}
+	p.Serve(w, r, "chat", oai.Decode)
+}
+
+// Serve runs one request through the gateway pipeline using the supplied
+// protocol label and request decoder.
+func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string, decode func([]byte) (oai.Object, error)) {
+	if decode == nil {
+		decode = oai.Decode
+	}
+	st := &reqState{id: newID(), start: time.Now(), snap: p.Live.Current(), protocol: protocol, decode: decode, w: w}
 	st.rec = audit.Record{Time: st.start, RequestID: st.id, Source: r.Header.Get(HeaderSource)}
 	w.Header().Set("X-Gatehouse-Request-Id", st.id)
 	err := p.handle(r.Context(), st, r)
@@ -96,40 +117,123 @@ func (p *Pipeline) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			oe = oai.Errorf(http.StatusInternalServerError, "internal_error", "%v", err)
 		}
 		st.rec.Status = oe.Status
+		st.errorCode = oe.Code
 		st.rec.Error = oe.Code + ": " + oe.Message
 		if !st.written {
 			oai.WriteError(w, oe)
 		}
 	}
+	if st.release != nil {
+		st.release(st.rec.Status)
+	}
 	st.rec.LatencyMS = time.Since(st.start).Milliseconds()
+	if p.Meter != nil {
+		var redMode string
+		var redCount int
+		if st.rec.Redaction != nil {
+			redMode = st.rec.Redaction.Mode
+			redCount = st.rec.Redaction.Masked + st.rec.Redaction.Warned
+			if st.rec.Redaction.Blocked {
+				redCount++
+			}
+		}
+		if err := p.Meter.LogRequest(meter.RequestLogEntry{
+			RequestID:        st.id,
+			Time:             st.start,
+			KeyID:            st.rec.TokenID,
+			KeyName:          st.rec.TokenName,
+			Protocol:         st.protocol,
+			ClientIP:         clientIP(r),
+			RequestedModel:   st.rec.RequestedModel,
+			Model:            st.rec.Model,
+			Status:           st.rec.Status,
+			ErrorCode:        st.errorCode,
+			Stream:           st.clientStream,
+			PromptTokens:     st.rec.PromptTokens,
+			CompletionTokens: st.rec.CompletionTokens,
+			CachedTokens:     st.cachedTokens,
+			LatencyMS:        st.rec.LatencyMS,
+			TTFTMS:           st.ttft.Milliseconds(),
+			Admitted:         st.admitted,
+			RedactionMode:    redMode,
+			RedactionCount:   redCount,
+			RouteBackend:     st.routeBackend,
+			RouteReason:      st.routeReason,
+		}); err != nil {
+			p.Log.Error("request log write failed", "err", err)
+		}
+	}
 	if err := p.Audit.Write(st.rec); err != nil {
 		p.Log.Error("audit write failed", "err", err)
 	}
 	p.Log.Info("request", "id", st.id, "status", st.rec.Status, "model", st.rec.Model, "rule", st.rec.Rule, "ms", st.rec.LatencyMS)
 }
 
+// Bearer extracts the gateway credential from Authorization: Bearer or x-api-key.
+func Bearer(r *http.Request) string {
+	if auth := strings.TrimSpace(r.Header.Get("Authorization")); len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		if tok := strings.TrimSpace(auth[7:]); tok != "" {
+			return tok
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("x-api-key"))
+}
+
 func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) error {
 	// auth
-	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	tok := Bearer(r)
 	if tok == "" {
 		return oai.Errorf(http.StatusUnauthorized, "missing_token", "missing gateway token (Authorization: Bearer <token>)")
 	}
 	if p.Policy != nil {
+		if strings.HasPrefix(tok, "sk-") {
+			return oai.Errorf(http.StatusUnauthorized, "invalid_token", "api keys are not supported in org mode")
+		}
 		return p.handleOrg(ctx, st, r, tok)
 	}
-	claims, err := p.Tokens.Verify(tok)
-	if err != nil {
-		st.rec.TokenID = claims.ID
-		code := "invalid_token"
-		if errors.Is(err, token.ErrExpired) {
-			code = "token_expired"
-		} else if errors.Is(err, token.ErrRevoked) {
-			code = "token_revoked"
+	if strings.HasPrefix(tok, "sk-") {
+		if p.Keys == nil {
+			return oai.Errorf(http.StatusUnauthorized, "invalid_api_key", "invalid api key")
 		}
-		return oai.Errorf(http.StatusUnauthorized, code, "%v", err)
+		k, err := p.Keys.Lookup(tok)
+		if err != nil {
+			if k.ID != "" {
+				st.rec.TokenID, st.rec.TokenName = k.ID, k.Name
+			}
+			code := "invalid_api_key"
+			if errors.Is(err, keys.ErrDisabled) {
+				code = "key_disabled"
+			} else if errors.Is(err, keys.ErrExpired) {
+				code = "key_expired"
+			}
+			return oai.Errorf(http.StatusUnauthorized, code, "%v", err)
+		}
+		st.principal = principal{
+			ID:     k.ID,
+			Name:   k.Name,
+			Scope:  token.Scope{Models: k.Models, Groups: k.Groups, DataClass: "internal"},
+			Limits: k.Limits,
+			IsKey:  true,
+		}
+		st.claims = token.Claims{ID: k.ID, Name: k.Name, Scope: st.principal.Scope}
+		st.rec.TokenID, st.rec.TokenName = k.ID, k.Name
+		p.Keys.Touch(k.ID)
+	} else {
+		claims, err := p.Tokens.Verify(tok)
+		if err != nil {
+			st.rec.TokenID = claims.ID
+			code := "invalid_token"
+			if errors.Is(err, token.ErrExpired) {
+				code = "token_expired"
+			} else if errors.Is(err, token.ErrRevoked) {
+				code = "token_revoked"
+			}
+			return oai.Errorf(http.StatusUnauthorized, code, "%v", err)
+		}
+		st.claims = claims
+		st.principal = principal{ID: claims.ID, Name: claims.Name, Scope: claims.Scope}
+		st.rec.TokenID, st.rec.TokenName = claims.ID, claims.Name
 	}
-	st.claims = claims
-	st.rec.TokenID, st.rec.TokenName = claims.ID, claims.Name
 
 	req, err := p.readRequest(st, r)
 	if err != nil {
@@ -138,29 +242,26 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 	requested := oai.Str(req, "model")
 
 	// policy (personal mode): token scope, budget, data class
-	isGroup := p.Router.IsGroup(requested)
+	isGroup := st.snap.Router.IsGroup(requested)
 	scopeName := requested
 	if isGroup {
-		scopeName = p.Router.ResolveGroupName(requested)
+		scopeName = st.snap.Router.ResolveGroupName(requested)
 	}
-	if !claims.Scope.AllowsModel(scopeName, isGroup) {
-		return oai.Errorf(http.StatusForbidden, "model_not_allowed", "token %s may not use %q", claims.Name, requested)
+	if !st.principal.Scope.AllowsModel(scopeName, isGroup) {
+		return oai.Errorf(http.StatusForbidden, "model_not_allowed", "token %s may not use %q", st.principal.Name, requested)
 	}
-	if claims.Scope.MaxTokens > 0 {
-		// serialize budget-limited requests per token through metering, so
-		// concurrent calls cannot all pass the check on the same total
-		mu := p.budgetLock(claims.ID)
-		mu.Lock()
-		defer mu.Unlock()
-		used, err := p.Meter.TokensUsed(claims.ID)
+	if !st.principal.IsKey && st.principal.Scope.MaxTokens > 0 {
+		// Intentionally unlocked so concurrent requests on the same token are not
+		// serialized; parallel in-flight requests may exceed MaxTokens slightly.
+		used, err := p.Meter.TokensUsed(st.principal.ID)
 		if err != nil {
 			return err
 		}
-		if used >= claims.Scope.MaxTokens {
-			return oai.Errorf(http.StatusForbidden, "token_budget_exceeded", "token %s used %d of %d tokens", claims.Name, used, claims.Scope.MaxTokens)
+		if used >= st.principal.Scope.MaxTokens {
+			return oai.Errorf(http.StatusForbidden, "token_budget_exceeded", "token %s used %d of %d tokens", st.principal.Name, used, st.principal.Scope.MaxTokens)
 		}
 	}
-	maxClass := claims.Scope.DataClass
+	maxClass := st.principal.Scope.DataClass
 	if maxClass == "" {
 		maxClass = "internal"
 	}
@@ -169,9 +270,22 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 		return err
 	}
 	if token.ClassRank(dataClass) > token.ClassRank(maxClass) {
-		return oai.Errorf(http.StatusForbidden, "data_class_not_allowed", "token %s may send at most %s data", claims.Name, maxClass)
+		return oai.Errorf(http.StatusForbidden, "data_class_not_allowed", "token %s may send at most %s data", st.principal.Name, maxClass)
 	}
 	st.rec.DataClass = dataClass
+	if st.principal.IsKey && p.Limiter != nil {
+		rel, lerr := p.Limiter.Acquire(st.principal.ID, st.principal.Limits, time.Now())
+		if lerr != nil {
+			if lerr.RetryAfter > 0 {
+				st.w.Header().Set("Retry-After", strconv.Itoa(lerr.RetryAfter))
+			}
+			return lerr.Err
+		}
+		st.release = func(status int) {
+			rel(status > 0 && status < 500)
+		}
+	}
+	st.admitted = true
 	return p.serve(ctx, st, r, req, dataClass, p.UserKey, nil)
 }
 
@@ -183,8 +297,8 @@ func (p *Pipeline) handleOrg(ctx context.Context, st *reqState, r *http.Request,
 	}
 	requested := oai.Str(req, "model")
 	group := ""
-	if p.Router.IsGroup(requested) {
-		group = p.Router.ResolveGroupName(requested)
+	if st.snap.Router.IsGroup(requested) {
+		group = st.snap.Router.ResolveGroupName(requested)
 	}
 	pc, err := p.Policy.Resolve(ctx, tok, &sdk.RequestMeta{Model: requested, RouteGroup: group, ClientIp: clientIP(r), RequestId: st.id, Source: st.rec.Source})
 	if err != nil {
@@ -200,7 +314,7 @@ func (p *Pipeline) handleOrg(ctx context.Context, st *reqState, r *http.Request,
 	st.rec.Tenant, st.rec.User, st.rec.Department = pc.Tenant, pc.User, pc.Department
 	st.rec.OnBehalfOf, st.rec.InstanceID, st.rec.WorkspaceID, st.rec.PolicyVersion = pc.OnBehalfOf, pc.InstanceID, pc.WorkspaceID, pc.PolicyVersion
 
-	allowed := p.orgAllowed(pc)
+	allowed := p.orgAllowed(st.snap, pc)
 	if group != "" {
 		if !contains(pc.AllowedGroups, group) {
 			return oai.Errorf(http.StatusForbidden, "model_not_allowed", "policy does not allow group %q for %s", group, pc.User)
@@ -223,6 +337,7 @@ func (p *Pipeline) handleOrg(ctx context.Context, st *reqState, r *http.Request,
 		dataClass = pc.DataClass
 	}
 	st.rec.DataClass = dataClass
+	st.admitted = true
 	mac := hmac.New(sha256.New, p.UserKey)
 	mac.Write([]byte(pc.Tenant + "\x00" + pc.User))
 	return p.serve(ctx, st, r, req, dataClass, mac.Sum(nil), allowed)
@@ -230,10 +345,10 @@ func (p *Pipeline) handleOrg(ctx context.Context, st *reqState, r *http.Request,
 
 // orgAllowed lists the provider/model refs a policy context may reach: the
 // members of its allowed groups plus its direct model allowlist.
-func (p *Pipeline) orgAllowed(pc *policy.Context) map[string]bool {
+func (p *Pipeline) orgAllowed(snap *live.Snapshot, pc *policy.Context) map[string]bool {
 	out := map[string]bool{}
 	for _, g := range pc.AllowedGroups {
-		for _, m := range p.Router.Members(g) {
+		for _, m := range snap.Router.Members(g) {
 			out[m] = true
 		}
 	}
@@ -244,22 +359,37 @@ func (p *Pipeline) orgAllowed(pc *policy.Context) map[string]bool {
 }
 
 func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error) {
-	body, err := io.ReadAll(http.MaxBytesReader(st.w, r.Body, MaxBody))
+	rc := r.Body
+	if maxBytes := st.snap.Cfg.MaxBodyBytes(); maxBytes > 0 {
+		rc = http.MaxBytesReader(st.w, r.Body, maxBytes)
+	}
+	body, err := io.ReadAll(rc)
 	if err != nil {
 		return nil, oai.Errorf(http.StatusRequestEntityTooLarge, "body_too_large", "%v", err)
 	}
-	req, err := oai.Decode(body)
+	req, err := st.decode(body)
 	if err != nil {
-		return nil, oai.Errorf(http.StatusBadRequest, "invalid_json", "%v", err)
+		var oe *oai.Error
+		if errors.As(err, &oe) {
+			return nil, oe
+		}
+		return nil, oai.Errorf(http.StatusBadRequest, "invalid_request", "%v", err)
 	}
 	// fields that carry plaintext outside the redaction scope never leave the gateway
-	for _, f := range append([]string{"dsh_session_log"}, p.Cfg.Redaction.StripFields...) {
+	for _, f := range append([]string{"dsh_session_log"}, st.snap.Cfg.Redaction.StripFields...) {
 		delete(req, f)
 	}
 	if len(oai.Messages(req)) == 0 {
 		return nil, oai.Errorf(http.StatusBadRequest, "invalid_request", "messages is required")
 	}
-	st.rec.RequestedModel = oai.Str(req, "model")
+	origModel := oai.Str(req, "model")
+	st.rec.RequestedModel = origModel
+	st.clientStream = oai.Bool(req, "stream")
+	if origModel != "" {
+		if resolved := st.snap.Cfg.ResolveAlias(origModel); resolved != origModel {
+			req["model"] = resolved
+		}
+	}
 	return req, nil
 }
 
@@ -276,10 +406,21 @@ func requestClass(r *http.Request, def string) (string, error) {
 
 func clientIP(r *http.Request) string {
 	host := r.RemoteAddr
-	if i := strings.LastIndexByte(host, ':'); i > 0 {
-		host = host[:i]
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
-	return strings.Trim(host, "[]")
+	host = strings.Trim(host, "[]")
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if rip := strings.TrimSpace(r.Header.Get("X-Real-IP")); rip != "" {
+			return rip
+		}
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if first, _, _ := strings.Cut(xff, ","); strings.TrimSpace(first) != "" {
+				return strings.TrimSpace(first)
+			}
+		}
+	}
+	return host
 }
 
 func contains(list []string, v string) bool {
@@ -307,7 +448,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 	if session == "" {
 		session = oai.Str(req, "user")
 	}
-	dec, err := p.Router.Decide(ctx, req, route.Meta{Source: st.rec.Source, Session: session, DataClass: dataClass, Now: time.Now()})
+	dec, err := st.snap.Router.Decide(ctx, req, route.Meta{Source: st.rec.Source, Session: session, DataClass: dataClass, Now: time.Now()})
 	if err != nil {
 		var um route.ErrUnknownModel
 		if errors.As(err, &um) {
@@ -319,7 +460,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 	if dec.ClassifierModel != "" {
 		p.meterClassifier(st, dec)
 	}
-	cands := p.orderCandidates(dec.Candidates, dataClass)
+	cands := p.orderCandidates(st.snap, dec.Candidates, dataClass)
 	if allowed != nil {
 		var keep []string
 		for _, c := range cands {
@@ -349,14 +490,20 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 
 	var lastErr *provider.UpstreamError
 	for _, ref := range cands {
-		prov, model, _ := p.Reg.Lookup(ref)
-		mode := p.Redactor.Mode(prov.Target, dataClass)
+		prov, model, _ := st.snap.Reg.Lookup(ref)
+		mode := st.snap.Redactor.Mode(prov.Target, dataClass)
 		out := oai.Clone(req).(map[string]any)
 		out["model"] = model
 		if e := effortParam(dec.Effort); e != "" {
 			out["reasoning_effort"] = e
 		}
-		res, rerr := p.Redactor.Apply(ctx, out, mode, userKey, vaultKey)
+		if prov.SystemPrompt != "" {
+			injectSystemPrompt(out, prov.SystemPrompt)
+		}
+		for k, v := range prov.ExtraBody {
+			out[k] = oai.Clone(v)
+		}
+		res, rerr := st.snap.Redactor.Apply(ctx, out, mode, userKey, vaultKey)
 		st.rec.Redaction = res.Report
 		st.rec.Model, st.rec.Target = ref, prov.Target
 		if rerr != nil {
@@ -377,7 +524,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			delete(out, "stream_options")
 		}
 		callStart := time.Now()
-		resp, err := prov.Chat(ctx, oai.Encode(out))
+		resp, err := prov.Chat(tiered.WithDataClass(ctx, dataClass), oai.Encode(out))
 		if err != nil {
 			var ue *provider.UpstreamError
 			if !errors.As(err, &ue) {
@@ -386,7 +533,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: ue.Status, Error: ue.Error()})
 			p.meterRecord(st, ref, prov.Target, oai.Usage{}, 0, statusOf(ue), time.Since(callStart))
 			if ue.Retryable {
-				p.Reg.MarkFailed(ref)
+				st.snap.Reg.MarkFailed(ref)
 				lastErr = ue
 				continue
 			}
@@ -399,14 +546,17 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 				return oai.Errorf(http.StatusBadGateway, "upstream_unavailable", "%s: %s", ref, ue.Error())
 			}
 			// a client error from the provider is returned as is
+			copyRouterHeaders(st, ue.Header)
 			st.rec.Status = ue.Status
+			st.errorCode = "upstream_error"
 			st.w.Header().Set("Content-Type", "application/json")
 			st.w.WriteHeader(ue.Status)
 			st.w.Write(ue.Body)
 			st.written = true
 			return nil
 		}
-		p.Reg.MarkOK(ref)
+		st.snap.Reg.MarkOK(ref)
+		copyRouterHeaders(st, resp.Header)
 		st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: resp.StatusCode})
 		var usage oai.Usage
 		if upStream {
@@ -421,14 +571,17 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			if errors.As(err, &oe) {
 				status = oe.Status
 			}
+			st.rec.PromptTokens, st.rec.CompletionTokens = usage.PromptTokens, usage.CompletionTokens
+			st.cachedTokens = usage.CachedTokens
 			p.meterRecord(st, ref, prov.Target, usage, prov.Cost(model, usage.PromptTokens, usage.CompletionTokens), status, time.Since(callStart))
 			return err
 		}
 		st.rec.Status = http.StatusOK
 		st.rec.PromptTokens, st.rec.CompletionTokens = usage.PromptTokens, usage.CompletionTokens
+		st.cachedTokens = usage.CachedTokens
 		cost := prov.Cost(model, usage.PromptTokens, usage.CompletionTokens)
 		p.meterRecord(st, ref, prov.Target, usage, cost, http.StatusOK, time.Since(callStart))
-		p.Router.Account(ref, usage.PromptTokens+usage.CompletionTokens)
+		st.snap.Router.Account(ref, usage.PromptTokens+usage.CompletionTokens)
 		return nil
 	}
 	msg := "all candidate models failed"
@@ -443,17 +596,17 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 
 // orderCandidates applies the data-class hard constraint and puts healthy
 // models first (keeping configured order within each half).
-func (p *Pipeline) orderCandidates(cands []string, dataClass string) []string {
+func (p *Pipeline) orderCandidates(snap *live.Snapshot, cands []string, dataClass string) []string {
 	var healthy, cooling []string
 	for _, ref := range cands {
-		prov, _, ok := p.Reg.Lookup(ref)
+		prov, _, ok := snap.Reg.Lookup(ref)
 		if !ok {
 			continue
 		}
 		if dataClass == "confidential" && prov.Target != "local" {
 			continue
 		}
-		if p.Reg.Healthy(ref) {
+		if snap.Reg.Healthy(ref) {
 			healthy = append(healthy, ref)
 		} else {
 			cooling = append(cooling, ref)
@@ -466,7 +619,7 @@ func (p *Pipeline) meterRecord(st *reqState, ref, target string, u oai.Usage, co
 	err := p.Meter.Add(meter.Record{
 		RequestID: st.id, Time: time.Now(), TokenID: st.claims.ID, TokenName: st.claims.Name,
 		RequestedModel: st.rec.RequestedModel, Model: ref, Target: target,
-		PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, Cost: cost, Status: status, Latency: lat,
+		PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, CachedTokens: u.CachedTokens, Cost: cost, Status: status, Latency: lat,
 	})
 	if err != nil {
 		p.Log.Error("meter write failed", "err", err)
@@ -474,7 +627,7 @@ func (p *Pipeline) meterRecord(st *reqState, ref, target string, u oai.Usage, co
 }
 
 func (p *Pipeline) meterClassifier(st *reqState, dec route.Decision) {
-	prov, model, _ := p.Reg.Lookup(dec.ClassifierModel)
+	prov, model, _ := st.snap.Reg.Lookup(dec.ClassifierModel)
 	status := http.StatusOK
 	if dec.ClassifierError != "" {
 		status = http.StatusGatewayTimeout
@@ -502,7 +655,7 @@ func (p *Pipeline) relayBuffered(st *reqState, resp *http.Response, vaultKey str
 		return oai.Usage{}, oai.Errorf(http.StatusBadGateway, "upstream_bad_json", "provider returned invalid JSON")
 	}
 	if st.rec.Redaction != nil {
-		p.Redactor.Restore(o, vaultKey, st.rec.Redaction)
+		st.snap.Redactor.Restore(o, vaultKey, st.rec.Redaction)
 	}
 	usage, _ := oai.UsageOf(o)
 	if len(p.Hooks) > 0 {
@@ -510,6 +663,7 @@ func (p *Pipeline) relayBuffered(st *reqState, resp *http.Response, vaultKey str
 		go p.runResponseHooks(p.hookCtx(st, st.rec.DataClass), body, http.StatusOK)
 	}
 	st.written = true
+	st.ttft = time.Since(st.start)
 	if !clientStream {
 		st.w.Header().Set("Content-Type", "application/json")
 		st.w.WriteHeader(http.StatusOK)
@@ -588,7 +742,9 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		if len(line) > 0 {
 			event.Write(line)
 			if len(bytes.TrimSpace(line)) == 0 {
-				p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done)
+				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done) && st.ttft == 0 {
+					st.ttft = time.Since(st.start)
+				}
 				event.Reset()
 				if fl != nil {
 					fl.Flush()
@@ -597,7 +753,9 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		}
 		if err != nil {
 			if event.Len() > 0 {
-				p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done)
+				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done) && st.ttft == 0 {
+					st.ttft = time.Since(st.start)
+				}
 			}
 			if fl != nil {
 				fl.Flush()
@@ -614,7 +772,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 	}
 }
 
-func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool) {
+func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool) bool {
 	for _, l := range bytes.Split(ev, []byte("\n")) {
 		data, ok := bytes.CutPrefix(bytes.TrimSpace(l), []byte("data:"))
 		if !ok {
@@ -642,11 +800,38 @@ func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *o
 		if u, ok := oai.UsageOf(o); ok {
 			*usage = u
 			if ch, _ := o["choices"].([]any); len(ch) == 0 && !clientUsage {
-				return
+				return false
 			}
 		}
 	}
 	w.Write(ev)
+	return true
+}
+
+func injectSystemPrompt(req oai.Object, prompt string) {
+	raw, _ := req["messages"].([]any)
+	if len(raw) > 0 {
+		if first, ok := raw[0].(map[string]any); ok && oai.Str(first, "role") == "system" {
+			switch c := first["content"].(type) {
+			case string:
+				if c == "" {
+					first["content"] = prompt
+				} else {
+					first["content"] = prompt + "\n\n" + c
+				}
+				return
+			case []any:
+				part := map[string]any{"type": "text", "text": prompt}
+				first["content"] = append([]any{part}, c...)
+				return
+			default:
+				first["content"] = prompt
+				return
+			}
+		}
+	}
+	sys := map[string]any{"role": "system", "content": prompt}
+	req["messages"] = append([]any{sys}, raw...)
 }
 
 func effortParam(e string) string {
@@ -692,4 +877,24 @@ func newID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return "req_" + hex.EncodeToString(b)
+}
+
+func copyRouterHeaders(st *reqState, hdr http.Header) {
+	if len(hdr) == 0 {
+		return
+	}
+	for k, vs := range hdr {
+		if len(vs) == 0 {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(k), "x-router-") {
+			st.w.Header().Set(k, vs[0])
+		}
+	}
+	if b := hdr.Get("X-Router-Backend"); b != "" {
+		st.routeBackend = b
+	}
+	if rs := hdr.Get("X-Router-Reason"); rs != "" {
+		st.routeReason = rs
+	}
 }

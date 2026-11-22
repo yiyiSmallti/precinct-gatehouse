@@ -32,11 +32,60 @@ CREATE TABLE IF NOT EXISTS usage (
   target            TEXT NOT NULL,
   prompt_tokens     INTEGER NOT NULL,
   completion_tokens INTEGER NOT NULL,
+  cached_tokens     INTEGER NOT NULL DEFAULT 0,
   cost              REAL NOT NULL,
   status            INTEGER NOT NULL,
   latency_ms        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_token_day ON usage(token_id, day);
+CREATE TABLE IF NOT EXISTS api_keys (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  key_hash     TEXT NOT NULL UNIQUE,
+  key_prefix   TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  expires_at   INTEGER NOT NULL DEFAULT 0,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  models       TEXT NOT NULL DEFAULT '[]',
+  groups       TEXT NOT NULL DEFAULT '[]',
+  rpm          INTEGER NOT NULL DEFAULT 0,
+  rpd          INTEGER NOT NULL DEFAULT 0,
+  concurrency  INTEGER NOT NULL DEFAULT 0,
+  note         TEXT NOT NULL DEFAULT '',
+  last_used_at INTEGER NOT NULL DEFAULT 0,
+  deleted_at   INTEGER
+);
+CREATE TABLE IF NOT EXISTS request_log (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id        TEXT NOT NULL,
+  ts                INTEGER NOT NULL,
+  day               TEXT NOT NULL,
+  key_id            TEXT NOT NULL DEFAULT '',
+  key_name          TEXT NOT NULL DEFAULT '',
+  protocol          TEXT NOT NULL DEFAULT '',
+  client_ip         TEXT NOT NULL DEFAULT '',
+  requested_model   TEXT NOT NULL DEFAULT '',
+  model             TEXT NOT NULL DEFAULT '',
+  status            INTEGER NOT NULL,
+  error_code        TEXT NOT NULL DEFAULT '',
+  stream            INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens     INTEGER NOT NULL DEFAULT 0,
+  latency_ms        INTEGER NOT NULL DEFAULT 0,
+  ttft_ms           INTEGER NOT NULL DEFAULT 0,
+  admitted          INTEGER NOT NULL DEFAULT 0,
+  redaction_mode    TEXT NOT NULL DEFAULT '',
+  redaction_count   INTEGER NOT NULL DEFAULT 0,
+  route_backend     TEXT NOT NULL DEFAULT '',
+  route_reason      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS request_log_key_day ON request_log(key_id, day);
+CREATE INDEX IF NOT EXISTS request_log_ts ON request_log(ts);
+CREATE TABLE IF NOT EXISTS settings (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
 `
 
 // Open opens (and migrates) <dataDir>/gatehouse.db.
@@ -54,5 +103,50 @@ func Open(dataDir string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
 	}
+	if err := ensureColumn(db, "usage", "cached_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	if err := ensureColumn(db, "request_log", "redaction_mode", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	if err := ensureColumn(db, "request_log", "redaction_count", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	if err := ensureColumn(db, "request_log", "route_backend", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	if err := ensureColumn(db, "request_log", "route_reason", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
 	return db, nil
+}
+
+func ensureColumn(db *sql.DB, table, col, def string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == col {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + col + " " + def)
+	return err
 }

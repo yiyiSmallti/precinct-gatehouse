@@ -18,6 +18,7 @@ type Record struct {
 	Target           string // local | external
 	PromptTokens     int
 	CompletionTokens int
+	CachedTokens     int
 	Cost             float64
 	Status           int
 	Latency          time.Duration
@@ -44,10 +45,10 @@ func (m *Meter) AddExporter(e Exporter) { m.exporters = append(m.exporters, e) }
 // Add stores a record and forwards it to exporters.
 func (m *Meter) Add(r Record) error {
 	m.mu.Lock()
-	_, err := m.db.Exec(`INSERT INTO usage(request_id,ts,day,token_id,token_name,requested_model,model,target,prompt_tokens,completion_tokens,cost,status,latency_ms)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := m.db.Exec(`INSERT INTO usage(request_id,ts,day,token_id,token_name,requested_model,model,target,prompt_tokens,completion_tokens,cached_tokens,cost,status,latency_ms)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.RequestID, r.Time.Unix(), r.Time.Local().Format("2006-01-02"), r.TokenID, r.TokenName, r.RequestedModel, r.Model, r.Target,
-		r.PromptTokens, r.CompletionTokens, r.Cost, r.Status, r.Latency.Milliseconds())
+		r.PromptTokens, r.CompletionTokens, r.CachedTokens, r.Cost, r.Status, r.Latency.Milliseconds())
 	m.mu.Unlock()
 	if err != nil {
 		return err
@@ -96,4 +97,65 @@ func (m *Meter) Daily(since string) ([]Row, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// RequestLogEntry is one row written to request_log per client request.
+type RequestLogEntry struct {
+	RequestID        string
+	Time             time.Time
+	KeyID            string
+	KeyName          string
+	Protocol         string
+	ClientIP         string
+	RequestedModel   string
+	Model            string
+	Status           int
+	ErrorCode        string
+	Stream           bool
+	PromptTokens     int
+	CompletionTokens int
+	CachedTokens     int
+	LatencyMS        int64
+	TTFTMS           int64
+	Admitted         bool
+	RedactionMode    string
+	RedactionCount   int
+	RouteBackend     string
+	RouteReason      string
+}
+
+// LogRequest records one client request in request_log.
+func (m *Meter) LogRequest(e RequestLogEntry) error {
+	stream := 0
+	if e.Stream {
+		stream = 1
+	}
+	admitted := 0
+	if e.Admitted {
+		admitted = 1
+	}
+	m.mu.Lock()
+	_, err := m.db.Exec(`INSERT INTO request_log(
+		request_id,ts,day,key_id,key_name,protocol,client_ip,requested_model,model,
+		status,error_code,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,admitted,
+		redaction_mode,redaction_count,route_backend,route_reason)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		e.RequestID, e.Time.Unix(), e.Time.Local().Format("2006-01-02"), e.KeyID, e.KeyName,
+		e.Protocol, e.ClientIP, e.RequestedModel, e.Model,
+		e.Status, e.ErrorCode, stream, e.PromptTokens, e.CompletionTokens, e.CachedTokens,
+		e.LatencyMS, e.TTFTMS, admitted, e.RedactionMode, e.RedactionCount, e.RouteBackend, e.RouteReason)
+	m.mu.Unlock()
+	return err
+}
+
+// PruneRequestLog deletes request_log rows older than days. Zero disables pruning.
+func (m *Meter) PruneRequestLog(days int, now time.Time) error {
+	if days <= 0 {
+		return nil
+	}
+	cutoff := now.Add(-time.Duration(days) * 24 * time.Hour).Unix()
+	m.mu.Lock()
+	_, err := m.db.Exec(`DELETE FROM request_log WHERE ts < ?`, cutoff)
+	m.mu.Unlock()
+	return err
 }

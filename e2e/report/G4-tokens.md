@@ -1,6 +1,6 @@
 # G4 令牌
 
-结果：**通过** · 运行于 2026-11-01 17:06:17 UTC · linux/amd64
+结果：**通过** · 运行于 2026-11-22 06:13:04 PST · darwin/arm64
 
 `gatehouse token issue` 签发限范围的短时效令牌，网关按令牌校验签名、有效期、吊销与范围。
 
@@ -24,11 +24,11 @@
 令牌列表：
 
 ```
-ID                    NAME       EXPIRES               STATE    SCOPE
-tok_b0a3766c9d5642b1  local      never                 active   {"data_class":"confidential"}
-tok_a4984dc07ac04936  only-a     2026-11-01T18:06:15Z  active   {"models":["p/model-a"],"data_class":"internal"}
-tok_c4fa584b3d3f1638  group-g    2026-11-01T18:06:15Z  active   {"groups":["g"],"data_class":"internal"}
-tok_b032763e9e08c431  short      2026-11-01T17:06:16Z  expired  {"data_class":"internal"}
-tok_377264ce592f2dcd  to-revoke  2026-11-01T18:06:16Z  revoked  {"data_class":"internal"}
-tok_fc1f31b9466929b1  budget     2026-11-01T18:06:16Z  active   {"max_tokens":5,"data_class":"internal"}
+ID                    NAME       EXPIRES                    STATE    SCOPE
+tok_e1465b52ad14581e  local      never                      active   {"data_class":"confidential"}
+tok_77fb9d64ba19a650  only-a     2026-11-22T07:13:03-08:00  active   {"models":["p/model-a"],"data_class":"internal"}
+tok_8f455c5ba840c644  group-g    2026-11-22T07:13:03-08:00  active   {"groups":["g"],"data_class":"internal"}
+tok_8093b4af970cc86c  short      2026-11-22T06:13:04-08:00  expired  {"data_class":"internal"}
+tok_7a95a55df004c9f7  to-revoke  2026-11-22T07:13:04-08:00  revoked  {"data_class":"internal"}
+tok_fa9011c27bb6ce35  budget     2026-11-22T07:13:04-08:00  active   {"max_tokens":5,"data_class":"internal"}
 ```

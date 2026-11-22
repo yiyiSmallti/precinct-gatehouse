@@ -64,9 +64,10 @@ type FakeProvider struct {
 	ln   net.Listener
 	srv  *http.Server
 
-	mu       sync.Mutex
-	requests [][]byte
-	down     bool
+	mu          sync.Mutex
+	requests    [][]byte
+	authHeaders []string
+	down        bool
 	// Classify answers classifier prompts (system prompt mentions 路由分类器).
 	Classify func(userText string) string
 	// RedirectTo, when set, answers requests whose last user message
@@ -95,6 +96,13 @@ func (f *FakeProvider) Requests() [][]byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([][]byte(nil), f.requests...)
+}
+
+// AuthHeaders returns the Authorization header values received so far.
+func (f *FakeProvider) AuthHeaders() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.authHeaders...)
 }
 
 // ChatRequests returns decoded non-classifier requests.
@@ -149,6 +157,7 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	f.mu.Lock()
 	f.requests = append(f.requests, body)
+	f.authHeaders = append(f.authHeaders, r.Header.Get("Authorization"))
 	down := f.down
 	f.mu.Unlock()
 	if down {
@@ -162,6 +171,9 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	model, _ := req["model"].(string)
 	user := lastUser(req)
+	if strings.Contains(user, "#slow") {
+		time.Sleep(1 * time.Second)
+	}
 	if f.RedirectTo != "" && strings.Contains(user, "#redirect") {
 		http.Redirect(w, r, f.RedirectTo+"/chat/completions", http.StatusTemporaryRedirect)
 		return
@@ -174,13 +186,27 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	msg := map[string]any{"role": "assistant", "content": content}
+	if strings.Contains(user, "#think") {
+		msg["reasoning_content"] = "思考..."
+	}
 	finish := "stop"
+	var toolArgsStr string
+	hasTools := false
 	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
+		hasTools = true
 		args, _ := json.Marshal(map[string]string{"echo": user})
-		msg["tool_calls"] = []any{map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "echo", "arguments": string(args)}}}
+		toolArgsStr = string(args)
+		msg["tool_calls"] = []any{map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "echo", "arguments": toolArgsStr}}}
 		finish = "tool_calls"
 	}
-	usage := map[string]any{"prompt_tokens": len(body) / 10, "completion_tokens": len(content) / 4, "total_tokens": len(body)/10 + len(content)/4}
+	promptTok := len(body) / 10
+	compTok := len(content) / 4
+	usage := map[string]any{
+		"prompt_tokens":         promptTok,
+		"completion_tokens":     compTok,
+		"total_tokens":          promptTok + compTok,
+		"prompt_tokens_details": map[string]any{"cached_tokens": promptTok / 2},
+	}
 	if stream, _ := req["stream"].(bool); stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		if strings.Contains(user, "#truncate") {
@@ -190,10 +216,30 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "data: %s\n\n", b)
 			return
 		}
+		if strings.Contains(user, "#think") {
+			for _, part := range []string{"思考", "..."} {
+				b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
+					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": part}}}})
+				fmt.Fprintf(w, "data: %s\n\n", b)
+			}
+		}
 		for _, part := range []string{content[:len(content)/2], content[len(content)/2:]} {
 			b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
 				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": part}}}})
 			fmt.Fprintf(w, "data: %s\n\n", b)
+		}
+		if hasTools {
+			mid := len(toolArgsStr) / 2
+			chunks := []map[string]any{
+				{"index": 0, "id": "call_1", "type": "function", "function": map[string]any{"name": "echo", "arguments": ""}},
+				{"index": 0, "function": map[string]any{"arguments": toolArgsStr[:mid]}},
+				{"index": 0, "function": map[string]any{"arguments": toolArgsStr[mid:]}},
+			}
+			for _, tc := range chunks {
+				b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
+					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{tc}}}}})
+				fmt.Fprintf(w, "data: %s\n\n", b)
+			}
 		}
 		b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
 			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}})
@@ -289,13 +335,27 @@ func (g *Gateway) Stop() {
 // CLI runs a gatehouse subcommand against this gateway's config.
 func (g *Gateway) CLI(t *testing.T, args ...string) string {
 	t.Helper()
-	args = append(args, "--config", filepath.Join(g.Dir, "config.yaml"))
-	// flags must precede positional args for the flag package; move --config after the subcommand words
-	out, err := exec.Command(gatehouse, reorder(args)...).CombinedOutput()
+	out, err := g.runCLI("", args...)
 	if err != nil {
 		t.Fatalf("gatehouse %v: %v\n%s", args, err, out)
 	}
-	return string(out)
+	return out
+}
+
+// CLIStdin runs a gatehouse subcommand with stdin input, returning combined output and error.
+func (g *Gateway) CLIStdin(stdin string, args ...string) (string, error) {
+	return g.runCLI(stdin, args...)
+}
+
+func (g *Gateway) runCLI(stdin string, args ...string) (string, error) {
+	args = append(args, "--config", filepath.Join(g.Dir, "config.yaml"))
+	// flags must precede positional args for the flag package; move --config after the subcommand words
+	cmd := exec.Command(gatehouse, reorder(args)...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 func reorder(args []string) []string {
@@ -322,7 +382,8 @@ func reorder(args []string) []string {
 
 func isWord(s string) bool {
 	switch s {
-	case "token", "issue", "revoke", "list", "config", "check", "redact", "try", "report", "key", "set", "delete":
+	case "token", "issue", "revoke", "list", "config", "check", "redact", "try", "report", "key", "set", "delete",
+		"apikey", "create", "import", "update", "enable", "disable", "reset", "admin", "set-password":
 		return true
 	}
 	return false

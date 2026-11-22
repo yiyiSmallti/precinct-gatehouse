@@ -115,8 +115,20 @@ redaction:
 
 ### 3.7 实现与本 Spec 的差异
 
-- 未做：配置热重载、Vault 加密落盘、多轮增量检测缓存、NER 模块（M5，看验证周）、插件进程崩溃后自动重启（当前需重启 Gatehouse）、插件包（`.tgz` + `gatehouse` 字段）的安装命令。
-- org 模式暂不使用 `byo_api` 与策略下发的 `redaction` 段（脱敏仍按本机配置）；`budget.period` 只透传不解释。
+- 已在首期之后补充实现：
+  - 持久化 `sk-` API Key 与基于内存滑窗/计数器的次数限额（并发、RPM、每日 RPD，重启后每日计数从 `request_log` 恢复）；`gatehouse apikey` CLI。
+  - 入口协议适配：Anthropic Messages（`POST /v1/messages`、`POST /v1/messages/count_tokens`）与 OpenAI Responses（`POST /v1/responses`），含流式/非流式、thinking 与 tool_calls 互转。
+  - 路由与请求增强：`max_body_mb` 配置（`0` 不限）、去掉 `ght1.` 令牌 `MaxTokens` 整请求串行锁、`model_aliases` 别名映射、provider 级 `system_prompt` 拼接与 `extra_body` 合并、`cached_tokens` 与 `ttft_ms` 统计。
+  - 内嵌 Web 控制面板与管理 API（`admin.listen`，PBKDF2 密码哈希、Cookie 会话、`X-Gatehouse-Admin` CSRF 校验、密码修改）。
+  - 配置热重载与全量在线配置管理：基于快照句柄的原子切换（`internal/live`，在途请求绑定进入时快照不受影响），支持渠道/路由与别名/脱敏/常规参数分节保存（带 `base_hash` 乐观锁冲突检测）、原始 YAML 编辑与语法校验、外部文件监听与 `SIGHUP` 自动重载、`<data_dir>/config-history/` 最多 30 份历史备份与逐行 Diff 回滚、`db:<name>` 上游密钥数据库存储、`providers/test` 连通性探测及 `/admin/api/flow` 门禁流统计；其中 `listen`、`mode`、`data_dir`、`admin.*`、`meter.*`、`audit.*`、`org.*`、`plugins.*` 等启动基础设施字段修改后返回 `restart_required` 提示需重启生效，且 Web 写回 YAML 会剥离手写注释。
+  - **内置智能分层路由（`providers[].tiered`）**：
+    - **配置 Schema**：`mode`（`shadow` | `active`）、`heavy_miss_threshold`、`health_interval_sec`、`zh_think_anchor`、`backends[]`（`id`, `url`, `tier`, `max_context_tokens`, `max_safe_input`, `promote_at`, `demote_below`, `speed_score`）、`starter_cache`（`enabled`, `canonicalize_tools`, `min_tokens`, `max_tokens`, `min_hits`, `max_entries`, `keepalive_sec`, `check_interval_sec`, `startup_delay_sec`, `entry_ttl_hours`, `persist_path`）。`shadow` 模式要求保留非空 `base_url`；`active` 模式可省略 `base_url`。
+    - **运行模式与热重载**：`internal/tiered.Hub` 按 provider 名称维护常驻 `Router` 实例；`buildSnapshot`（含配置校验/预览）无副作用，`live.Manager.OnSwap` 仅在真实快照切换时调用 `Hub.Activate` 原地更新后端与 Starter 参数，完整保留内存前缀缓存、会话滞回表及后台探测协程；响应传播 `X-Router-*` 头并在 SQLite `request_log` 写入 `route_backend` / `route_reason`。
+    - **管理接口**：`GET /admin/api/tiered`、`GET /admin/api/tiered/{provider}/starters`、`POST /admin/api/tiered/{provider}/starters/pin`、`DELETE /admin/api/tiered/{provider}/starters/{hash}`、`POST /admin/api/tiered/{provider}/starters/warm`（`shadow` 模式返回 `409 shadow_mode`）、`POST /admin/api/tiered/{provider}/shadow/reset`；验收覆盖 `e2e/g12_tiered_test.go`（`e2e/report/G12-tiered-router.md`）。
+- 仍未实现：
+  - Vault 加密落盘、多轮增量检测缓存、NER 模块（M5，看验证周）、插件进程崩溃后自动重启（当前需重启 Gatehouse）、插件包（`.tgz` + `gatehouse` 字段）的安装命令。
+  - Gemini 原生协议互转；OpenAI Responses 的 `previous_response_id` 有状态续聊（返回 400 `previous_response_not_supported`）；Responses 中 `web_search`、`custom` 等非 `function` 内置工具会被丢弃并在 `X-Gatehouse-Dropped-Tools` 响应头中列出。
+- org 模式暂不使用 `byo_api` 与策略下发的 `redaction` 段（脱敏仍按本机配置）；`budget.period` 只透传不解释；`sk-` API Key 仅限 personal 模式使用。
 - 外部目标含图请求：类别 `image`，默认动作同其它类别（mask 模式下视为 warn，原样发出并告警），可设 `image: block`。
 - 审计样本只记类别、长度、动作，不记值的前几个字符。
 - 路由组的 `usage` 分摊按进程内累计 token，重启归零。

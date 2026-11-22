@@ -144,6 +144,19 @@ func Text(m Object) string {
 	return ""
 }
 
+func estimateStringTokens(s string) int {
+	n := 0
+	other := 0
+	for _, r := range s {
+		if r >= 0x2E80 && utf8.RuneLen(r) >= 3 {
+			n++
+		} else {
+			other++
+		}
+	}
+	return n + (other+3)/4
+}
+
 // EstimateTokens is a cheap prompt-size estimate used by routing rules:
 // roughly one token per CJK character and one per four other characters.
 func EstimateTokens(req Object) int {
@@ -154,15 +167,10 @@ func EstimateTokens(req Object) int {
 		if tc, ok := m["tool_calls"].([]any); ok {
 			s += string(Encode(tc))
 		}
-		other := 0
-		for _, r := range s {
-			if r >= 0x2E80 && utf8.RuneLen(r) >= 3 {
-				n++
-			} else {
-				other++
-			}
-		}
-		n += (other + 3) / 4
+		n += estimateStringTokens(s)
+	}
+	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
+		n += estimateStringTokens(string(Encode(tools)))
 	}
 	return n
 }
@@ -182,6 +190,7 @@ func LastUserText(req Object) string {
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
+	CachedTokens     int `json:"cached_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
@@ -192,6 +201,9 @@ func UsageOf(resp Object) (Usage, bool) {
 		return Usage{}, false
 	}
 	us := Usage{PromptTokens: Int(u, "prompt_tokens"), CompletionTokens: Int(u, "completion_tokens"), TotalTokens: Int(u, "total_tokens")}
+	if ptd, ok := u["prompt_tokens_details"].(map[string]any); ok {
+		us.CachedTokens = Int(ptd, "cached_tokens")
+	}
 	if us.TotalTokens == 0 {
 		us.TotalTokens = us.PromptTokens + us.CompletionTokens
 	}

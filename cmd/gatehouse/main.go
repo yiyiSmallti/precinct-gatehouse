@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,8 +27,10 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/admin"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/api"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keystore"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/meter"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
@@ -43,6 +46,11 @@ const usage = `gatehouse — Precinct model gateway (OpenAI-compatible)
 
 Usage:
   gatehouse serve                      run the gateway
+  gatehouse apikey create --name N [--models a,b] [--groups g] [--rpm N] [--rpd N] [--concurrency N] [--ttl 0|720h] [--note s] [--json]
+  gatehouse apikey list [--json]
+  gatehouse apikey update <id> [--name N] [--models a,b] [--groups g] [--rpm N] [--rpd N] [--concurrency N] [--ttl 0|720h] [--note s]
+  gatehouse apikey enable|disable|reset|delete <id>
+  gatehouse admin set-password [--user admin]   (reads password from stdin)
   gatehouse token issue --name N [--ttl 24h] [--models p/m,...] [--groups g,...] [--max-tokens N] [--data-class internal]
   gatehouse token revoke <id|name>
   gatehouse token list
@@ -66,6 +74,10 @@ func main() {
 	switch cmd {
 	case "serve":
 		err = serve(args)
+	case "apikey":
+		err = apikeyCmd(args)
+	case "admin":
+		err = adminCmd(args)
 	case "token":
 		err = tokenCmd(args)
 	case "config":
@@ -171,19 +183,74 @@ Next steps:
 	if len(srv.Missing) > 0 {
 		log.Warn("required detectors unavailable; requests that need redaction will get 503", "detectors", srv.Missing)
 	}
+	var admSrv *http.Server
+	if cfg.Admin.Listen != "" {
+		if !admin.HasPassword(srv.DB) {
+			log.Warn("admin password is not set; run `gatehouse admin set-password`")
+		}
+		adm := admin.New(admin.Deps{
+			DB:               srv.DB,
+			Keys:             srv.Keys,
+			Limiter:          srv.Limiter,
+			Live:             srv.Live,
+			Tiered:           srv.Tiered,
+			MissingDetectors: srv.Missing,
+			UserKey:          srv.UserKey,
+			SessionTTL:       cfg.Admin.SessionTTL.D(12 * time.Hour),
+		})
+		admLn, err := net.Listen("tcp", cfg.Admin.Listen)
+		if err != nil {
+			_ = ln.Close()
+			srv.Shutdown(context.Background())
+			return err
+		}
+		admSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second}
+		log.Info("admin listening", "addr", "http://"+admLn.Addr().String()+"/admin/")
+		defer admLn.Close()
+		go func() {
+			if err := admSrv.Serve(admLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				log.Error("admin server failed", "err", err)
+			}
+		}()
+	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.HTTP.Serve(ln) }()
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	select {
-	case <-sig:
-	case err := <-errc:
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			return err
+	hup := notifyReload()
+	if hup != nil {
+		defer signal.Stop(hup)
+	}
+loop:
+	for {
+		select {
+		case <-sig:
+			break loop
+		case <-hup:
+			res, changed, rerr := srv.Live.ReloadFromDisk("signal")
+			if rerr != nil {
+				log.Error("SIGHUP reload failed", "err", rerr)
+			} else if changed {
+				log.Info("config reloaded via SIGHUP", "version", res.Version, "restart_required", res.RestartRequired)
+			} else {
+				log.Info("SIGHUP received, config unchanged", "version", res.Version)
+			}
+		case err := <-errc:
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				if admSrv != nil {
+					_ = admSrv.Shutdown(context.Background())
+				}
+				srv.Shutdown(context.Background())
+				return err
+			}
+			break loop
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if admSrv != nil {
+		_ = admSrv.Shutdown(ctx)
+	}
 	srv.Shutdown(ctx)
 	log.Info("gatehouse stopped")
 	return nil
@@ -307,9 +374,25 @@ func configCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	var dbCloser func()
+	resolve := keystore.Resolve
+	for _, p := range cfg.Providers {
+		if strings.HasPrefix(p.KeyRef, "db:") {
+			db, derr := store.Open(cfg.DataDir)
+			if derr != nil {
+				return derr
+			}
+			dbCloser = func() { db.Close() }
+			resolve = func(ref string) (string, error) { return api.ResolveKey(db, ref) }
+			break
+		}
+	}
+	if dbCloser != nil {
+		defer dbCloser()
+	}
 	var problems []string
 	for _, p := range cfg.Providers {
-		if _, err := keystore.Resolve(p.KeyRef); err != nil {
+		if _, err := resolve(p.KeyRef); err != nil {
 			problems = append(problems, fmt.Sprintf("providers.%s.key_ref: %v", p.Name, err))
 		}
 	}
@@ -449,5 +532,267 @@ func keyCmd(args []string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "stored; reference it as key_ref: keychain:%s\n", args[1])
+	return nil
+}
+
+func openKeyStore(cfg *config.Config) (*keys.Store, func(), error) {
+	db, err := store.Open(cfg.DataDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	ks := keys.NewStore(db)
+	return ks, func() {
+		ks.Close()
+		db.Close()
+	}, nil
+}
+
+func splitFlagsAndPos(args []string, boolFlags map[string]bool) []string {
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") && a != "-" {
+			flags = append(flags, a)
+			name := strings.TrimLeft(a, "-")
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				continue
+			}
+			if !boolFlags[name] && i+1 < len(args) {
+				flags = append(flags, args[i+1])
+				i++
+			}
+			continue
+		}
+		pos = append(pos, a)
+	}
+	return append(flags, pos...)
+}
+
+func apikeyCmd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("apikey: want create, import, list, update, enable, disable, reset or delete")
+	}
+	sub := args[0]
+	fs, cfgPath := newFlags("apikey " + sub)
+	name := fs.String("name", "", "key name")
+	models := fs.String("models", "", "comma-separated allowed <provider>/<model>")
+	groups := fs.String("groups", "", "comma-separated allowed routing groups")
+	rpm := fs.Int("rpm", 0, "requests per minute limit (0 = unlimited)")
+	rpd := fs.Int("rpd", 0, "requests per day limit (0 = unlimited)")
+	conc := fs.Int("concurrency", 0, "max concurrent requests (0 = unlimited)")
+	ttl := fs.Duration("ttl", 0, "lifetime, e.g. 720h (0 = never expires)")
+	note := fs.String("note", "", "optional note")
+	asJSON := fs.Bool("json", false, "print JSON")
+
+	ordered := splitFlagsAndPos(args[1:], map[string]bool{"json": true})
+	if err := fs.Parse(ordered); err != nil {
+		return exitErr(2)
+	}
+	setFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
+	cfg, err := load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	ks, closeKS, err := openKeyStore(cfg)
+	if err != nil {
+		return err
+	}
+	defer closeKS()
+
+	switch sub {
+	case "create":
+		if strings.TrimSpace(*name) == "" {
+			return fmt.Errorf("apikey create: --name is required")
+		}
+		var exp int64
+		if *ttl > 0 {
+			exp = time.Now().Add(*ttl).Unix()
+		}
+		plain, k, err := ks.Create(keys.CreateOpts{
+			Name:        *name,
+			ExpiresAt:   exp,
+			Models:      splitList(*models),
+			Groups:      splitList(*groups),
+			RPM:         *rpm,
+			RPD:         *rpd,
+			Concurrency: *conc,
+			Note:        *note,
+		})
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{"key": plain, "api_key": k})
+		}
+		fmt.Println(plain)
+		fmt.Fprintf(os.Stderr, "created %s (%s, prefix %s)\n", k.ID, k.Name, k.KeyPrefix)
+	case "import":
+		if strings.TrimSpace(*name) == "" {
+			return fmt.Errorf("apikey import: --name is required")
+		}
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		plain := strings.TrimSpace(line)
+		var exp int64
+		if *ttl > 0 {
+			exp = time.Now().Add(*ttl).Unix()
+		}
+		k, err := ks.Import(plain, keys.CreateOpts{
+			Name:        *name,
+			ExpiresAt:   exp,
+			Models:      splitList(*models),
+			Groups:      splitList(*groups),
+			RPM:         *rpm,
+			RPD:         *rpd,
+			Concurrency: *conc,
+			Note:        *note,
+		})
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{"api_key": k})
+		}
+		fmt.Fprintf(os.Stderr, "imported %s (%s, prefix %s)\n", k.ID, k.Name, k.KeyPrefix)
+	case "list":
+		list, err := ks.List()
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(list)
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tNAME\tPREFIX\tSTATE\tRPM/RPD/CONC\tMODELS\tGROUPS\tEXPIRES")
+		now := time.Now()
+		for _, k := range list {
+			state := "enabled"
+			if !k.Enabled {
+				state = "disabled"
+			} else if k.ExpiresAt > 0 && now.Unix() >= k.ExpiresAt {
+				state = "expired"
+			}
+			exp := "never"
+			if k.ExpiresAt > 0 {
+				exp = time.Unix(k.ExpiresAt, 0).Format(time.RFC3339)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d/%d/%d\t%s\t%s\t%s\n",
+				k.ID, k.Name, k.KeyPrefix, state, k.RPM, k.RPD, k.Concurrency,
+				strings.Join(k.Models, ","), strings.Join(k.Groups, ","), exp)
+		}
+		tw.Flush()
+	case "update":
+		if fs.NArg() != 1 {
+			return fmt.Errorf("apikey update: want <id>")
+		}
+		var patch keys.Patch
+		if setFlags["name"] {
+			patch.Name = name
+		}
+		if setFlags["models"] {
+			m := splitList(*models)
+			patch.Models = &m
+		}
+		if setFlags["groups"] {
+			g := splitList(*groups)
+			patch.Groups = &g
+		}
+		if setFlags["rpm"] {
+			patch.RPM = rpm
+		}
+		if setFlags["rpd"] {
+			patch.RPD = rpd
+		}
+		if setFlags["concurrency"] {
+			patch.Concurrency = conc
+		}
+		if setFlags["note"] {
+			patch.Note = note
+		}
+		if setFlags["ttl"] {
+			var exp int64
+			if *ttl > 0 {
+				exp = time.Now().Add(*ttl).Unix()
+			}
+			patch.ExpiresAt = &exp
+		}
+		k, err := ks.Update(fs.Arg(0), patch)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(k)
+		}
+		fmt.Printf("updated %s (%s)\n", k.ID, k.Name)
+	case "enable", "disable":
+		if fs.NArg() != 1 {
+			return fmt.Errorf("apikey %s: want <id>", sub)
+		}
+		if err := ks.SetEnabled(fs.Arg(0), sub == "enable"); err != nil {
+			return err
+		}
+		fmt.Printf("%sd %s\n", sub, fs.Arg(0))
+	case "reset":
+		if fs.NArg() != 1 {
+			return fmt.Errorf("apikey reset: want <id>")
+		}
+		plain, k, err := ks.Reset(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{"key": plain, "api_key": k})
+		}
+		fmt.Println(plain)
+		fmt.Fprintf(os.Stderr, "reset %s (%s, prefix %s)\n", k.ID, k.Name, k.KeyPrefix)
+	case "delete":
+		if fs.NArg() != 1 {
+			return fmt.Errorf("apikey delete: want <id>")
+		}
+		if err := ks.Delete(fs.Arg(0)); err != nil {
+			return err
+		}
+		fmt.Printf("deleted %s\n", fs.Arg(0))
+	default:
+		return fmt.Errorf("apikey: unknown subcommand %q", sub)
+	}
+	return nil
+}
+
+func adminCmd(args []string) error {
+	if len(args) == 0 || args[0] != "set-password" {
+		return fmt.Errorf("admin: want set-password [--user admin]")
+	}
+	fs, cfgPath := newFlags("admin set-password")
+	user := fs.String("user", "admin", "admin username")
+	ordered := splitFlagsAndPos(args[1:], nil)
+	if err := fs.Parse(ordered); err != nil {
+		return exitErr(2)
+	}
+	cfg, err := load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	pass := strings.TrimRight(line, "\r\n")
+	if pass == "" {
+		return fmt.Errorf("admin set-password: empty password on stdin")
+	}
+	db, err := store.Open(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := admin.SetPassword(db, *user, pass); err != nil {
+		return err
+	}
+	fmt.Printf("admin password updated for %q\n", strings.TrimSpace(*user))
 	return nil
 }
