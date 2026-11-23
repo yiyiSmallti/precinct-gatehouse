@@ -577,7 +577,14 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 		}
 		callStart := time.Now()
 		routeMeta := &tiered.RouteMeta{}
-		reqCtx := provider.WithCompressHeaders(tiered.WithRouteMeta(tiered.WithDataClass(ctx, dataClass), routeMeta), r.Header.Get("X-No-Compress"), r.Header.Get("X-Context-Compress"))
+		reqCtx := provider.WithCompressHeaders(
+			tiered.WithRouteMeta(
+				tiered.WithCallerScope(tiered.WithDataClass(ctx, dataClass), st.claims.ID+"\x00"+dataClass),
+				routeMeta,
+			),
+			r.Header.Get("X-No-Compress"),
+			r.Header.Get("X-Context-Compress"),
+		)
 		resp, err := p.callProviderWithKeepalive(reqCtx, st, prov, oai.Encode(out), clientStream, upStream)
 		if err != nil {
 			var ue *provider.UpstreamError

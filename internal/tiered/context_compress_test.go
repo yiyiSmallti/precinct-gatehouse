@@ -514,14 +514,14 @@ func TestConfidentialCheckpointIsolation(t *testing.T) {
 		t.Fatalf("expected confidential checkpoint to block external summarizer (failed=%v calls=%d)", failedRefusal, externalCalls.Load())
 	}
 
-	// Part 3: upgrading a non-confidential checkpoint via a follow-up confidential turn scrubs disk and redacts List().
+	// Part 3: isolate confidential checkpoints from non-confidential callers, isolate distinct caller scopes, and scrub disk on upgradeConfidential.
 	localSrv3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/get_server_info" {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"ok":true}`))
 			return
 		}
-		summary := "## 1. 用户目标\n- TOP_SECRET_UPGRADED_SYS\n\n## 2. 状态\n- Upgraded confidential." + strings.Repeat(" padding", 12)
+		summary := "## 1. 用户目标\n- TOP_SECRET_CONFIDENTIAL_SYS\n\n## 2. 状态\n- Confidential isolated." + strings.Repeat(" padding", 12)
 		b, _ := json.Marshal(map[string]any{
 			"id":      "s3",
 			"choices": []map[string]any{{"index": 0, "message": map[string]string{"role": "assistant", "content": summary}, "finish_reason": "stop"}},
@@ -538,61 +538,94 @@ func TestConfidentialCheckpointIsolation(t *testing.T) {
 	r3.ensureLoops()
 	normCfg3 := r3.compressor.getCfg()
 
-	turns3a := []map[string]any{
-		{"role": "user", "content": "Public note line"},
-		{"role": "assistant", "content": strings.Repeat("Public analysis detail ", 220)},
-		{"role": "user", "content": strings.Repeat("Public requirements text ", 200)},
+	turns3 := []map[string]any{
+		{"role": "user", "content": "Shared archived note line"},
+		{"role": "assistant", "content": strings.Repeat("Detailed analysis block ", 220)},
+		{"role": "user", "content": strings.Repeat("Detailed requirements text ", 200)},
 		{"role": "assistant", "content": "Understood."},
 		{"role": "user", "content": "Next question."},
 	}
-	body3a := makeCompTestBody("Public system", turns3a)
-	an3a, _ := r3.analyzeChatBody(body3a)
-	res3a := r3.compressor.MaybeCompress(body3a, an3a, nil, normCfg3, 24000, "local", false)
-	if !res3a.Compressed || res3a.PendingJob == nil || res3a.CheckpointID == "" {
-		t.Fatalf("expected non-confidential stage1 checkpoint, got %+v", res3a)
+	body3Conf := makeCompTestBody("System: TOP_SECRET_CONFIDENTIAL_SYS", turns3)
+	an3Conf, _ := r3.analyzeChatBody(body3Conf)
+	resConf := r3.compressor.MaybeCompress(body3Conf, an3Conf, nil, normCfg3, 24000, "local", true)
+	if !resConf.Compressed || resConf.PendingJob == nil || resConf.CheckpointID == "" {
+		t.Fatalf("expected confidential stage1 checkpoint, got %+v", resConf)
 	}
-	r3.compressor.gcAndSave()
-	diskBefore, err := os.ReadFile(persist3)
-	if err != nil || !strings.Contains(string(diskBefore), res3a.CheckpointID) {
-		t.Fatalf("expected non-confidential checkpoint persisted on disk, err=%v data=%s", err, diskBefore)
-	}
-
-	turns3b := append(append([]map[string]any(nil), turns3a...),
-		map[string]any{"role": "assistant", "content": "Public answer."},
-		map[string]any{"role": "user", "content": "Follow-up confidential turn."},
-	)
-	body3b := makeCompTestBody("System: TOP_SECRET_UPGRADED_SYS", turns3b)
-	an3b, _ := r3.analyzeChatBody(body3b)
-	res3b := r3.compressor.MaybeCompress(body3b, an3b, nil, normCfg3, 24000, "local", true)
-	if !res3b.Compressed || res3b.CheckpointID != res3a.CheckpointID || res3b.PendingJob == nil || !res3b.PendingJob.confidential {
-		t.Fatalf("expected follow-up confidential turn to reuse %s with confidential pending job, got %+v", res3a.CheckpointID, res3b)
-	}
-	r3.compressor.ScheduleStage2(res3b.PendingJob)
+	r3.compressor.ScheduleStage2(resConf.PendingJob)
 
 	deadline = time.Now().Add(4 * time.Second)
-	upgradedReady := false
+	confReady := false
 	for time.Now().Before(deadline) {
-		list := r3.compressor.List()
-		if len(list) == 1 && list[0].Stage2Status == "ready" {
-			if !list[0].Confidential || list[0].SummaryPreview != "" {
-				t.Fatalf("expected upgraded confidential checkpoint with redacted summary_preview, got %+v", list[0])
+		for _, item := range r3.compressor.List() {
+			if item.ID == resConf.CheckpointID && item.Stage2Status == "ready" {
+				if !item.Confidential || item.SummaryPreview != "" {
+					t.Fatalf("expected confidential checkpoint with redacted summary_preview, got %+v", item)
+				}
+				confReady = true
+				break
 			}
-			upgradedReady = true
+		}
+		if confReady {
 			break
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
-	if !upgradedReady {
-		t.Fatalf("timed out waiting for upgraded checkpoint stage2 ready")
+	if !confReady {
+		t.Fatalf("timed out waiting for confidential stage2 ready")
 	}
+
+	turns3Follow := append(append([]map[string]any(nil), turns3...),
+		map[string]any{"role": "assistant", "content": "Answer."},
+		map[string]any{"role": "user", "content": "Follow-up non-confidential turn."},
+	)
+	body3Pub := makeCompTestBody("Public system", turns3Follow)
+	an3Pub, _ := r3.analyzeChatBody(body3Pub)
+	resPub := r3.compressor.MaybeCompress(body3Pub, an3Pub, nil, normCfg3, 24000, "local", false)
+	if !resPub.Compressed || resPub.CheckpointID == "" || resPub.CheckpointID == resConf.CheckpointID {
+		t.Fatalf("expected isolated public checkpoint != %s, got %+v", resConf.CheckpointID, resPub)
+	}
+	if strings.Contains(string(resPub.Body), "TOP_SECRET_CONFIDENTIAL_SYS") {
+		t.Fatalf("non-confidential caller leaked confidential Stage 2 summary: %s", string(resPub.Body))
+	}
+
+	// Even with an identical system prompt string, non-confidential must NOT reuse the confidential checkpoint.
+	body3PubSameSys := makeCompTestBody("System: TOP_SECRET_CONFIDENTIAL_SYS", turns3Follow)
+	an3PubSameSys, _ := r3.analyzeChatBody(body3PubSameSys)
+	resPubSameSys := r3.compressor.MaybeCompress(body3PubSameSys, an3PubSameSys, nil, normCfg3, 24000, "local", false)
+	if !resPubSameSys.Compressed || resPubSameSys.CheckpointID == resConf.CheckpointID || strings.Contains(string(resPubSameSys.Body), summaryHeaderMarker) {
+		t.Fatalf("non-confidential caller must not reuse confidential Stage 2 checkpoint %s, got %+v", resConf.CheckpointID, resPubSameSys)
+	}
+
+	// Distinct callerScope with identical non-confidential body creates a distinct checkpoint ID.
+	resCallerB := r3.compressor.MaybeCompressWithScope(body3Pub, an3Pub, nil, normCfg3, 24000, "local", false, "caller-B\x00internal")
+	if !resCallerB.Compressed || resCallerB.CheckpointID == "" || resCallerB.CheckpointID == resPub.CheckpointID || resCallerB.CheckpointID == resConf.CheckpointID {
+		t.Fatalf("expected distinct callerScope checkpoint, got %+v (pub=%s conf=%s)", resCallerB, resPub.CheckpointID, resConf.CheckpointID)
+	}
+
 	r3.compressor.gcAndSave()
 	r3.compressor.saveToDisk()
-	if diskAfter, err := os.ReadFile(persist3); err == nil {
-		if strings.Contains(string(diskAfter), res3a.CheckpointID) || strings.Contains(string(diskAfter), "TOP_SECRET_UPGRADED_SYS") {
-			t.Fatalf("upgraded confidential checkpoint must be scrubbed from disk, got %s", diskAfter)
+	diskPub, err := os.ReadFile(persist3)
+	if err != nil {
+		t.Fatalf("expected non-confidential checkpoints persisted to disk: %v", err)
+	}
+	if !strings.Contains(string(diskPub), resPub.CheckpointID) || strings.Contains(string(diskPub), resConf.CheckpointID) || strings.Contains(string(diskPub), "TOP_SECRET_CONFIDENTIAL_SYS") {
+		t.Fatalf("disk persistence mismatch: pub=%s conf=%s data=%s", resPub.CheckpointID, resConf.CheckpointID, diskPub)
+	}
+
+	// Directly upgrading resPub to confidential must scrub it from disk and redact List().
+	r3.compressor.upgradeConfidential(resPub.CheckpointID)
+	diskUpgraded, err := os.ReadFile(persist3)
+	if err == nil && strings.Contains(string(diskUpgraded), resPub.CheckpointID) {
+		t.Fatalf("expected upgraded checkpoint %s scrubbed from disk, got %s", resPub.CheckpointID, diskUpgraded)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected read error after upgradeConfidential: %v", err)
+	}
+	for _, item := range r3.compressor.List() {
+		if item.ID == resPub.CheckpointID {
+			if !item.Confidential || item.SummaryPreview != "" {
+				t.Fatalf("expected upgraded checkpoint confidential & redacted in List(), got %+v", item)
+			}
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unexpected error reading %s: %v", persist3, err)
 	}
 }
 
@@ -696,7 +729,7 @@ func TestStage2WarmupFilterAndTargetPurge(t *testing.T) {
 
 	// Verify local -> external target reload purges local checkpoints from memory and disk.
 	r.compressor.mu.Lock()
-	r.compressor.dirty = true
+	r.compressor.markDirtyLocked()
 	r.compressor.mu.Unlock()
 	r.compressor.saveToDisk()
 	if _, err := os.Stat(persistPath); err != nil {
@@ -1113,5 +1146,252 @@ func TestContextCompressCodexFindingsRegression(t *testing.T) {
 	}
 	if strings.Contains(string(resEF.Body), "SECRET_PROJECT_ALPHA") || !strings.Contains(string(resEF.Body), "{{") {
 		t.Fatalf("expected external Stage 2 checkpoint to keep placeholder masked (not restore local secret), got:\n%s", string(resEF.Body))
+	}
+}
+
+func TestContextCompressRound3CodexRegression(t *testing.T) {
+	// 1. Reject truncated summarizer completions (finish_reason=length) before installing them, keeping Stage 1 usable for retry.
+	var returnFull atomic.Bool
+	truncSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		fr := "length"
+		summary := "## 1. 用户目标\n- Partial truncated output only, cut mid-sentence without sections 2-5." + strings.Repeat(" partial", 12)
+		if returnFull.Load() {
+			fr = "stop"
+			summary = "## 1. 用户目标\n- Keep contract.\n\n## 2. 已落地的事实变更\n- Applied clean summary after retry.\n\n## 3. 未完成待办\n- None." + strings.Repeat(" ok", 8)
+		}
+		b, _ := json.Marshal(map[string]any{
+			"id": "trunc",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]string{"role": "assistant", "content": summary},
+				"finish_reason": fr,
+			}},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(b)
+	}))
+	defer truncSrv.Close()
+
+	ccTrunc := ContextCompressConfig{
+		Enabled:                true,
+		Stage2Enabled:          boolPtr(true),
+		Stage2Prewarm:          boolPtr(false),
+		Stage2MaxSummaryTokens: 256,
+		TriggerTokens:          1400,
+		Stage1TargetTokens:     600,
+		KeepRecentGroups:       2,
+		KeepRecentMinTokens:    20,
+		KeepRecentMaxTokens:    160,
+		AssistantMaxChars:      120,
+		UserPasteMaxChars:      120,
+	}
+	rTrunc := testCompressRouter(t, truncSrv.URL, filepath.Join(t.TempDir(), "trunc.json"), ccTrunc)
+	rTrunc.ensureLoops()
+	normTrunc := rTrunc.compressor.getCfg()
+
+	turns := []map[string]any{
+		{"role": "user", "content": "Rule: complete summary required."},
+		{"role": "assistant", "content": strings.Repeat("Detailed design block alpha. ", 90)},
+		{"role": "user", "content": strings.Repeat("Detailed user specification beta. ", 80)},
+		{"role": "assistant", "content": "Understood."},
+		{"role": "user", "content": "Proceed."},
+	}
+	body1 := makeCompTestBody("Sys.", turns)
+	an1, _ := rTrunc.analyzeChatBody(body1)
+	res1 := rTrunc.compressor.MaybeCompress(body1, an1, nil, normTrunc, 24000, "local", false)
+	if !res1.Compressed || res1.PendingJob == nil {
+		t.Fatalf("expected stage1 + pending job, got %+v", res1)
+	}
+	rTrunc.compressor.ScheduleStage2(res1.PendingJob)
+
+	deadline := time.Now().Add(4 * time.Second)
+	failedTrunc := false
+	for time.Now().Before(deadline) {
+		list := rTrunc.compressor.List()
+		if len(list) == 1 && list[0].Stage2Status == "failed" {
+			if !strings.Contains(list[0].Stage2Err, "truncated") || list[0].Stage != 1 {
+				t.Fatalf("expected failed stage2 due to truncation while preserving stage=1, got %+v", list[0])
+			}
+			failedTrunc = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !failedTrunc {
+		t.Fatalf("timed out waiting for truncated Stage 2 failure, got %+v", rTrunc.compressor.List())
+	}
+
+	// Next live request must still reuse frozen Stage 1 checkpoint.
+	body2 := makeCompTestBody("Sys.", append(append([]map[string]any{}, turns...),
+		map[string]any{"role": "assistant", "content": "Ack."},
+		map[string]any{"role": "user", "content": "Next turn while stage2 retrying."},
+	))
+	an2, _ := rTrunc.analyzeChatBody(body2)
+	res2 := rTrunc.compressor.MaybeCompress(body2, an2, nil, normTrunc, 24000, "local", false)
+	if !res2.Compressed || res2.Mode != "stage1" || res2.CheckpointID != res1.CheckpointID {
+		t.Fatalf("expected frozen stage1 fallback after truncated stage2, got %+v", res2)
+	}
+
+	// Expire retry cooldown, return finish_reason=stop, and verify Stage 2 succeeds.
+	rTrunc.compressor.mu.Lock()
+	rTrunc.compressor.checkpoints[res1.CheckpointID].Stage2FailedAt = time.Now().Add(-2 * stage2RetryCooldown)
+	rTrunc.compressor.mu.Unlock()
+	returnFull.Store(true)
+
+	resRetry := rTrunc.compressor.MaybeCompress(body2, an2, nil, normTrunc, 24000, "local", false)
+	if resRetry.PendingJob == nil {
+		t.Fatalf("expected retry PendingJob after cooldown expired, got %+v", resRetry)
+	}
+	rTrunc.compressor.ScheduleStage2(resRetry.PendingJob)
+
+	deadline = time.Now().Add(4 * time.Second)
+	readyAfterRetry := false
+	for time.Now().Before(deadline) {
+		list := rTrunc.compressor.List()
+		if len(list) == 1 && list[0].Stage == 2 && list[0].Stage2Status == "ready" {
+			readyAfterRetry = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !readyAfterRetry {
+		t.Fatalf("expected Stage 2 ready after retry with finish_reason=stop, got %+v", rTrunc.compressor.List())
+	}
+
+	// 2. Hot-reload local -> external cancels an in-flight waitForIdleBackend Stage 2 job without dispatching to the new external backend.
+	rHot := testCompressRouter(t, truncSrv.URL, filepath.Join(t.TempDir(), "hot.json"), ccTrunc)
+	rHot.ensureLoops()
+	resHot := rHot.compressor.MaybeCompress(body1, an1, nil, rHot.compressor.getCfg(), 24000, "local", false)
+	if !resHot.Compressed || resHot.PendingJob == nil {
+		t.Fatalf("expected stage1 + pending job on rHot, got %+v", resHot)
+	}
+	for _, b := range rHot.getBackends() {
+		b.activeReqs.Store(1) // Keep waitForIdleBackend waiting until reload cancels it.
+	}
+	rHot.compressor.ScheduleStage2(resHot.PendingJob)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if rHot.compressor.stage2Active.Load() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !rHot.compressor.stage2Active.Load() {
+		t.Fatalf("expected Stage 2 job active inside waitForIdleBackend")
+	}
+
+	var extChatHits atomic.Int32
+	extSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		extChatHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ext","choices":[{"index":0,"message":{"role":"assistant","content":"should never run"},"finish_reason":"stop"}]}`))
+	}))
+	defer extSrv.Close()
+
+	extCfg := rHot.getConfig()
+	extCfg.Backends = []BackendConfig{
+		{ID: "ext1", URL: extSrv.URL, Tier: 1, MaxContextTokens: 200000, MaxSafeInput: 180000, PromoteAt: 100000, SpeedScore: 100},
+	}
+	if err := rHot.apply("external", "", extCfg); err != nil {
+		t.Fatalf("rHot.apply external: %v", err)
+	}
+
+	deadline = time.Now().Add(1 * time.Second)
+	stopped := false
+	for time.Now().Before(deadline) {
+		if !rHot.compressor.stage2Active.Load() {
+			stopped = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !stopped {
+		t.Fatalf("expected in-flight local Stage 2 job to abort promptly on local->external reload")
+	}
+	if extChatHits.Load() != 0 {
+		t.Fatalf("aborted local Stage 2 job must NOT dispatch to new external backend (hits=%d)", extChatHits.Load())
+	}
+	if rem := rHot.compressor.List(); len(rem) != 0 {
+		t.Fatalf("expected 0 remaining local checkpoints after reload, got %+v", rem)
+	}
+
+	// 3. Serialize concurrent checkpoint snapshot + disk write operations (no .tmp race or resurrected state).
+	persistConc := filepath.Join(t.TempDir(), "concurrent-checkpoints.json")
+	ccConc := ccTrunc
+	ccConc.Stage2Enabled = boolPtr(false)
+	ccConc.PersistPath = persistConc
+	rConc := testCompressRouter(t, truncSrv.URL, persistConc, ccConc)
+	normConc := rConc.compressor.getCfg()
+
+	var wg sync.WaitGroup
+	var created atomic.Int32
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for iter := 0; iter < 15; iter++ {
+				tTurns := []map[string]any{
+					{"role": "user", "content": fmt.Sprintf("Worker %d iter %d rule", idx, iter)},
+					{"role": "assistant", "content": strings.Repeat("Long worker content analysis block ", 110)},
+					{"role": "user", "content": strings.Repeat("Worker detailed specification block ", 100)},
+					{"role": "assistant", "content": "Ack."},
+					{"role": "user", "content": "Continue."},
+				}
+				b := makeCompTestBody("Sys.", tTurns)
+				a, _ := rConc.analyzeChatBody(b)
+				res := rConc.compressor.MaybeCompress(b, a, nil, normConc, 24000, "local", false)
+				if res.CheckpointID != "" {
+					created.Add(1)
+				}
+				rConc.compressor.gcAndSave()
+				rConc.compressor.saveToDisk()
+				if res.CheckpointID != "" {
+					switch iter % 3 {
+					case 0:
+						rConc.compressor.upgradeConfidential(res.CheckpointID)
+					case 1:
+						_, _ = rConc.compressor.Delete(res.CheckpointID)
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	if created.Load() == 0 {
+		t.Fatalf("expected concurrent workers to create checkpoints")
+	}
+	beforeClearRaw, err := os.ReadFile(persistConc)
+	if err != nil {
+		t.Fatalf("expected persist file to exist before Clear(): %v", err)
+	}
+	var beforeClearList []ContextCheckpoint
+	if err := json.Unmarshal(beforeClearRaw, &beforeClearList); err != nil {
+		t.Fatalf("invalid JSON written by concurrent saves before Clear(): %v\nraw=%s", err, beforeClearRaw)
+	}
+
+	rConc.compressor.Clear()
+	rConc.compressor.gcAndSave()
+	rConc.compressor.saveToDisk()
+	finalRaw, err := os.ReadFile(persistConc)
+	if err != nil {
+		t.Fatalf("read concurrent persist file: %v", err)
+	}
+	var finalList []ContextCheckpoint
+	if err := json.Unmarshal(finalRaw, &finalList); err != nil {
+		t.Fatalf("invalid JSON written by concurrent saves: %v\nraw=%s", err, finalRaw)
+	}
+	if len(finalList) != 0 {
+		t.Fatalf("expected 0 checkpoints on disk after Clear(), got %d resurrected entries: %s", len(finalList), finalRaw)
 	}
 }

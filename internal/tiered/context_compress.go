@@ -134,6 +134,7 @@ type ContextCheckpoint struct {
 	ID               string            `json:"id"`
 	SessionRoot      string            `json:"session_root"`
 	OriginTarget     string            `json:"origin_target,omitempty"`
+	ScopeHash        string            `json:"scope_hash,omitempty"`
 	Confidential     bool              `json:"-"` // never persisted to disk
 	CutMsgIdx        int               `json:"cut_msg_idx"`
 	ArchivedMsgCount int               `json:"archived_msg_count"`
@@ -219,11 +220,17 @@ type ContextCompressor struct {
 	cfgMu sync.RWMutex
 	cfg   ContextCompressConfig
 
+	persistMu sync.Mutex // serializes snapshot + temp write + rename; lock order: persistMu -> mu
+
 	mu            sync.RWMutex
 	checkpoints   map[string]*ContextCheckpoint
 	bySessionRoot map[string][]*ContextCheckpoint
 	inFlightSess  map[string]bool
 	dirty         bool
+	dirtySeq      uint64
+
+	targetJobMu   sync.Mutex
+	nonExtAbortCh chan struct{}
 
 	loopMu     sync.Mutex
 	loopCancel context.CancelFunc
@@ -247,6 +254,7 @@ func newContextCompressor(cfg ContextCompressConfig, router *Router) *ContextCom
 		checkpoints:   make(map[string]*ContextCheckpoint),
 		bySessionRoot: make(map[string][]*ContextCheckpoint),
 		inFlightSess:  make(map[string]bool),
+		nonExtAbortCh: make(chan struct{}),
 		jobCh:         make(chan *stage2Job, 16),
 	}
 	cm.loadFromDisk(cfg.PersistPath)
@@ -276,10 +284,52 @@ func (cm *ContextCompressor) applyConfig(next ContextCompressConfig) {
 	}
 }
 
+func (cm *ContextCompressor) markDirtyLocked() {
+	cm.dirty = true
+	cm.dirtySeq++
+}
+
+func (cm *ContextCompressor) checkJobTrustBoundary(job *stage2Job) (string, error) {
+	routerTarget := cm.router.getTarget()
+	if routerTarget != "local" && (job.confidential || normalizeOriginTarget(job.originTarget) != "external") {
+		return routerTarget, errors.New("trust boundary changed: non-external checkpoint cannot run on external target")
+	}
+	return routerTarget, nil
+}
+
+func (cm *ContextCompressor) hasCheckpoint(id string) bool {
+	cm.mu.RLock()
+	_, ok := cm.checkpoints[id]
+	cm.mu.RUnlock()
+	return ok
+}
+
+func (cm *ContextCompressor) purgeCheckpointOnBoundaryChange(job *stage2Job) {
+	shouldSave := false
+	cm.mu.Lock()
+	if cur, ok := cm.checkpoints[job.checkpointID]; ok {
+		delete(cm.checkpoints, job.checkpointID)
+		cm.rebuildSessionIndexLocked()
+		if !cur.Confidential {
+			cm.markDirtyLocked()
+			shouldSave = true
+		}
+	}
+	cm.mu.Unlock()
+	if shouldSave {
+		cm.saveToDisk()
+	}
+}
+
 func (cm *ContextCompressor) enforceTarget(routerTarget string) {
 	if routerTarget == "local" {
 		return
 	}
+	cm.targetJobMu.Lock()
+	close(cm.nonExtAbortCh)
+	cm.nonExtAbortCh = make(chan struct{})
+	cm.targetJobMu.Unlock()
+
 	cm.mu.Lock()
 	removedPersisted := 0
 	for id, cp := range cm.checkpoints {
@@ -292,7 +342,7 @@ func (cm *ContextCompressor) enforceTarget(routerTarget string) {
 	}
 	if removedPersisted > 0 {
 		cm.rebuildSessionIndexLocked()
-		cm.dirty = true
+		cm.markDirtyLocked()
 	} else {
 		cm.rebuildSessionIndexLocked()
 	}
@@ -353,7 +403,7 @@ func (cm *ContextCompressor) ScheduleStage2(job *stage2Job) {
 	cm.mu.Lock()
 	if cp, ok := cm.checkpoints[job.checkpointID]; ok && job.confidential && !cp.Confidential {
 		cp.Confidential = true
-		cm.dirty = true
+		cm.markDirtyLocked()
 		upgraded = true
 	}
 	if cm.inFlightSess[job.sessionRoot] {
@@ -412,6 +462,21 @@ func (cm *ContextCompressor) MaybeCompress(
 	originTarget string,
 	confidential bool,
 ) CompressResult {
+	return cm.MaybeCompressWithScope(body, rawAn, headers, cfg, heavyMissThreshold, originTarget, confidential, "")
+}
+
+// MaybeCompressWithScope behaves like MaybeCompress while scoping checkpoints by
+// confidential status, caller scope, and canonical system messages.
+func (cm *ContextCompressor) MaybeCompressWithScope(
+	body []byte,
+	rawAn *RequestAnalysis,
+	headers http.Header,
+	cfg ContextCompressConfig,
+	heavyMissThreshold int,
+	originTarget string,
+	confidential bool,
+	callerScope string,
+) CompressResult {
 	res := CompressResult{
 		Body:           body,
 		Mode:           "none",
@@ -465,8 +530,12 @@ func (cm *ContextCompressor) MaybeCompress(
 		return res
 	}
 
+	sysMsgs := msgs[:sysEnd]
+	scopeHash := computeCheckpointScopeHash(originTarget, confidential, callerScope, sysMsgs)
+	hashSeed := "body-v2|" + scopeHash
+
 	// O(1) session root check when below trigger threshold
-	sessionRoot := computeSingleBodyHash("body-v1", msgs[sysEnd])
+	sessionRoot := computeSingleBodyHash(hashSeed, msgs[sysEnd])
 	cm.mu.RLock()
 	hasSessionCP := len(cm.bySessionRoot[sessionRoot]) > 0
 	cm.mu.RUnlock()
@@ -476,22 +545,24 @@ func (cm *ContextCompressor) MaybeCompress(
 		return res
 	}
 
-	// Compute cumulative body hashes [sysEnd..len(msgs)-1] (excluding system & tools)
-	bodyHashes := computeBodyHashes(msgs, sysEnd)
+	// Compute cumulative body hashes [sysEnd..len(msgs)-1] seeded with caller/security scope + system messages.
+	bodyHashes := computeBodyHashes(hashSeed, msgs, sysEnd)
 
-	// 1. Check for deepest matching existing checkpoint (longest prefix match within trust boundary)
+	// 1. Check for deepest matching existing checkpoint (longest prefix match within trust & caller boundary)
 	var matchedCP *ContextCheckpoint
 	matchedCutIdx := -1
 	if hasSessionCP {
 		cm.mu.RLock()
 		for i := len(msgs) - 1; i >= sysEnd; i-- {
 			if cp, ok := cm.checkpoints[bodyHashes[i]]; ok {
-				if originTarget != "local" && (cp.Confidential || normalizeOriginTarget(cp.OriginTarget) != "external") {
+				if cp.Confidential != confidential {
 					continue
 				}
-				if !confidential && cp.Confidential {
-					// Keep confidentiality taint isolated if caller is non-confidential; treat as usable in-memory on local only?
-					// Wait: keep strict separation so non-confidential session or checkpoint cannot mix with confidential history unless confidential flag remains true.
+				if cp.ScopeHash != scopeHash {
+					continue
+				}
+				if originTarget != "local" && (cp.Confidential || normalizeOriginTarget(cp.OriginTarget) != "external") {
+					continue
 				}
 				cpCopy := *cp
 				matchedCP = &cpCopy
@@ -502,7 +573,6 @@ func (cm *ContextCompressor) MaybeCompress(
 		cm.mu.RUnlock()
 	}
 
-	sysMsgs := msgs[:sysEnd]
 	toolsRaw := top["tools"]
 	toolsEst := estimateToolsTokens(toolsRaw)
 	sysEst := estimateMessagesTokens(sysMsgs)
@@ -543,7 +613,7 @@ func (cm *ContextCompressor) MaybeCompress(
 					return res
 				}
 			} else {
-				return cm.compressAndRegister(body, top, msgs, sysEnd, bodyHashes, sessionRoot, rawAn,
+				return cm.compressAndRegister(body, top, msgs, sysEnd, bodyHashes, sessionRoot, scopeHash, rawAn,
 					sysMsgs, toolsRaw, extraOpts, model, sysEst, toolsEst,
 					cfg, heavyMissThreshold, originTarget, effectiveConfidential,
 					matchedCP, injected, tailMsgs, matchedCutIdx+1)
@@ -592,7 +662,7 @@ func (cm *ContextCompressor) MaybeCompress(
 					return res
 				}
 			} else {
-				return cm.compressAndRegister(body, top, msgs, sysEnd, bodyHashes, sessionRoot, rawAn,
+				return cm.compressAndRegister(body, top, msgs, sysEnd, bodyHashes, sessionRoot, scopeHash, rawAn,
 					sysMsgs, toolsRaw, extraOpts, model, sysEst, toolsEst,
 					cfg, heavyMissThreshold, originTarget, effectiveConfidential,
 					matchedCP, matchedCP.Stage1Msgs, tailMsgs, matchedCutIdx+1)
@@ -636,7 +706,7 @@ func (cm *ContextCompressor) MaybeCompress(
 		return res
 	}
 
-	return cm.compressAndRegister(body, top, msgs, sysEnd, bodyHashes, sessionRoot, rawAn,
+	return cm.compressAndRegister(body, top, msgs, sysEnd, bodyHashes, sessionRoot, scopeHash, rawAn,
 		sysMsgs, toolsRaw, extraOpts, model, sysEst, toolsEst,
 		cfg, heavyMissThreshold, originTarget, confidential,
 		nil, nil, msgs[sysEnd:], sysEnd)
@@ -673,6 +743,7 @@ func (cm *ContextCompressor) compressAndRegister(
 	sysEnd int,
 	bodyHashes []string,
 	sessionRoot string,
+	scopeHash string,
 	rawAn *RequestAnalysis,
 	sysMsgs []json.RawMessage,
 	toolsRaw json.RawMessage,
@@ -773,6 +844,7 @@ func (cm *ContextCompressor) compressAndRegister(
 		ID:               cpID,
 		SessionRoot:      sessionRoot,
 		OriginTarget:     normalizeOriginTarget(originTarget),
+		ScopeHash:        scopeHash,
 		Confidential:     effectiveConfidential,
 		CutMsgIdx:        origCutIdx,
 		ArchivedMsgCount: archivedCount,
@@ -1570,6 +1642,23 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 		cm.mu.Unlock()
 	}()
 
+	jobCtx := ctx
+	if job.confidential || normalizeOriginTarget(job.originTarget) != "external" {
+		cm.targetJobMu.Lock()
+		abortCh := cm.nonExtAbortCh
+		cm.targetJobMu.Unlock()
+		var jobCancel context.CancelFunc
+		jobCtx, jobCancel = context.WithCancel(ctx)
+		defer jobCancel()
+		go func() {
+			select {
+			case <-abortCh:
+				jobCancel()
+			case <-jobCtx.Done():
+			}
+		}()
+	}
+
 	if job.deferAfterLive {
 		delay := 1500 * time.Millisecond
 		if ns := cm.deferAfterLiveDelay.Load(); ns < 0 {
@@ -1580,28 +1669,26 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 		if delay > 0 {
 			t := time.NewTimer(delay)
 			select {
-			case <-ctx.Done():
+			case <-jobCtx.Done():
 				t.Stop()
-				cm.resetPendingStage2Status(job.checkpointID)
+				if ctx.Err() == nil {
+					cm.purgeCheckpointOnBoundaryChange(job)
+				} else {
+					cm.resetPendingStage2Status(job.checkpointID)
+				}
 				return
 			case <-t.C:
 			}
 		}
 	}
 
-	routerTarget := cm.router.getTarget()
-	if routerTarget != "local" && (job.confidential || normalizeOriginTarget(job.originTarget) != "external") {
-		cm.mu.Lock()
-		if cur, ok := cm.checkpoints[job.checkpointID]; ok {
-			delete(cm.checkpoints, job.checkpointID)
-			cm.rebuildSessionIndexLocked()
-			if !cur.Confidential {
-				cm.dirty = true
-			}
-		}
-		cm.mu.Unlock()
-		cm.saveToDisk()
+	routerTarget, bErr := cm.checkJobTrustBoundary(job)
+	if bErr != nil {
+		cm.purgeCheckpointOnBoundaryChange(job)
 		cm.router.log.Warn("stage2 skipped: trust boundary mismatch", "provider", cm.router.name, "id", shortID(job.checkpointID))
+		return
+	}
+	if !cm.hasCheckpoint(job.checkpointID) {
 		return
 	}
 
@@ -1614,7 +1701,7 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 	if cp, ok := cm.checkpoints[job.checkpointID]; ok {
 		if job.confidential && !cp.Confidential {
 			cp.Confidential = true
-			cm.dirty = true
+			cm.markDirtyLocked()
 			upgradedOnStart = true
 		}
 		cp.Stage2Status = "running"
@@ -1634,12 +1721,19 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 		if job.confidential && (routerTarget != "local" || !config.IsLoopbackURL(sumURL)) {
 			err = errors.New("confidential checkpoint cannot use external summarizer")
 		} else {
-			summaryText, redactedChanged, err = cm.callExternalSummarizer(ctx, cfg, job)
+			summaryText, redactedChanged, err = cm.callExternalSummarizer(jobCtx, cfg, job)
 		}
 	} else {
-		backend := cm.waitForIdleBackend(ctx, cfg, job.sourceEstTokens, job.confidential)
+		backend := cm.waitForIdleBackend(jobCtx, cfg, job)
 		if backend == nil {
-			if ctx.Err() != nil {
+			if _, bErr := cm.checkJobTrustBoundary(job); bErr != nil {
+				cm.purgeCheckpointOnBoundaryChange(job)
+				return
+			}
+			if !cm.hasCheckpoint(job.checkpointID) {
+				return
+			}
+			if jobCtx.Err() != nil {
 				cm.resetPendingStage2Status(job.checkpointID)
 				return
 			}
@@ -1647,19 +1741,26 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 		} else {
 			bCfg := backend.config()
 			usedBackend = bCfg.ID
-			summaryText, redactedChanged, err = cm.callClusterSummarizer(ctx, cfg, job, backend)
+			summaryText, redactedChanged, err = cm.callClusterSummarizer(jobCtx, cfg, job, backend)
 		}
 	}
 
 	durMs := time.Since(start).Milliseconds()
 	if err != nil {
+		if _, bErr := cm.checkJobTrustBoundary(job); bErr != nil {
+			cm.purgeCheckpointOnBoundaryChange(job)
+			return
+		}
+		if !cm.hasCheckpoint(job.checkpointID) {
+			return
+		}
 		cm.totalStage2Fail.Add(1)
 		upgradedOnErr := false
 		cm.mu.Lock()
 		if cp, ok := cm.checkpoints[job.checkpointID]; ok {
 			if job.confidential && !cp.Confidential {
 				cp.Confidential = true
-				cm.dirty = true
+				cm.markDirtyLocked()
 				upgradedOnErr = true
 			}
 			cp.Stage2Status = "failed"
@@ -1667,7 +1768,7 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 			cp.Stage2Ms = durMs
 			cp.Stage2FailedAt = time.Now()
 			if !cp.Confidential {
-				cm.dirty = true
+				cm.markDirtyLocked()
 			}
 		}
 		cm.mu.Unlock()
@@ -1675,6 +1776,15 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 			cm.saveToDisk()
 		}
 		cm.router.log.Warn("context compress stage2 failed", "provider", cm.router.name, "id", shortID(job.checkpointID), "backend", usedBackend, "ms", durMs, "err", err)
+		return
+	}
+
+	routerTarget, bErr = cm.checkJobTrustBoundary(job)
+	if bErr != nil {
+		cm.purgeCheckpointOnBoundaryChange(job)
+		return
+	}
+	if !cm.hasCheckpoint(job.checkpointID) {
 		return
 	}
 
@@ -1699,11 +1809,26 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 			SummaryText:      summaryText,
 		}
 		injected := buildStage2InjectedMessages(tmpCP, job.nextMsgRole)
-		prewarmPrompt, prewarmCached = cm.prewarmStage2Checkpoint(ctx, job, injected)
+		prewarmPrompt, prewarmCached = cm.prewarmStage2Checkpoint(jobCtx, job, injected)
 	}
 
 	shouldPersist := false
 	cm.mu.Lock()
+	if _, bErr := cm.checkJobTrustBoundary(job); bErr != nil {
+		if cur, ok := cm.checkpoints[job.checkpointID]; ok {
+			delete(cm.checkpoints, job.checkpointID)
+			cm.rebuildSessionIndexLocked()
+			if !cur.Confidential {
+				cm.markDirtyLocked()
+				shouldPersist = true
+			}
+		}
+		cm.mu.Unlock()
+		if shouldPersist {
+			cm.saveToDisk()
+		}
+		return
+	}
 	if cp, ok := cm.checkpoints[job.checkpointID]; ok {
 		wasNonConfidential := !cp.Confidential
 		if job.confidential && !cp.Confidential {
@@ -1721,7 +1846,7 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 		cp.PrewarmCached = prewarmCached
 		cp.Stage1Msgs = nil
 		if !cp.Confidential || (wasNonConfidential && cp.Confidential) {
-			cm.dirty = true
+			cm.markDirtyLocked()
 			shouldPersist = true
 		}
 	}
@@ -1735,14 +1860,20 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 		"orig", job.originalTokens, "summary_est", summaryEst, "prewarm_cached", prewarmCached, "prewarm_prompt", prewarmPrompt, "ms", durMs)
 }
 
-func (cm *ContextCompressor) waitForIdleBackend(ctx context.Context, cfg ContextCompressConfig, estTokens int, confidential bool) *BackendState {
-	need := estTokens + cfg.Stage2MaxSummaryTokens*2 + 2048
+func (cm *ContextCompressor) waitForIdleBackend(ctx context.Context, cfg ContextCompressConfig, job *stage2Job) *BackendState {
+	need := job.sourceEstTokens + cfg.Stage2MaxSummaryTokens*2 + 2048
 	deadline := time.Now().Add(60 * time.Second)
 	poll := 2 * time.Second
 	if ns := cm.idlePollInterval.Load(); ns > 0 {
 		poll = time.Duration(ns)
 	}
 	for {
+		if _, err := cm.checkJobTrustBoundary(job); err != nil {
+			return nil
+		}
+		if !cm.hasCheckpoint(job.checkpointID) {
+			return nil
+		}
 		for _, b := range cm.router.getBackends() {
 			if !b.healthy.Load() {
 				continue
@@ -1751,10 +1882,13 @@ func (cm *ContextCompressor) waitForIdleBackend(ctx context.Context, cfg Context
 				continue
 			}
 			bCfg := b.config()
-			if confidential && !config.IsLoopbackURL(bCfg.URL) {
+			if job.confidential && !config.IsLoopbackURL(bCfg.URL) {
 				continue
 			}
 			if need <= bCfg.MaxContextTokens {
+				if _, err := cm.checkJobTrustBoundary(job); err != nil {
+					return nil
+				}
 				return b
 			}
 		}
@@ -1866,6 +2000,13 @@ func (cm *ContextCompressor) callClusterSummarizer(parentCtx context.Context, cf
 	req.Header.Set("User-Agent", "dsv41-smart-router-compressor/1.0")
 	if apiKey := cm.router.getAPIKey(); apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	if _, err := cm.checkJobTrustBoundary(job); err != nil {
+		return "", redactedChanged, err
+	}
+	if job.confidential && !config.IsLoopbackURL(bCfg.URL) {
+		return "", redactedChanged, errors.New("confidential checkpoint cannot dispatch to non-loopback backend")
 	}
 
 	backend.activeReqs.Add(1)
@@ -1989,6 +2130,10 @@ func (cm *ContextCompressor) callExternalSummarizer(parentCtx context.Context, c
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
+	if _, err := cm.checkJobTrustBoundary(job); err != nil {
+		return "", redactedChanged, err
+	}
+
 	resp, err := cm.router.transport.RoundTrip(req)
 	if err != nil {
 		return "", redactedChanged, err
@@ -2003,6 +2148,9 @@ func (cm *ContextCompressor) callExternalSummarizer(parentCtx context.Context, c
 }
 
 func (cm *ContextCompressor) prewarmStage2Checkpoint(parentCtx context.Context, job *stage2Job, injected []json.RawMessage) (int, int) {
+	if _, err := cm.checkJobTrustBoundary(job); err != nil || !cm.hasCheckpoint(job.checkpointID) {
+		return 0, 0
+	}
 	estTok := estimateMessagesTokens(job.sysMsgs) + estimateToolsTokens(job.tools) + estimateMessagesTokens(injected) + 32
 	var backend *BackendState
 	for _, b := range cm.router.getBackends() {
@@ -2071,6 +2219,13 @@ func (cm *ContextCompressor) prewarmStage2Checkpoint(parentCtx context.Context, 
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
+	if _, err := cm.checkJobTrustBoundary(job); err != nil || !cm.hasCheckpoint(job.checkpointID) {
+		return 0, 0
+	}
+	if job.confidential && !config.IsLoopbackURL(bCfg.URL) {
+		return 0, 0
+	}
+
 	backend.activeReqs.Add(1)
 	resp, err := cm.router.transport.RoundTrip(req)
 	var respBody []byte
@@ -2090,7 +2245,8 @@ func (cm *ContextCompressor) prewarmStage2Checkpoint(parentCtx context.Context, 
 func extractAssistantContentFromResponse(respBody []byte) (string, error) {
 	var parsed struct {
 		Choices []struct {
-			Message struct {
+			FinishReason *string `json:"finish_reason"`
+			Message      struct {
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
@@ -2100,6 +2256,17 @@ func extractAssistantContentFromResponse(respBody []byte) (string, error) {
 	}
 	if len(parsed.Choices) == 0 {
 		return "", fmt.Errorf("empty choices in summarizer response")
+	}
+	fr := ""
+	if parsed.Choices[0].FinishReason != nil {
+		fr = strings.ToLower(strings.TrimSpace(*parsed.Choices[0].FinishReason))
+	}
+	switch fr {
+	case "stop", "end_turn", "eos":
+	case "length", "max_tokens", "model_context_window_exceeded":
+		return "", fmt.Errorf("summarizer completion truncated by token limit (finish_reason=%q)", fr)
+	default:
+		return "", fmt.Errorf("incomplete summarizer completion (finish_reason=%q)", fr)
 	}
 	content := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	if len(content) < 60 {
@@ -2218,6 +2385,25 @@ func canonicalizeBodyMsg(raw json.RawMessage) []byte {
 	return compactJSONBytes(enc)
 }
 
+func computeCheckpointScopeHash(originTarget string, confidential bool, callerScope string, sysMsgs []json.RawMessage) string {
+	h := sha256.New()
+	h.Write([]byte("scope-v1|"))
+	h.Write([]byte(normalizeOriginTarget(originTarget)))
+	h.Write([]byte("|"))
+	if confidential {
+		h.Write([]byte("conf|"))
+	} else {
+		h.Write([]byte("pub|"))
+	}
+	h.Write([]byte(callerScope))
+	h.Write([]byte("|"))
+	for _, sm := range sysMsgs {
+		h.Write(canonicalizeBodyMsg(sm))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
 func computeSingleBodyHash(prev string, raw json.RawMessage) string {
 	h := sha256.New()
 	h.Write([]byte(prev))
@@ -2226,9 +2412,9 @@ func computeSingleBodyHash(prev string, raw json.RawMessage) string {
 	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
-func computeBodyHashes(msgs []json.RawMessage, sysEnd int) []string {
+func computeBodyHashes(seed string, msgs []json.RawMessage, sysEnd int) []string {
 	hashes := make([]string, len(msgs))
-	prev := "body-v1"
+	prev := seed
 	for i := sysEnd; i < len(msgs); i++ {
 		prev = computeSingleBodyHash(prev, msgs[i])
 		hashes[i] = prev
@@ -2341,7 +2527,7 @@ func (cm *ContextCompressor) upgradeConfidential(id string) {
 	cm.mu.Lock()
 	if cp, ok := cm.checkpoints[id]; ok && !cp.Confidential {
 		cp.Confidential = true
-		cm.dirty = true
+		cm.markDirtyLocked()
 		upgraded = true
 	}
 	cm.mu.Unlock()
@@ -2380,7 +2566,7 @@ func (cm *ContextCompressor) upsertCheckpoint(cp *ContextCheckpoint) {
 	cm.checkpoints[cp.ID] = cp
 	cm.trimLocked(cfg)
 	if !cp.Confidential || upgraded {
-		cm.dirty = true
+		cm.markDirtyLocked()
 	}
 	cm.mu.Unlock()
 	if upgraded {
@@ -2394,7 +2580,7 @@ func (cm *ContextCompressor) touchCheckpoint(id string) {
 		cp.Hits++
 		cp.LastUsed = time.Now()
 		if !cp.Confidential {
-			cm.dirty = true
+			cm.markDirtyLocked()
 		}
 	}
 	cm.mu.Unlock()
@@ -2434,7 +2620,7 @@ func (cm *ContextCompressor) trimLocked(cfg ContextCompressConfig) {
 		cm.rebuildSessionIndexLocked()
 	}
 	if changedPersisted {
-		cm.dirty = true
+		cm.markDirtyLocked()
 	}
 }
 
@@ -2450,6 +2636,9 @@ func (cm *ContextCompressor) loadFromDisk(path string) {
 	if path == "" {
 		return
 	}
+	cm.persistMu.Lock()
+	defer cm.persistMu.Unlock()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -2480,22 +2669,30 @@ func (cm *ContextCompressor) loadFromDisk(path string) {
 	}
 	cm.rebuildSessionIndexLocked()
 	if dropped > 0 {
-		cm.dirty = true
+		cm.markDirtyLocked()
 	}
 	count := len(cm.checkpoints)
 	cm.mu.Unlock()
 	if dropped > 0 {
-		cm.saveToPath(path)
+		cm.saveToPathLocked(path)
 	}
 	cm.router.log.Info("loaded context checkpoints", "provider", cm.router.name, "count", count, "path", path)
 }
 
 func (cm *ContextCompressor) gcAndSave() {
 	cfg := cm.getCfg()
+	if cfg.PersistPath == "" {
+		cm.mu.Lock()
+		cm.trimLocked(cfg)
+		cm.mu.Unlock()
+		return
+	}
+	cm.persistMu.Lock()
+	defer cm.persistMu.Unlock()
 	cm.mu.Lock()
 	cm.trimLocked(cfg)
 	cm.mu.Unlock()
-	cm.saveToPath(cfg.PersistPath)
+	cm.saveToPathLocked(cfg.PersistPath)
 }
 
 func (cm *ContextCompressor) saveToDisk() {
@@ -2506,6 +2703,15 @@ func (cm *ContextCompressor) saveToPath(path string) {
 	if path == "" {
 		return
 	}
+	cm.persistMu.Lock()
+	defer cm.persistMu.Unlock()
+	cm.saveToPathLocked(path)
+}
+
+func (cm *ContextCompressor) saveToPathLocked(path string) {
+	if path == "" {
+		return
+	}
 	cfg := cm.getCfg()
 	cm.mu.Lock()
 	if !cm.dirty {
@@ -2513,6 +2719,7 @@ func (cm *ContextCompressor) saveToPath(path string) {
 		return
 	}
 	cm.trimLocked(cfg)
+	seq := cm.dirtySeq
 	list := make([]*ContextCheckpoint, 0, len(cm.checkpoints))
 	for _, cp := range cm.checkpoints {
 		if cp.Confidential {
@@ -2522,11 +2729,19 @@ func (cm *ContextCompressor) saveToPath(path string) {
 		copyCP.Stage1Msgs = cloneRawMessages(cp.Stage1Msgs)
 		list = append(list, &copyCP)
 	}
-	cm.dirty = false
 	cm.mu.Unlock()
+
+	clearDirtyIfUnchanged := func() {
+		cm.mu.Lock()
+		if cm.dirtySeq == seq {
+			cm.dirty = false
+		}
+		cm.mu.Unlock()
+	}
 
 	if len(list) == 0 {
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			clearDirtyIfUnchanged()
 			return
 		}
 	}
@@ -2547,7 +2762,9 @@ func (cm *ContextCompressor) saveToPath(path string) {
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		cm.router.log.Warn("context checkpoints rename failed", "provider", cm.router.name, "path", path, "err", err)
+		return
 	}
+	clearDirtyIfUnchanged()
 }
 
 func (cm *ContextCompressor) Summary() map[string]any {
@@ -2639,7 +2856,7 @@ func (cm *ContextCompressor) Delete(id string) (string, error) {
 			deleted = k
 			cm.rebuildSessionIndexLocked()
 			if !wasConf {
-				cm.dirty = true
+				cm.markDirtyLocked()
 			}
 			break
 		}
@@ -2667,7 +2884,7 @@ func (cm *ContextCompressor) Clear() int {
 	cm.checkpoints = make(map[string]*ContextCheckpoint)
 	cm.bySessionRoot = make(map[string][]*ContextCheckpoint)
 	if hadNonConf {
-		cm.dirty = true
+		cm.markDirtyLocked()
 	}
 	cm.mu.Unlock()
 	if hadNonConf {

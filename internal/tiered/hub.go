@@ -24,8 +24,9 @@ import (
 type ctxKey int
 
 const (
-	dataClassCtxKey ctxKey = 1
-	routeMetaCtxKey ctxKey = 2
+	dataClassCtxKey   ctxKey = 1
+	routeMetaCtxKey   ctxKey = 2
+	callerScopeCtxKey ctxKey = 3
 )
 
 // RouteMeta records the final backend and routing reason across keepalive failovers.
@@ -82,6 +83,20 @@ func dataClassFromContext(ctx context.Context) string {
 // DataClassFromContext returns the Gatehouse data classification stored on ctx, if any.
 func DataClassFromContext(ctx context.Context) string {
 	return dataClassFromContext(ctx)
+}
+
+// WithCallerScope attaches an opaque caller/security scope key so context
+// compression checkpoints never cross caller or classification boundaries.
+func WithCallerScope(ctx context.Context, scope string) context.Context {
+	if scope == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, callerScopeCtxKey, scope)
+}
+
+func callerScopeFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(callerScopeCtxKey).(string)
+	return v
 }
 
 // Hub owns one Router per tiered-configured provider and manages lifecycle across config reloads.
@@ -505,10 +520,11 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 	var compRes CompressResult
 	compEnabled := t.plan.cfg.ContextCompress != nil && t.plan.cfg.ContextCompress.Enabled
 	if compEnabled && r != nil && r.compressor != nil {
-		compRes = r.compressor.MaybeCompress(
+		compRes = r.compressor.MaybeCompressWithScope(
 			body, rawAn, req.Header, *t.plan.cfg.ContextCompress,
 			t.plan.cfg.HeavyMissThreshold, t.plan.target,
 			dataClassFromContext(req.Context()) == "confidential",
+			callerScopeFromContext(req.Context()),
 		)
 		if compRes.Compressed && len(compRes.Body) > 0 {
 			effectiveBody = compRes.Body
