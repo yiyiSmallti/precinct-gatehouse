@@ -43,6 +43,14 @@ type statsSlice struct {
 	AvgLatencyMS     float64 `json:"avg_latency_ms"`
 }
 
+// localHour returns the start of t's local wall-clock hour. time.Truncate
+// rounds absolute time, which lands on :30 or :45 in zones such as
+// Asia/Kolkata, while SQL buckets requests by local hour.
+func localHour(t time.Time) time.Time {
+	t = t.Local()
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
+}
+
 // effectiveModelExpr names the model a log row is attributed to. Requests
 // rejected before routing (quota, permission) have no upstream model but keep
 // requested_model; ranking and filtering must use the same expression so that
@@ -62,7 +70,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request, _ string) {
 	hourly := days == 1
 	var start time.Time
 	if hourly {
-		start = now.Truncate(time.Hour).Add(-23 * time.Hour)
+		start = localHour(now).Add(-23 * time.Hour)
 	} else {
 		start = time.Date(now.Year(), now.Month(), now.Day()-days+1, 0, 0, 0, 0, now.Location())
 	}

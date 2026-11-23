@@ -41,7 +41,7 @@ routing_groups:
 
 // startGatewayLogFile starts serve with stdout in a file, so the test can read
 // the one-time setup code while the process is still running.
-func startGatewayLogFile(t *testing.T, dir, cfg, adminBase string) (*Gateway, string) {
+func startGatewayLogFile(t *testing.T, dir, cfg, adminBase string, env ...string) (*Gateway, string) {
 	t.Helper()
 	addr := freePort(t)
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(strings.ReplaceAll(cfg, "{{LISTEN}}", addr)), 0o600); err != nil {
@@ -56,6 +56,9 @@ func startGatewayLogFile(t *testing.T, dir, cfg, adminBase string) (*Gateway, st
 	g := &Gateway{Dir: dir, URL: "http://" + addr + "/v1", log: &bytes.Buffer{}}
 	g.cmd = exec.Command(gatehouse, "serve", "--config", filepath.Join(dir, "config.yaml"))
 	g.cmd.Stdout, g.cmd.Stderr = lf, lf
+	if len(env) > 0 {
+		g.cmd.Env = append(os.Environ(), env...)
+	}
 	if err := g.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -243,9 +246,31 @@ func TestG13TokenQuota(t *testing.T) {
 	rep.Check("控制台保存常规参数后 OTLP headers 不丢失", st == 200 && strings.Contains(string(saved), "X-Collector-Tenant: g13-e2e") && strings.Contains(string(saved), "max_body_mb: 16"),
 		"status=%d headers_kept=%v", st, strings.Contains(string(saved), "X-Collector-Tenant"))
 
-	// 6. Restart: the ledger keeps the total quota enforced.
+	// 6. Restart: the ledger keeps the total quota enforced. The restarted
+	// gateway runs in a +05:45 zone, where hourly buckets must still align
+	// to the local wall-clock hour.
 	g.Stop()
-	g2, _ := startGatewayLogFile(t, dir, cfg, adminBase)
+	g2, _ := startGatewayLogFile(t, dir, cfg, adminBase, "TZ=Asia/Kathmandu")
+	_ = ask(g2, kDay, false)
+	jar2, _ := cookiejar.New(nil)
+	client = &http.Client{Jar: jar2}
+	st, _ = adm(http.MethodPost, "/admin/api/login", map[string]string{"username": "admin", "password": "setup-pass-1"})
+	_, statsK := adm(http.MethodGet, "/admin/api/stats?days=1", nil)
+	totalsK, _ := statsK["totals"].(map[string]any)
+	seriesK, _ := statsK["series"].([]any)
+	var seriesSum float64
+	lastLabel := ""
+	for _, b := range seriesK {
+		m, _ := b.(map[string]any)
+		v, _ := m["requests"].(float64)
+		seriesSum += v
+		lastLabel, _ = m["t"].(string)
+	}
+	wantLast := time.Now().In(mustLoc(t, "Asia/Kathmandu")).Format("2006-01-02 15:00")
+	rep.Check("非整点时区（UTC+05:45）24 小时序列按本地整点分桶，含当前小时且合计等于总数",
+		st == 200 && len(seriesK) == 24 && lastLabel == wantLast && seriesSum == totalsK["requests"],
+		"login=%d buckets=%d last=%s want=%s series_sum=%v totals=%v", st, len(seriesK), lastLabel, wantLast, seriesSum, totalsK["requests"])
+
 	s3 := ask(g2, kTot, false)
 	rep.Check("重启网关后累计配额仍生效 → 429", s3.Status == 429 && s3.ErrCode() == "token_quota_exceeded", "status=%d code=%s", s3.Status, s3.ErrCode())
 
@@ -253,4 +278,13 @@ func TestG13TokenQuota(t *testing.T) {
 	g2.CLI(t, "apikey", "update", kTotID, "--tokens-total", "0")
 	s4 := ask(g2, kTot, false)
 	rep.Check("CLI 把累计配额改为 0（不限）后恢复 200", s4.Status == 200, "status=%d", s4.Status)
+}
+
+func mustLoc(t *testing.T, name string) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return loc
 }

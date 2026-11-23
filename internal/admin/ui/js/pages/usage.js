@@ -111,7 +111,11 @@ export function renderUsage(container, ctx) {
     history.replaceState(null, '', `#/usage?${qs}`);
   };
 
+  // Only the latest load may render: a slower, superseded response must not
+  // overwrite figures for the filters now shown in the controls and URL.
+  let loadSeq = 0;
   const load = async () => {
+    const seq = ++loadSeq;
     bodyHost.classList.add('is-refetching');
     try {
       const params = { days };
@@ -121,6 +125,7 @@ export function renderUsage(container, ctx) {
         api.stats(params),
         keyOptions.length ? Promise.resolve(null) : api.listKeys().catch(() => null),
       ]);
+      if (seq !== loadSeq) return;
       data = stats;
       if (keysRes?.keys) keyOptions = keysRes.keys.map((k) => ({ id: k.id, name: k.name }));
       if (!modelFilter) {
@@ -132,9 +137,9 @@ export function renderUsage(container, ctx) {
       paintFilters();
       paint();
     } catch (e) {
-      if (e.status !== 401) toast(`读取统计失败: ${e.message}`, 'err');
+      if (seq === loadSeq && e.status !== 401) toast(`读取统计失败: ${e.message}`, 'err');
     } finally {
-      bodyHost.classList.remove('is-refetching');
+      if (seq === loadSeq) bodyHost.classList.remove('is-refetching');
     }
   };
 

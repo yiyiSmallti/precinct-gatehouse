@@ -266,7 +266,7 @@ func (s *Server) overview(w http.ResponseWriter, _ *http.Request, _ string) {
 	}
 
 	// 24 hourly buckets ending at current local hour.
-	curHour := now.Local().Truncate(time.Hour)
+	curHour := localHour(now)
 	startHour := curHour.Add(-23 * time.Hour)
 	type hourBucket struct {
 		Hour     string `json:"hour"`
