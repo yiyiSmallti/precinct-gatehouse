@@ -9,17 +9,33 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 )
 
+// ResponsesMeta is what DecodeResponses learns about a request besides the
+// Chat Completions body.
+type ResponsesMeta struct {
+	Model string
+	// DroppedTools are tool types the request declared that Chat Completions
+	// cannot carry.
+	DroppedTools []string
+	// DroppedItems are input item types that were skipped.
+	DroppedItems []string
+	// CustomTools names the `custom` (freeform) tools, which are sent as
+	// functions taking one `input` string; calls to them are turned back
+	// into custom_tool_call items.
+	CustomTools map[string]bool
+}
+
 // DecodeResponses translates an OpenAI /v1/responses JSON body into an OpenAI
-// Chat Completions request object, also returning the requested model and any
-// dropped non-function tool types.
-func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
+// Chat Completions request object.
+func DecodeResponses(body []byte) (oai.Object, ResponsesMeta, error) {
+	var meta ResponsesMeta
 	in, err := oai.Decode(body)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, meta, err
 	}
 	reqModel := oai.Str(in, "model")
+	meta.Model = reqModel
 	if prev := oai.Str(in, "previous_response_id"); prev != "" {
-		return nil, reqModel, nil, oai.Errorf(http.StatusBadRequest, "previous_response_not_supported", "previous_response_id is not supported")
+		return nil, meta, oai.Errorf(http.StatusBadRequest, "previous_response_not_supported", "previous_response_id is not supported")
 	}
 	out := oai.Object{"model": reqModel}
 
@@ -60,26 +76,32 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 				}
 				content := convertResponseInputContent(item["content"])
 				msgs = append(msgs, map[string]any{"role": role, "content": content})
-			case typ == "function_call":
+			case typ == "function_call" || typ == "custom_tool_call" || typ == "local_shell_call" || typ == "shell_call":
 				flushToolImages()
 				callID := oai.Str(item, "call_id")
 				if callID == "" {
 					callID = oai.Str(item, "id")
 				}
-				tc := map[string]any{
-					"id":   callID,
-					"type": "function",
-					"function": map[string]any{
-						"name":      oai.Str(item, "name"),
-						"arguments": oai.Str(item, "arguments"),
-					},
+				name, args := oai.Str(item, "name"), oai.Str(item, "arguments")
+				switch typ {
+				case "custom_tool_call":
+					args = string(oai.Encode(map[string]any{"input": oai.Str(item, "input")}))
+				case "local_shell_call", "shell_call":
+					name = strings.TrimSuffix(typ, "_call")
+					args = string(oai.Encode(item["action"]))
 				}
+				tc := map[string]any{
+					"id":       callID,
+					"type":     "function",
+					"function": map[string]any{"name": name, "arguments": args},
+				}
+				// calls follow the assistant text of the same turn: keep them
+				// in one assistant message
 				if len(msgs) > 0 {
 					if prev, ok := msgs[len(msgs)-1].(map[string]any); ok && oai.Str(prev, "role") == "assistant" {
-						if prevTCs, ok := prev["tool_calls"].([]any); ok {
-							prev["tool_calls"] = append(prevTCs, tc)
-							continue
-						}
+						prevTCs, _ := prev["tool_calls"].([]any)
+						prev["tool_calls"] = append(prevTCs, tc)
+						continue
 					}
 				}
 				msgs = append(msgs, map[string]any{
@@ -87,8 +109,11 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 					"content":    nil,
 					"tool_calls": []any{tc},
 				})
-			case typ == "function_call_output":
+			case typ == "function_call_output" || typ == "custom_tool_call_output" || typ == "local_shell_call_output" || typ == "shell_call_output":
 				callID := oai.Str(item, "call_id")
+				if callID == "" {
+					callID = oai.Str(item, "id")
+				}
 				text, images := splitToolOutput(item["output"])
 				if len(images) > 0 {
 					if text == "" {
@@ -110,8 +135,21 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 				}
 			case typ == "reasoning":
 				// dropped
+			case typ == "compaction":
+				// a compacted history: keep it when it has readable text
+				if txt := compactionText(item); txt != "" {
+					flushToolImages()
+					msgs = append(msgs, map[string]any{"role": "user", "content": compactionPrefix + txt})
+				} else {
+					meta.DroppedItems = appendUnique(meta.DroppedItems, typ)
+				}
+			case typ == "":
+				return nil, meta, oai.Errorf(http.StatusBadRequest, "unsupported_input_item", "input item has no type")
 			default:
-				return nil, reqModel, nil, oai.Errorf(http.StatusBadRequest, "unsupported_input_item", "unsupported input item type %q", typ)
+				// server-side tool calls (web_search_call, file_search_call,
+				// ...), item_reference and unknown items cannot be replayed
+				// statelessly; skip them instead of failing the session
+				meta.DroppedItems = appendUnique(meta.DroppedItems, typ)
 			}
 		}
 		flushToolImages()
@@ -131,6 +169,14 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 				continue
 			}
 			tt := oai.Str(t, "type")
+			if tt == "custom" {
+				if meta.CustomTools == nil {
+					meta.CustomTools = map[string]bool{}
+				}
+				meta.CustomTools[oai.Str(t, "name")] = true
+				chatTools = append(chatTools, customToolFunction(t))
+				continue
+			}
 			if tt != "function" {
 				if tt != "" {
 					dropped = append(dropped, tt)
@@ -158,7 +204,7 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 	case string:
 		out["tool_choice"] = tc
 	case map[string]any:
-		if oai.Str(tc, "type") == "function" {
+		if tt := oai.Str(tc, "type"); tt == "function" || tt == "custom" {
 			out["tool_choice"] = map[string]any{
 				"type":     "function",
 				"function": map[string]any{"name": oai.Str(tc, "name")},
@@ -207,7 +253,79 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 	} else if u := oai.Str(in, "user"); u != "" {
 		out["user"] = u
 	}
-	return out, reqModel, dropped, nil
+	meta.DroppedTools = dropped
+	return out, meta, nil
+}
+
+const compactionPrefix = "[Summary of the earlier conversation]\n"
+
+// compactionText returns the readable summary of a compaction item, if any;
+// encrypted_content is opaque and ignored.
+func compactionText(item map[string]any) string {
+	for _, k := range []string{"summary", "content", "text"} {
+		switch v := item[k].(type) {
+		case string:
+			if v != "" {
+				return v
+			}
+		case []any:
+			var parts []string
+			for _, it := range v {
+				if m, ok := it.(map[string]any); ok {
+					if t := oai.Str(m, "text"); t != "" {
+						parts = append(parts, t)
+					}
+				}
+			}
+			if len(parts) > 0 {
+				return strings.Join(parts, "\n")
+			}
+		}
+	}
+	return ""
+}
+
+// customToolFunction turns a `custom` (freeform) tool into a function with a
+// single string argument `input`, describing the expected input format.
+func customToolFunction(t map[string]any) map[string]any {
+	desc := oai.Str(t, "description")
+	note := "Call this tool with the raw tool input as the `input` string argument."
+	if f, ok := t["format"].(map[string]any); ok && oai.Str(f, "type") == "grammar" {
+		note += " The input must follow this " + oai.Str(f, "syntax") + " grammar:\n" + oai.Str(f, "definition")
+	}
+	if desc != "" {
+		desc += "\n\n"
+	}
+	return map[string]any{"type": "function", "function": map[string]any{
+		"name":        oai.Str(t, "name"),
+		"description": desc + note,
+		"parameters": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"input": map[string]any{"type": "string"}},
+			"required":   []any{"input"},
+		},
+	}}
+}
+
+// customToolInput unwraps the `input` argument of a call to a custom tool.
+func customToolInput(args string) string {
+	if v, err := oai.DecodeValue([]byte(args)); err == nil {
+		if m, ok := v.(map[string]any); ok {
+			if s, ok := m["input"].(string); ok {
+				return s
+			}
+		}
+	}
+	return args
+}
+
+func appendUnique(list []string, s string) []string {
+	for _, v := range list {
+		if v == s {
+			return list
+		}
+	}
+	return append(list, s)
 }
 
 func convertResponseInputContent(v any) any {
@@ -228,6 +346,8 @@ func convertResponseInputContent(v any) any {
 				if img := imagePart(p); img != nil {
 					parts = append(parts, img)
 				}
+			case "input_file":
+				parts = append(parts, inputFilePart(p))
 			}
 		}
 		if len(parts) == 1 {
@@ -239,6 +359,15 @@ func convertResponseInputContent(v any) any {
 	default:
 		return ""
 	}
+}
+
+// inputFilePart converts an `input_file` part into an image part for image
+// files and into a text part (extracted text or a notice) otherwise.
+func inputFilePart(p map[string]any) map[string]any {
+	if fd := oai.Str(p, "file_data"); strings.HasPrefix(fd, "data:image/") {
+		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": fd}}
+	}
+	return map[string]any{"type": "text", "text": documentText(responsesInputFile(p))}
 }
 
 // imagePart converts a Responses or Chat image content part
@@ -362,6 +491,14 @@ func splitContentParts(v any) (text string, images []any, ok bool) {
 				texts = append(texts, s)
 			}
 			images = append(images, imgs...)
+		case "input_file":
+			ok = true
+			fp := inputFilePart(p)
+			if oai.Str(fp, "type") == "image_url" {
+				images = append(images, fp)
+			} else {
+				texts = append(texts, oai.Str(fp, "text"))
+			}
 		case "input_image", "image_url", "image":
 			ok = true
 			if img := imagePart(p); img != nil {
@@ -397,6 +534,7 @@ func extractInlineImages(s string) (string, []any) {
 }
 
 type openRespTool struct {
+	custom      bool
 	outputIndex int
 	itemID      string
 	callID      string
@@ -408,6 +546,8 @@ type openRespTool struct {
 // into OpenAI Responses format.
 type ResponsesTranslator struct {
 	Model string
+	// CustomTools names the request's custom tools (see ResponsesMeta).
+	CustomTools map[string]bool
 
 	respID         string
 	createdAt      int64
@@ -430,6 +570,19 @@ func NewResponsesTranslator(requestedModel string) *ResponsesTranslator {
 		outputIndex:    -1,
 		completedItems: []any{},
 	}
+}
+
+// callItem builds a function_call item, or a custom_tool_call item when name
+// is one of the request's custom tools.
+func (t *ResponsesTranslator) callItem(id, callID, name, args, status string) map[string]any {
+	if t.CustomTools[name] {
+		input := ""
+		if args != "" {
+			input = customToolInput(args)
+		}
+		return map[string]any{"type": "custom_tool_call", "id": id, "call_id": callID, "name": name, "input": input, "status": status}
+	}
+	return map[string]any{"type": "function_call", "id": id, "call_id": callID, "name": name, "arguments": args, "status": status}
 }
 
 func (t *ResponsesTranslator) WriteError(w http.ResponseWriter, status int, body []byte) {
@@ -522,14 +675,7 @@ func (t *ResponsesTranslator) WriteJSON(w http.ResponseWriter, body []byte) {
 				for i, rawTC := range tcs {
 					tc, _ := rawTC.(map[string]any)
 					fn, _ := tc["function"].(map[string]any)
-					output = append(output, map[string]any{
-						"type":      "function_call",
-						"id":        fmt.Sprintf("fc_%s_%d", idSuffix, i),
-						"call_id":   oai.Str(tc, "id"),
-						"name":      oai.Str(fn, "name"),
-						"arguments": oai.Str(fn, "arguments"),
-						"status":    "completed",
-					})
+					output = append(output, t.callItem(fmt.Sprintf("fc_%s_%d", idSuffix, i), oai.Str(tc, "id"), oai.Str(fn, "name"), oai.Str(fn, "arguments"), "completed"))
 				}
 			}
 		}
@@ -630,19 +776,26 @@ func (t *ResponsesTranslator) closeOpenTools(w http.ResponseWriter) {
 			continue
 		}
 		text := st.args.String()
-		t.emitEvent(w, "response.function_call_arguments.done", map[string]any{
-			"item_id":      st.itemID,
-			"output_index": st.outputIndex,
-			"arguments":    text,
-		})
-		item := map[string]any{
-			"type":      "function_call",
-			"id":        st.itemID,
-			"call_id":   st.callID,
-			"name":      st.name,
-			"arguments": text,
-			"status":    "completed",
+		if st.custom {
+			input := customToolInput(text)
+			t.emitEvent(w, "response.custom_tool_call_input.delta", map[string]any{
+				"item_id":      st.itemID,
+				"output_index": st.outputIndex,
+				"delta":        input,
+			})
+			t.emitEvent(w, "response.custom_tool_call_input.done", map[string]any{
+				"item_id":      st.itemID,
+				"output_index": st.outputIndex,
+				"input":        input,
+			})
+		} else {
+			t.emitEvent(w, "response.function_call_arguments.done", map[string]any{
+				"item_id":      st.itemID,
+				"output_index": st.outputIndex,
+				"arguments":    text,
+			})
 		}
+		item := t.callItem(st.itemID, st.callID, st.name, text, "completed")
 		t.emitEvent(w, "response.output_item.done", map[string]any{
 			"output_index": st.outputIndex,
 			"item":         item,
@@ -711,18 +864,12 @@ func (t *ResponsesTranslator) startFunctionCall(w http.ResponseWriter, tcIdx int
 	if t.openTools == nil {
 		t.openTools = map[int]*openRespTool{}
 	}
+	st.custom = t.CustomTools[name]
 	t.openTools[tcIdx] = st
 	t.openToolOrder = append(t.openToolOrder, tcIdx)
 	t.emitEvent(w, "response.output_item.added", map[string]any{
 		"output_index": st.outputIndex,
-		"item": map[string]any{
-			"type":      "function_call",
-			"id":        st.itemID,
-			"call_id":   callID,
-			"name":      name,
-			"arguments": "",
-			"status":    "in_progress",
-		},
+		"item":         t.callItem(st.itemID, callID, name, "", "in_progress"),
 	})
 	return st
 }
@@ -797,6 +944,11 @@ func (t *ResponsesTranslator) OnChunk(w http.ResponseWriter, chunk oai.Object) {
 			}
 			if args != "" {
 				st.args.WriteString(args)
+				if st.custom {
+					// a custom tool's input is unwrapped from the arguments
+					// JSON once they are complete
+					continue
+				}
 				t.emitEvent(w, "response.function_call_arguments.delta", map[string]any{
 					"item_id":      st.itemID,
 					"output_index": st.outputIndex,

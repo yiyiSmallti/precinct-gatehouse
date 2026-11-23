@@ -354,10 +354,13 @@ func (s *Server) openaiResponses(w http.ResponseWriter, r *http.Request) {
 	tr := compat.NewResponsesTranslator("")
 	cw := compat.NewWriter(w, tr)
 	s.Pipeline.Serve(cw, r, "responses", func(b []byte) (oai.Object, error) {
-		req, model, dropped, err := compat.DecodeResponses(b)
-		tr.Model = model
-		if len(dropped) > 0 {
-			cw.Header().Set("X-Gatehouse-Dropped-Tools", strings.Join(dropped, ", "))
+		req, meta, err := compat.DecodeResponses(b)
+		tr.Model, tr.CustomTools = meta.Model, meta.CustomTools
+		if len(meta.DroppedTools) > 0 {
+			cw.Header().Set("X-Gatehouse-Dropped-Tools", strings.Join(meta.DroppedTools, ", "))
+		}
+		if len(meta.DroppedItems) > 0 {
+			cw.Header().Set("X-Gatehouse-Dropped-Items", strings.Join(meta.DroppedItems, ", "))
 		}
 		return req, err
 	})
