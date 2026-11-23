@@ -111,25 +111,26 @@ type principal struct {
 }
 
 type reqState struct {
-	id           string
-	start        time.Time
-	snap         *live.Snapshot
-	protocol     string
-	decode       func([]byte) (oai.Object, error)
-	principal    principal
-	claims       token.Claims
-	org          *policy.Context // org mode
-	rec          audit.Record
-	w            http.ResponseWriter
-	written      bool
-	ttft         time.Duration
-	release      func(status int)
-	admitted     bool
-	errorCode    string
-	clientStream bool
-	cachedTokens int
-	routeBackend string
-	routeReason  string
+	id            string
+	start         time.Time
+	snap          *live.Snapshot
+	protocol      string
+	decode        func([]byte) (oai.Object, error)
+	principal     principal
+	claims        token.Claims
+	org           *policy.Context // org mode
+	rec           audit.Record
+	w             http.ResponseWriter
+	written       bool
+	keepaliveOnly bool
+	ttft          time.Duration
+	release       func(status int)
+	admitted      bool
+	errorCode     string
+	clientStream  bool
+	cachedTokens  int
+	routeBackend  string
+	routeReason   string
 }
 
 // ServeHTTP handles POST /v1/chat/completions.
@@ -157,6 +158,19 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 		st.rec.Error = oe.Code + ": " + oe.Message
 		if !st.written {
 			oai.WriteError(w, oe)
+		} else if st.keepaliveOnly {
+			errBody := oai.Encode(map[string]any{
+				"error": map[string]any{
+					"message": oe.Message,
+					"type":    "upstream_error",
+					"code":    oe.Code,
+				},
+			})
+			fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", errBody)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			st.keepaliveOnly = false
 		}
 	}
 	if st.release != nil {
@@ -549,8 +563,10 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			}
 			return rerr
 		}
-		h.Set("X-Gatehouse-Model", ascii(ref))
-		h.Set("X-Gatehouse-Redaction", redactionHeader(res.Report))
+		if !st.written {
+			h.Set("X-Gatehouse-Model", ascii(ref))
+			h.Set("X-Gatehouse-Redaction", redactionHeader(res.Report))
+		}
 
 		upStream := clientStream && prov.Target == "local" && (mode == redact.ModeOff || mode == redact.ModeAudit)
 		if upStream {
@@ -570,14 +586,6 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			}
 			st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: ue.Status, Error: ue.Error()})
 			p.meterRecord(st, ref, prov.Target, oai.Usage{}, 0, statusOf(ue), time.Since(callStart))
-			if st.written {
-				errBody := oai.Encode(map[string]any{"error": map[string]any{"message": ue.Error(), "type": "upstream_error"}})
-				fmt.Fprintf(st.w, "data: %s\n\ndata: [DONE]\n\n", errBody)
-				if fl, ok := st.w.(http.Flusher); ok {
-					fl.Flush()
-				}
-				return oai.Errorf(statusOf(ue), "upstream_error", "%s", ue.Error())
-			}
 			if ue.Retryable {
 				st.snap.Reg.MarkFailed(ref)
 				lastErr = ue
@@ -590,6 +598,9 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			if ue.Status == 0 {
 				// no upstream response (e.g. the client went away)
 				return oai.Errorf(http.StatusBadGateway, "upstream_unavailable", "%s: %s", ref, ue.Error())
+			}
+			if st.written {
+				return oai.Errorf(statusOf(ue), "upstream_error", "%s", ue.Error())
 			}
 			// a client error from the provider is returned as is
 			copyRouterHeaders(st, ue.Header)
@@ -712,6 +723,7 @@ func (p *Pipeline) relayBuffered(st *reqState, resp *http.Response, vaultKey str
 	}
 	alreadyWritten := st.written
 	st.written = true
+	st.keepaliveOnly = false
 	st.ttft = time.Since(st.start)
 	if !clientStream {
 		st.w.Header().Set("Content-Type", "application/json")
@@ -785,6 +797,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		st.w.WriteHeader(http.StatusOK)
 		st.written = true
 	}
+	st.keepaliveOnly = false
 	fl, _ := st.w.(http.Flusher)
 	var usage oai.Usage
 	done := false // saw [DONE] or a finish_reason
@@ -989,8 +1002,11 @@ func (p *Pipeline) callProviderWithKeepalive(ctx context.Context, st *reqState, 
 	}
 	// Let active tiered routers emit keepalives first at initDelay (with X-Router-* headers);
 	// Pipeline still acts as a safety net for non-tiered upstreams or buffered streaming masks.
-	if upStream {
-		initDelay += initDelay / 10
+	firstWait := initDelay
+	if st.written {
+		firstWait = keepaliveEvery
+	} else if upStream {
+		firstWait += initDelay / 10
 	}
 	var callMu sync.Mutex
 	canceled := false
@@ -1009,7 +1025,7 @@ func (p *Pipeline) callProviderWithKeepalive(ctx context.Context, st *reqState, 
 		callMu.Unlock()
 	}()
 
-	timer := time.NewTimer(initDelay)
+	timer := time.NewTimer(firstWait)
 	defer timer.Stop()
 	var tk *time.Ticker
 	var tickC <-chan time.Time
@@ -1045,6 +1061,7 @@ func (p *Pipeline) callProviderWithKeepalive(ctx context.Context, st *reqState, 
 				st.w.Header().Set("Cache-Control", "no-cache")
 				st.w.WriteHeader(http.StatusOK)
 				st.written = true
+				st.keepaliveOnly = true
 			}
 			_, _ = io.WriteString(st.w, ": keepalive\n\n")
 			if fl != nil {
