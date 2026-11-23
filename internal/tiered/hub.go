@@ -24,8 +24,9 @@ import (
 type ctxKey int
 
 const (
-	dataClassCtxKey ctxKey = 1
-	routeMetaCtxKey ctxKey = 2
+	dataClassCtxKey   ctxKey = 1
+	routeMetaCtxKey   ctxKey = 2
+	callerScopeCtxKey ctxKey = 3
 )
 
 // RouteMeta records the final backend and routing reason across keepalive failovers.
@@ -79,16 +80,36 @@ func dataClassFromContext(ctx context.Context) string {
 	return v
 }
 
+// DataClassFromContext returns the Gatehouse data classification stored on ctx, if any.
+func DataClassFromContext(ctx context.Context) string {
+	return dataClassFromContext(ctx)
+}
+
+// WithCallerScope attaches an opaque caller/security scope key so context
+// compression checkpoints never cross caller or classification boundaries.
+func WithCallerScope(ctx context.Context, scope string) context.Context {
+	if scope == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, callerScopeCtxKey, scope)
+}
+
+func callerScopeFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(callerScopeCtxKey).(string)
+	return v
+}
+
 // Hub owns one Router per tiered-configured provider and manages lifecycle across config reloads.
 type Hub struct {
 	dataDir   string
 	log       *slog.Logger
 	transport *http.Transport
 
-	mu           sync.RWMutex
-	routers      map[string]*Router
-	warmupFilter WarmupFilterFunc
-	resolveKey   func(ref string) (string, error)
+	mu            sync.RWMutex
+	routers       map[string]*Router
+	warmupFilter  WarmupFilterFunc
+	warmupRestore WarmupRestoreFunc
+	resolveKey    func(ref string) (string, error)
 }
 
 // SetWarmupFilter installs a filter invoked on starter warm-up payloads before dispatch.
@@ -102,6 +123,20 @@ func (h *Hub) SetWarmupFilter(fn WarmupFilterFunc) {
 	h.mu.Unlock()
 	for _, r := range list {
 		r.setWarmupFilter(fn)
+	}
+}
+
+// SetWarmupRestore installs a callback invoked to restore redacted placeholders before local checkpoint freezing.
+func (h *Hub) SetWarmupRestore(fn WarmupRestoreFunc) {
+	h.mu.Lock()
+	h.warmupRestore = fn
+	list := make([]*Router, 0, len(h.routers))
+	for _, r := range h.routers {
+		list = append(list, r)
+	}
+	h.mu.Unlock()
+	for _, r := range list {
+		r.setWarmupRestore(fn)
 	}
 }
 
@@ -238,6 +273,7 @@ func (h *Hub) Activate(cfg *config.Config) {
 
 	h.mu.Lock()
 	filter := h.warmupFilter
+	restore := h.warmupRestore
 	resolveFn := h.resolveKey
 	var toClose []*Router
 	for name, r := range h.routers {
@@ -268,6 +304,8 @@ func (h *Hub) Activate(cfg *config.Config) {
 		}
 		if r, ok := existing[name]; ok {
 			r.setWarmupFilter(filter)
+			r.setWarmupRestore(restore)
+			r.setKeyResolver(resolveFn)
 			if err := r.apply(spec.target, apiKey, *spec.tc); err != nil {
 				h.log.Error("tiered router apply failed", "provider", name, "err", err)
 			}
@@ -280,6 +318,8 @@ func (h *Hub) Activate(cfg *config.Config) {
 			continue
 		}
 		r.setWarmupFilter(filter)
+		r.setWarmupRestore(restore)
+		r.setKeyResolver(resolveFn)
 		r.ensureLoops()
 		h.mu.Lock()
 		// double-check race
@@ -287,6 +327,8 @@ func (h *Hub) Activate(cfg *config.Config) {
 			h.mu.Unlock()
 			r.close()
 			old.setWarmupFilter(filter)
+			old.setWarmupRestore(restore)
+			old.setKeyResolver(resolveFn)
 			_ = old.apply(spec.target, apiKey, *spec.tc)
 			continue
 		}
@@ -468,15 +510,34 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 		}
 	}
 
-	an, ok := r.analyzeChatBody(body)
+	rawAn, ok := r.analyzeChatBody(body)
 	if !ok {
 		return passHighest(body)
 	}
 
-	sendBody := body
+	effectiveBody := body
+	an := rawAn
+	var compRes CompressResult
+	compEnabled := t.plan.cfg.ContextCompress != nil && t.plan.cfg.ContextCompress.Enabled
+	if compEnabled && r != nil && r.compressor != nil {
+		compRes = r.compressor.MaybeCompressWithScope(
+			body, rawAn, req.Header, *t.plan.cfg.ContextCompress,
+			t.plan.cfg.HeavyMissThreshold, t.plan.target,
+			dataClassFromContext(req.Context()) == "confidential",
+			callerScopeFromContext(req.Context()),
+		)
+		if compRes.Compressed && len(compRes.Body) > 0 {
+			effectiveBody = compRes.Body
+			if newAn, ok2 := r.analyzeChatBody(effectiveBody); ok2 {
+				an = newAn
+			}
+		}
+	}
+
+	sendBody := effectiveBody
 	zhAnchored := false
 	if zhAnchorEnabled(t.plan.cfg) {
-		if anchoredBody, changed := injectZhThinkAnchor(body); changed {
+		if anchoredBody, changed := injectZhThinkAnchor(effectiveBody); changed {
 			sendBody = anchoredBody
 			zhAnchored = true
 		}
@@ -560,9 +621,13 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 					if starterTmpl != nil {
 						r.starters.Observe(starterTmpl)
 					}
+					if compRes.PendingJob != nil && r.compressor != nil {
+						r.compressor.ScheduleStage2(compRes.PendingJob)
+					}
 				}
 				durMs := time.Since(start).Milliseconds()
 				logger.Info("tiered route", "provider", t.provider, "mode", "active", "backend", bCfg.ID, "reason", reason,
+					"compress", compRes.Mode, "orig_est", compRes.OriginalTokens,
 					"est", an.TotalEst, "cached_est", an.CachedEst, "miss_est", an.MissEst,
 					"actual_prompt", actualPrompt, "actual_cached", actualCached, "status", statusCode, "ms", durMs)
 				if r != nil {
@@ -570,6 +635,8 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 						Time:         time.Now().Format("15:04:05"),
 						Backend:      bCfg.ID,
 						Reason:       reason,
+						CompressMode: compRes.Mode,
+						OrigEst:      compRes.OriginalTokens,
 						TotalEst:     an.TotalEst,
 						CachedEst:    an.CachedEst,
 						MissEst:      an.MissEst,
@@ -633,6 +700,8 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 					an:             an,
 					toolsReordered: toolsReordered,
 					zhAnchored:     zhAnchored,
+					compRes:        compRes,
+					compEnabled:    compEnabled,
 					highestTier:    highestTier,
 					maxAttempts:    maxAttempts,
 					resolved:       resolved,
@@ -670,7 +739,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 			cur.releaseActive()
 			resp.Body = io.NopCloser(bytes.NewReader(errBody))
 			resp.ContentLength = int64(len(errBody))
-			setRouterHeaders(resp.Header, cur.bCfg.ID, cur.reason, an, toolsReordered, cur.clampedMaxOut, zhAnchored)
+			setRouterHeaders(resp.Header, cur.bCfg.ID, cur.reason, an, toolsReordered, cur.clampedMaxOut, zhAnchored, compRes, compEnabled)
 			routeMeta.Set(cur.bCfg.ID, cur.reason)
 			return resp, nil
 		}
@@ -684,7 +753,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 			continue
 		}
 
-		setRouterHeaders(resp.Header, cur.bCfg.ID, cur.reason, an, toolsReordered, cur.clampedMaxOut, zhAnchored)
+		setRouterHeaders(resp.Header, cur.bCfg.ID, cur.reason, an, toolsReordered, cur.clampedMaxOut, zhAnchored, compRes, compEnabled)
 		routeMeta.Set(cur.bCfg.ID, cur.reason)
 		resp.Body = &trackedBody{
 			inner:        resp.Body,
@@ -831,7 +900,36 @@ func (t *hubTransport) roundTripShadow(req *http.Request, r *Router) (*http.Resp
 	return resp, nil
 }
 
-func setRouterHeaders(h http.Header, backendID, reason string, an *RequestAnalysis, toolsReordered bool, clampedMaxOut int, zhAnchored bool) {
+func setContextHeaders(h http.Header, cr CompressResult, enabled bool) {
+	if !enabled && !cr.Compressed && cr.CheckpointID == "" {
+		return
+	}
+	if cr.Compressed {
+		h.Set("X-Context-Compressed", cr.Mode)
+		h.Set("X-Context-Compressed-Tokens", fmt.Sprintf("%d", cr.CompressedTokens))
+		saved := cr.OriginalTokens - cr.CompressedTokens
+		if saved < 0 {
+			saved = 0
+		}
+		h.Set("X-Context-Saved-Tokens", fmt.Sprintf("%d", saved))
+	} else {
+		h.Set("X-Context-Compressed", "0")
+		if cr.SkipReason != "" && cr.SkipReason != "below-threshold" && cr.SkipReason != "disabled" {
+			h.Set("X-Context-Skip-Reason", cr.SkipReason)
+		}
+	}
+	if cr.OriginalTokens > 0 {
+		h.Set("X-Context-Original-Tokens", fmt.Sprintf("%d", cr.OriginalTokens))
+	}
+	if cr.CheckpointID != "" {
+		h.Set("X-Context-Checkpoint-Id", shortID(cr.CheckpointID))
+	}
+	if cr.Stage2Status != "" && cr.Stage2Status != "none" {
+		h.Set("X-Context-Stage2-Status", cr.Stage2Status)
+	}
+}
+
+func setRouterHeaders(h http.Header, backendID, reason string, an *RequestAnalysis, toolsReordered bool, clampedMaxOut int, zhAnchored bool, cr CompressResult, compressEnabled bool) {
 	h.Set("X-Router-Backend", backendID)
 	h.Set("X-Router-Reason", reason)
 	h.Set("X-Router-Est-Tokens", fmt.Sprintf("%d", an.TotalEst))
@@ -845,6 +943,7 @@ func setRouterHeaders(h http.Header, backendID, reason string, an *RequestAnalys
 	if zhAnchored {
 		h.Set("X-Router-Zh-Anchor", "1")
 	}
+	setContextHeaders(h, cr, compressEnabled)
 }
 
 type activeRTRes struct {
@@ -921,6 +1020,8 @@ type keepaliveFailoverState struct {
 	an             *RequestAnalysis
 	toolsReordered bool
 	zhAnchored     bool
+	compRes        CompressResult
+	compEnabled    bool
 	highestTier    int
 	maxAttempts    int
 	resolved       []resolvedBackend
@@ -1001,7 +1102,7 @@ func (t *hubTransport) startKeepaliveStream(
 	hdr.Set("Cache-Control", "no-cache")
 	hdr.Set("Connection", "keep-alive")
 	hdr.Set("X-Router-SSE-Keepalive", "1")
-	setRouterHeaders(hdr, cur.bCfg.ID, cur.reason, st.an, st.toolsReordered, cur.clampedMaxOut, st.zhAnchored)
+	setRouterHeaders(hdr, cur.bCfg.ID, cur.reason, st.an, st.toolsReordered, cur.clampedMaxOut, st.zhAnchored, st.compRes, st.compEnabled)
 
 	go func() {
 		if _, err := pw.Write([]byte(": keepalive\n\n")); err != nil {

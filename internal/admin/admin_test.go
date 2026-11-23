@@ -19,6 +19,7 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/route"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/store"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/tiered"
 )
 
 func TestChangePasswordRevokesOtherSessions(t *testing.T) {
@@ -443,5 +444,228 @@ model_aliases:
 	}
 	if len(cur.ModelAliases) != 1 || cur.ModelAliases[0].Match != "friendly" || cur.ModelAliases[0].Use != "primary" {
 		t.Fatalf("expected alias friendly -> primary, got %+v", cur.ModelAliases)
+	}
+}
+
+func TestContextCompressSecretRedactionAndCheckpointsAPI(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := SetPassword(db, "admin", "password-123"); err != nil {
+		t.Fatal(err)
+	}
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer up.Close()
+
+	initialYAML := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    target: local
+    models: [m1]
+    tiered:
+      mode: active
+      health_interval_sec: 1
+      zh_think_anchor: false
+      starter_cache:
+        enabled: false
+      context_compress:
+        enabled: true
+        stage2_enabled: false
+        trigger_tokens: 500
+        stage1_target_tokens: 200
+        keep_recent_groups: 2
+        keep_recent_min_tokens: 20
+        keep_recent_max_tokens: 120
+        assistant_max_chars: 120
+        user_paste_max_chars: 120
+        summarizer_url: %s
+        summarizer_api_key: sk-inline-secret
+      backends:
+        - id: b1
+          url: %s
+          tier: 1
+          max_context_tokens: 32000
+          max_safe_input: 16000
+          promote_at: 8000
+          speed_score: 100
+default_group: main
+routing_groups:
+  main:
+    members: [p/m1]
+`, dir, up.URL, up.URL)
+
+	mgr, cfgPath := newTestLiveManager(t, dir, initialYAML, nil)
+	hub := tiered.NewHub(dir, nil)
+	defer func() { _ = hub.Close() }()
+	hub.Activate(mgr.Current().Cfg)
+
+	srv := New(Deps{DB: db, Live: mgr, Tiered: hub})
+
+	reqLogin, _ := http.NewRequest(http.MethodPost, "/admin/api/login", bytes.NewReader([]byte(`{"username":"admin","password":"password-123"}`)))
+	reqLogin.Header.Set("Content-Type", "application/json")
+	recLogin := httptest.NewRecorder()
+	srv.ServeHTTP(recLogin, reqLogin)
+	var tok string
+	for _, c := range recLogin.Result().Cookies() {
+		if c.Name == cookieName {
+			tok = c.Value
+		}
+	}
+	if tok == "" {
+		t.Fatal("missing admin cookie")
+	}
+
+	admDo := func(method, path string, body any) (int, map[string]any, string) {
+		t.Helper()
+		var buf bytes.Buffer
+		if body != nil {
+			_ = json.NewEncoder(&buf).Encode(body)
+		}
+		var rdr *bytes.Reader
+		if body != nil {
+			rdr = bytes.NewReader(buf.Bytes())
+		} else {
+			rdr = bytes.NewReader(nil)
+		}
+		req, _ := http.NewRequest(method, path, rdr)
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
+		req.Header.Set("X-Gatehouse-Admin", "1")
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		var out map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out, rec.Body.String()
+	}
+
+	// 1. GET /admin/api/config must redact summarizer_api_key and expose has_summarizer_key=true.
+	codeCfg, cfgResp, rawCfg := admDo(http.MethodGet, "/admin/api/config", nil)
+	if codeCfg != http.StatusOK || bytes.Contains([]byte(rawCfg), []byte("sk-inline-secret")) {
+		t.Fatalf("GET /admin/api/config status=%d leaked secret or failed: %s", codeCfg, rawCfg)
+	}
+	rawMap, _ := cfgResp["raw"].(map[string]any)
+	provs, _ := rawMap["providers"].([]any)
+	p0, _ := provs[0].(map[string]any)
+	t0, _ := p0["tiered"].(map[string]any)
+	cc0, _ := t0["context_compress"].(map[string]any)
+	if cc0 == nil || cc0["has_summarizer_key"] != true {
+		t.Fatalf("expected has_summarizer_key=true in redacted config, got %+v", cc0)
+	}
+	if v, ok := cc0["summarizer_api_key"].(string); ok && v != "" {
+		t.Fatalf("expected empty/omitted summarizer_api_key, got %q", v)
+	}
+
+	// 2. PUT /admin/api/config/sections/providers without summarizer_api_key/key_ref must preserve inline key on disk and in live snapshot.
+	baseHash, _ := cfgResp["hash"].(string)
+	codePut, _, rawPut := admDo(http.MethodPut, "/admin/api/config/sections/providers", map[string]any{
+		"base_hash": baseHash,
+		"data":      provs,
+	})
+	if codePut != http.StatusOK {
+		t.Fatalf("PUT /admin/api/config/sections/providers status=%d body=%s", codePut, rawPut)
+	}
+	liveCC := mgr.Current().Cfg.Providers[0].Tiered.ContextCompress
+	if liveCC == nil || liveCC.SummarizerAPIKey != "sk-inline-secret" || liveCC.HasSummarizerKey {
+		t.Fatalf("expected inline summarizer_api_key preserved without has_summarizer_key persisted, got %+v", liveCC)
+	}
+	diskBytes, _ := os.ReadFile(cfgPath)
+	if !bytes.Contains(diskBytes, []byte("sk-inline-secret")) || bytes.Contains(diskBytes, []byte("has_summarizer_key")) {
+		t.Fatalf("expected config.yaml to retain sk-inline-secret without has_summarizer_key, got:\n%s", diskBytes)
+	}
+
+	// 3. Exercise Checkpoints Admin API (list, 404 on unknown, delete by id, clear all).
+	deadline := time.Now().Add(4 * time.Second)
+	healthy := false
+	for time.Now().Before(deadline) {
+		_, stMap, _ := admDo(http.MethodGet, "/admin/api/tiered", nil)
+		if ps, _ := stMap["providers"].([]any); len(ps) > 0 {
+			if st0, _ := ps[0].(map[string]any); st0 != nil {
+				if bs, _ := st0["backends"].([]any); len(bs) > 0 {
+					if b0, _ := bs[0].(map[string]any); b0 != nil && b0["healthy"] == true {
+						healthy = true
+						break
+					}
+				}
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !healthy {
+		t.Fatalf("backend b1 did not become healthy in time")
+	}
+
+	tr, err := hub.Transport("p", "local", mgr.Current().Cfg.Providers[0].Tiered, nil)
+	if err != nil {
+		t.Fatalf("hub.Transport: %v", err)
+	}
+	triggerCP := func(marker string) {
+		t.Helper()
+		payload, _ := json.Marshal(map[string]any{
+			"model": "m1",
+			"messages": []map[string]string{
+				{"role": "user", "content": "Rule " + marker},
+				{"role": "assistant", "content": string(bytes.Repeat([]byte("Assistant long analysis block "), 55))},
+				{"role": "user", "content": string(bytes.Repeat([]byte("User long detail block "), 55))},
+				{"role": "assistant", "content": string(bytes.Repeat([]byte("Second assistant block "), 55))},
+				{"role": "user", "content": "Recent follow up."},
+				{"role": "assistant", "content": "Short ok."},
+				{"role": "user", "content": "Final question."},
+			},
+		})
+		req, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("tr.RoundTrip: %v", err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("X-Context-Compressed"); got != "stage1" {
+			t.Fatalf("expected X-Context-Compressed=stage1, got %q", got)
+		}
+	}
+
+	triggerCP("A")
+	cList, cpResp, rawCP := admDo(http.MethodGet, "/admin/api/tiered/p/checkpoints", nil)
+	cpList, _ := cpResp["checkpoints"].([]any)
+	if cList != http.StatusOK || len(cpList) != 1 {
+		t.Fatalf("expected 1 checkpoint on GET, got status=%d body=%s", cList, rawCP)
+	}
+	cpID := fmt.Sprint(cpList[0].(map[string]any)["id"])
+
+	cMiss, _, _ := admDo(http.MethodDelete, "/admin/api/tiered/p/checkpoints/nonexistent-id", nil)
+	if cMiss != http.StatusNotFound {
+		t.Fatalf("expected 404 deleting unknown checkpoint, got %d", cMiss)
+	}
+
+	cDel, _, rawDel := admDo(http.MethodDelete, "/admin/api/tiered/p/checkpoints/"+cpID, nil)
+	if cDel != http.StatusOK {
+		t.Fatalf("expected 200 deleting checkpoint %s, got %d (%s)", cpID, cDel, rawDel)
+	}
+
+	triggerCP("B")
+	cClr, clrResp, rawClr := admDo(http.MethodDelete, "/admin/api/tiered/p/checkpoints?all=1", nil)
+	if cClr != http.StatusOK || clrResp["cleared"] != float64(1) {
+		t.Fatalf("expected cleared=1 on DELETE ?all=1, got %d (%s)", cClr, rawClr)
+	}
+	_, afterResp, rawAfter := admDo(http.MethodGet, "/admin/api/tiered/p/checkpoints", nil)
+	if arr, _ := afterResp["checkpoints"].([]any); len(arr) != 0 {
+		t.Fatalf("expected 0 checkpoints after clear, got %s", rawAfter)
 	}
 }

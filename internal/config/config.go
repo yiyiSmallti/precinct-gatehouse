@@ -87,15 +87,45 @@ type Provider struct {
 
 // TieredConfig configures built-in tiered routing and starter prefix caching for a provider.
 type TieredConfig struct {
-	Mode               string              `yaml:"mode,omitempty" json:"mode,omitempty"` // shadow | active
-	HeavyMissThreshold int                 `yaml:"heavy_miss_threshold,omitempty" json:"heavy_miss_threshold,omitempty"`
-	HeavyStickySec     int                 `yaml:"heavy_sticky_sec,omitempty" json:"heavy_sticky_sec,omitempty"`
-	SSEKeepaliveSec    int                 `yaml:"sse_keepalive_sec,omitempty" json:"sse_keepalive_sec,omitempty"`
-	HealthIntervalSec  int                 `yaml:"health_interval_sec,omitempty" json:"health_interval_sec,omitempty"`
-	HealthMaxTimeouts  int                 `yaml:"health_max_timeouts,omitempty" json:"health_max_timeouts,omitempty"`
-	ZhThinkAnchor      *bool               `yaml:"zh_think_anchor,omitempty" json:"zh_think_anchor,omitempty"`
-	Backends           []TieredBackend     `yaml:"backends,omitempty" json:"backends,omitempty"`
-	StarterCache       *TieredStarterCache `yaml:"starter_cache,omitempty" json:"starter_cache,omitempty"`
+	Mode               string                 `yaml:"mode,omitempty" json:"mode,omitempty"` // shadow | active
+	HeavyMissThreshold int                    `yaml:"heavy_miss_threshold,omitempty" json:"heavy_miss_threshold,omitempty"`
+	HeavyStickySec     int                    `yaml:"heavy_sticky_sec,omitempty" json:"heavy_sticky_sec,omitempty"`
+	SSEKeepaliveSec    int                    `yaml:"sse_keepalive_sec,omitempty" json:"sse_keepalive_sec,omitempty"`
+	HealthIntervalSec  int                    `yaml:"health_interval_sec,omitempty" json:"health_interval_sec,omitempty"`
+	HealthMaxTimeouts  int                    `yaml:"health_max_timeouts,omitempty" json:"health_max_timeouts,omitempty"`
+	ZhThinkAnchor      *bool                  `yaml:"zh_think_anchor,omitempty" json:"zh_think_anchor,omitempty"`
+	Backends           []TieredBackend        `yaml:"backends,omitempty" json:"backends,omitempty"`
+	StarterCache       *TieredStarterCache    `yaml:"starter_cache,omitempty" json:"starter_cache,omitempty"`
+	ContextCompress    *TieredContextCompress `yaml:"context_compress,omitempty" json:"context_compress,omitempty"`
+}
+
+// TieredContextCompress configures two-stage checkpoint-frozen context compression for a tiered provider.
+type TieredContextCompress struct {
+	Enabled                   bool   `yaml:"enabled" json:"enabled"`
+	TriggerTokens             int    `yaml:"trigger_tokens,omitempty" json:"trigger_tokens,omitempty"`
+	Stage1TargetTokens        int    `yaml:"stage1_target_tokens,omitempty" json:"stage1_target_tokens,omitempty"`
+	KeepRecentGroups          int    `yaml:"keep_recent_groups,omitempty" json:"keep_recent_groups,omitempty"`
+	KeepRecentMinTokens       int    `yaml:"keep_recent_min_tokens,omitempty" json:"keep_recent_min_tokens,omitempty"`
+	KeepRecentMaxTokens       int    `yaml:"keep_recent_max_tokens,omitempty" json:"keep_recent_max_tokens,omitempty"`
+	ToolMaxChars              int    `yaml:"tool_max_chars,omitempty" json:"tool_max_chars,omitempty"`
+	MutationToolMaxChars      int    `yaml:"mutation_tool_max_chars,omitempty" json:"mutation_tool_max_chars,omitempty"`
+	StaleReadMaxChars         int    `yaml:"stale_read_max_chars,omitempty" json:"stale_read_max_chars,omitempty"`
+	UserPasteMaxChars         int    `yaml:"user_paste_max_chars,omitempty" json:"user_paste_max_chars,omitempty"`
+	AssistantMaxChars         int    `yaml:"assistant_max_chars,omitempty" json:"assistant_max_chars,omitempty"`
+	Stage2Enabled             *bool  `yaml:"stage2_enabled,omitempty" json:"stage2_enabled,omitempty"`
+	Stage2MaxSummaryTokens    int    `yaml:"stage2_max_summary_tokens,omitempty" json:"stage2_max_summary_tokens,omitempty"`
+	Stage2TimeoutSec          int    `yaml:"stage2_timeout_sec,omitempty" json:"stage2_timeout_sec,omitempty"`
+	Stage2Prewarm             *bool  `yaml:"stage2_prewarm,omitempty" json:"stage2_prewarm,omitempty"`
+	Stage2WarmStage1MaxTokens int    `yaml:"stage2_warm_stage1_max_tokens,omitempty" json:"stage2_warm_stage1_max_tokens,omitempty"`
+	Stage2WarmStage1MinDrop   int    `yaml:"stage2_warm_stage1_min_drop_pct,omitempty" json:"stage2_warm_stage1_min_drop_pct,omitempty"`
+	SummarizerURL             string `yaml:"summarizer_url,omitempty" json:"summarizer_url,omitempty"`
+	SummarizerModel           string `yaml:"summarizer_model,omitempty" json:"summarizer_model,omitempty"`
+	SummarizerKeyRef          string `yaml:"summarizer_key_ref,omitempty" json:"summarizer_key_ref,omitempty"`
+	SummarizerAPIKey          string `yaml:"summarizer_api_key,omitempty" json:"summarizer_api_key,omitempty"`
+	HasSummarizerKey          bool   `yaml:"-" json:"has_summarizer_key,omitempty"`
+	CheckpointTTLHours        int    `yaml:"checkpoint_ttl_hours,omitempty" json:"checkpoint_ttl_hours,omitempty"`
+	MaxCheckpoints            int    `yaml:"max_checkpoints,omitempty" json:"max_checkpoints,omitempty"`
+	PersistPath               string `yaml:"persist_path,omitempty" json:"persist_path,omitempty"`
 }
 
 // TieredBackend defines one backend tier inside a tiered provider.
@@ -404,6 +434,9 @@ func (c *Config) applyDefaults() {
 			if p.Tiered.StarterCache != nil && p.Tiered.StarterCache.PersistPath != "" {
 				p.Tiered.StarterCache.PersistPath = ExpandHome(p.Tiered.StarterCache.PersistPath)
 			}
+			if p.Tiered.ContextCompress != nil && p.Tiered.ContextCompress.PersistPath != "" {
+				p.Tiered.ContextCompress.PersistPath = ExpandHome(p.Tiered.ContextCompress.PersistPath)
+			}
 		}
 		if p.Target == "" {
 			p.Target = DefaultProviderTarget(p)
@@ -524,6 +557,22 @@ func validateTiered(add func(string, ...any), pr *Provider) {
 			add("providers.%s.tiered.backends[%d].promote_at: must be > 0", pr.Name, j)
 		}
 	}
+	if t.ContextCompress != nil {
+		cc := t.ContextCompress
+		if cc.SummarizerURL != "" && !strings.HasPrefix(cc.SummarizerURL, "http://") && !strings.HasPrefix(cc.SummarizerURL, "https://") {
+			add("providers.%s.tiered.context_compress.summarizer_url: must start with http:// or https://", pr.Name)
+		}
+		if cc.SummarizerKeyRef != "" && !isValidKeyRef(cc.SummarizerKeyRef) {
+			add("providers.%s.tiered.context_compress.summarizer_key_ref: must be env:NAME, keychain:NAME, file:PATH or db:NAME", pr.Name)
+		}
+	}
+}
+
+func isValidKeyRef(ref string) bool {
+	return strings.HasPrefix(ref, "env:") ||
+		strings.HasPrefix(ref, "keychain:") ||
+		strings.HasPrefix(ref, "file:") ||
+		(strings.HasPrefix(ref, "db:") && len(ref) > 3)
 }
 
 func set(v ...string) map[string]bool {
@@ -592,7 +641,7 @@ func (c *Config) Validate() []string {
 		if pr.Target != "local" && pr.Target != "external" {
 			add("providers.%s.target: must be local or external", pr.Name)
 		}
-		if pr.KeyRef != "" && !strings.HasPrefix(pr.KeyRef, "env:") && !strings.HasPrefix(pr.KeyRef, "keychain:") && !strings.HasPrefix(pr.KeyRef, "file:") && !(strings.HasPrefix(pr.KeyRef, "db:") && len(pr.KeyRef) > 3) {
+		if pr.KeyRef != "" && !isValidKeyRef(pr.KeyRef) {
 			add("providers.%s.key_ref: must be env:NAME, keychain:NAME, file:PATH or db:NAME", pr.Name)
 		}
 	}

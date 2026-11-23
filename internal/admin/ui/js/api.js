@@ -126,6 +126,12 @@ export const api = {
     request('POST', `/admin/api/tiered/${encodeURIComponent(provider)}/starters/pin`, data),
   deleteTieredStarter: (provider, hash) =>
     request('DELETE', `/admin/api/tiered/${encodeURIComponent(provider)}/starters/${encodeURIComponent(hash)}`),
+  tieredCheckpoints: (provider) =>
+    request('GET', `/admin/api/tiered/${encodeURIComponent(provider)}/checkpoints`),
+  tieredDeleteCheckpoint: (provider, id) =>
+    request('DELETE', `/admin/api/tiered/${encodeURIComponent(provider)}/checkpoints/${encodeURIComponent(id)}`),
+  tieredClearCheckpoints: (provider) =>
+    request('DELETE', `/admin/api/tiered/${encodeURIComponent(provider)}/checkpoints?all=1`),
   warmTieredStarters: (provider, data = {}) =>
     request('POST', `/admin/api/tiered/${encodeURIComponent(provider)}/starters/warm`, data),
   resetTieredShadow: (provider) =>

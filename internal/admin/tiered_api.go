@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/tiered"
 )
@@ -142,4 +143,77 @@ func (s *Server) resetTieredShadow(w http.ResponseWriter, r *http.Request, _ str
 	}
 	rt.ResetShadow()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) getTieredCheckpoints(w http.ResponseWriter, r *http.Request, _ string) {
+	name := r.PathValue("provider")
+	rt, ok := s.tieredRouter(name)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "tiered provider not found")
+		return
+	}
+	items, summary := rt.Checkpoints()
+	if items == nil {
+		items = []tiered.CheckpointView{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider":    name,
+		"checkpoints": items,
+		"summary":     summary,
+	})
+}
+
+func (s *Server) deleteTieredCheckpoints(w http.ResponseWriter, r *http.Request, _ string) {
+	name := r.PathValue("provider")
+	rt, ok := s.tieredRouter(name)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "tiered provider not found")
+		return
+	}
+	all := strings.TrimSpace(r.URL.Query().Get("all"))
+	if all == "1" || strings.EqualFold(all, "true") {
+		removed := rt.ClearCheckpoints()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": removed})
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "id or all=1 required")
+		return
+	}
+	writeDeleteCheckpoint(w, rt, id)
+}
+
+func (s *Server) deleteTieredCheckpoint(w http.ResponseWriter, r *http.Request, _ string) {
+	name := r.PathValue("provider")
+	rt, ok := s.tieredRouter(name)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "tiered provider not found")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	all := strings.TrimSpace(r.URL.Query().Get("all"))
+	if id == "all" || all == "1" || strings.EqualFold(all, "true") {
+		removed := rt.ClearCheckpoints()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": removed})
+		return
+	}
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "checkpoint id required")
+		return
+	}
+	writeDeleteCheckpoint(w, rt, id)
+}
+
+func writeDeleteCheckpoint(w http.ResponseWriter, rt *tiered.Router, id string) {
+	deletedID, err := rt.DeleteCheckpoint(id)
+	if err != nil {
+		if errors.Is(err, tiered.ErrCheckpointNotFound) {
+			writeJSONError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": deletedID})
 }
