@@ -257,6 +257,9 @@ func imagePart(p map[string]any) map[string]any {
 		url = oai.Str(p, "url")
 	}
 	if url == "" {
+		url = inlineImageURL(p)
+	}
+	if url == "" {
 		return nil
 	}
 	if detail == "" {
@@ -267,6 +270,30 @@ func imagePart(p map[string]any) map[string]any {
 		iu["detail"] = detail
 	}
 	return map[string]any{"type": "image_url", "image_url": iu}
+}
+
+// inlineImageURL builds a data URI from an image given as base64 data plus a
+// media type: MCP's {data, mimeType} or Anthropic's
+// {source: {type: base64, media_type, data}} / {source: {type: url, url}}.
+func inlineImageURL(p map[string]any) string {
+	if src, ok := p["source"].(map[string]any); ok {
+		if oai.Str(src, "type") == "url" {
+			return oai.Str(src, "url")
+		}
+		p = src
+	}
+	data := oai.Str(p, "data")
+	mime := oai.Str(p, "mimeType")
+	if mime == "" {
+		mime = oai.Str(p, "mime_type")
+	}
+	if mime == "" {
+		mime = oai.Str(p, "media_type")
+	}
+	if data == "" || !strings.HasPrefix(mime, "image/") {
+		return ""
+	}
+	return "data:" + mime + ";base64," + data
 }
 
 const (
@@ -339,6 +366,10 @@ func splitContentParts(v any) (text string, images []any, ok bool) {
 			ok = true
 			if img := imagePart(p); img != nil {
 				images = append(images, img)
+			} else {
+				// an image shape we cannot convert stays as JSON text
+				// rather than vanishing
+				texts = append(texts, string(oai.Encode(p)))
 			}
 		}
 	}

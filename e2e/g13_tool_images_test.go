@@ -84,7 +84,7 @@ func TestG13ToolImages(t *testing.T) {
 			map[string]any{"type": "additional_tools", "tools": []any{
 				map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}},
 			}},
-			call("call_a"), call("call_b"), call("call_c"), call("call_d"), call("call_e"),
+			call("call_a"), call("call_b"), call("call_c"), call("call_d"), call("call_e"), call("call_f"), call("call_g"),
 			map[string]any{"type": "function_call_output", "call_id": "call_a", "output": []any{
 				map[string]any{"type": "input_text", "text": "截图 A，联系 " + g2Phone},
 				map[string]any{"type": "input_image", "image_url": big},
@@ -95,12 +95,16 @@ func TestG13ToolImages(t *testing.T) {
 			map[string]any{"type": "function_call_output", "call_id": "call_c", "output": string(jsonC)},
 			map[string]any{"type": "function_call_output", "call_id": "call_d", "output": "日志 D " + smallD + " 结束"},
 			map[string]any{"type": "function_call_output", "call_id": "call_e", "output": `[{"type":"image","url":"https://example.com/shot.png"}]`},
+			map[string]any{"type": "function_call_output", "call_id": "call_f", "output": map[string]any{
+				"type": "image", "mimeType": "image/png", "data": strings.TrimPrefix(smallD, "data:image/png;base64,"),
+			}},
+			map[string]any{"type": "function_call_output", "call_id": "call_g", "output": map[string]any{"type": "image", "ref": "shot-7"}},
 			map[string]any{"type": "message", "role": "user", "content": "继续"},
 		},
 		"tools": []any{map[string]any{"type": "function", "name": "screenshot", "parameters": map[string]any{"type": "object"}}},
 	})
 	respElapsed := time.Since(start)
-	rep.Check("Responses 含 `additional_tools` 输入项与 5 路工具图片返回 200", r.Status == 200, "status=%d body=%.200s", r.Status, r.Raw)
+	rep.Check("Responses 含 `additional_tools` 输入项与 7 路工具输出返回 200", r.Status == 200, "status=%d body=%.200s", r.Status, r.Raw)
 	if r.Status != 200 {
 		t.FailNow()
 	}
@@ -112,8 +116,8 @@ func TestG13ToolImages(t *testing.T) {
 	for _, m := range upMsgs {
 		roles = append(roles, fmt.Sprint(m.(map[string]any)["role"]))
 	}
-	wantRoles := "user,assistant,tool,tool,tool,tool,tool,user,user"
-	rep.Check("消息顺序：5 条 tool 紧跟 assistant.tool_calls，图片在其后的一条 user 消息里",
+	wantRoles := "user,assistant,tool,tool,tool,tool,tool,tool,tool,user,user"
+	rep.Check("消息顺序：7 条 tool 紧跟 assistant.tool_calls，图片在其后的一条 user 消息里",
 		strings.Join(roles, ",") == wantRoles, "roles=%s", strings.Join(roles, ","))
 	if strings.Join(roles, ",") != wantRoles {
 		t.FailNow()
@@ -121,7 +125,7 @@ func TestG13ToolImages(t *testing.T) {
 
 	toolText := map[string]string{}
 	toolOK := true
-	for _, m := range upMsgs[2:7] {
+	for _, m := range upMsgs[2:9] {
 		mo := m.(map[string]any)
 		s, isStr := mo["content"].(string)
 		toolText[fmt.Sprint(mo["tool_call_id"])] = s
@@ -131,14 +135,15 @@ func TestG13ToolImages(t *testing.T) {
 	}
 	rep.Check("tool 消息只含纯文本，无 base64",
 		toolOK && strings.HasPrefix(toolText["call_a"], "截图 A") && strings.Contains(toolText["call_b"], "image returned by tool") &&
-			toolText["call_c"] == "截图 C" && toolText["call_d"] == "日志 D [image] 结束" && strings.Contains(toolText["call_e"], "image returned by tool"),
-		"a=%q b=%q c=%q d=%q e=%q", toolText["call_a"], toolText["call_b"], toolText["call_c"], toolText["call_d"], toolText["call_e"])
+			toolText["call_c"] == "截图 C" && toolText["call_d"] == "日志 D [image] 结束" && strings.Contains(toolText["call_e"], "image returned by tool") &&
+			strings.Contains(toolText["call_f"], "image returned by tool") && toolText["call_g"] == `{"ref":"shot-7","type":"image"}`,
+		"a=%q b=%q c=%q d=%q e=%q f=%q g=%q", toolText["call_a"], toolText["call_b"], toolText["call_c"], toolText["call_d"], toolText["call_e"], toolText["call_f"], toolText["call_g"])
 	rep.Check("tool 文本中的手机号仍被脱敏",
 		!strings.Contains(toolText["call_a"], g2Phone), "a=%q", toolText["call_a"])
 
 	var urls []string
 	var detailB string
-	parts, _ := upMsgs[7].(map[string]any)["content"].([]any)
+	parts, _ := upMsgs[9].(map[string]any)["content"].([]any)
 	for _, p := range parts {
 		po := p.(map[string]any)
 		if po["type"] == "image_url" {
@@ -150,9 +155,9 @@ func TestG13ToolImages(t *testing.T) {
 			}
 		}
 	}
-	rep.Check("5 张图片原样进入 user 消息的 image_url 块（含 detail、JSON 字符串里的 `image`+`url` 别名）",
-		len(urls) == 5 && urls[0] == big && urls[1] == smallB && urls[2] == smallC && urls[3] == smallD &&
-			urls[4] == "https://example.com/shot.png" && detailB == "high",
+	rep.Check("6 张图片原样进入 user 消息的 image_url 块（含 detail、JSON 字符串里的 `image`+`url`、MCP `data`+`mimeType`）；无法转换的图片对象保留为 JSON 文本",
+		len(urls) == 6 && urls[0] == big && urls[1] == smallB && urls[2] == smallC && urls[3] == smallD &&
+			urls[4] == "https://example.com/shot.png" && urls[5] == smallD && detailB == "high",
 		"images=%d big_intact=%v detail_b=%q", len(urls), len(urls) > 0 && urls[0] == big, detailB)
 
 	var toolNames []string
