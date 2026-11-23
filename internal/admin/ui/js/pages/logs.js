@@ -24,6 +24,53 @@ function kvRow(k, v) {
   );
 }
 
+// cacheHit returns the share of input tokens served from the upstream prompt
+// cache, or null when the request had no input tokens.
+function cacheHit(r) {
+  const prompt = Number(r.prompt_tokens || 0);
+  if (prompt <= 0) return null;
+  return Math.min(1, Number(r.cached_tokens || 0) / prompt);
+}
+
+// outputSpeed returns output tokens per second. Streaming responses are timed
+// from the first token to the end (generation only). Non-streaming responses
+// record TTFT when the whole body arrives, so they — and streams whose
+// generation span is too short to time — fall back to end-to-end latency,
+// which includes prefill.
+const MIN_GEN_MS = 50;
+function outputSpeed(r) {
+  const out = Number(r.completion_tokens || 0);
+  const total = Number(r.latency_ms || 0);
+  if (out <= 0 || total <= 0) return null;
+  const gen = total - Number(r.ttft_ms || 0);
+  if (r.stream && r.ttft_ms > 0 && gen >= MIN_GEN_MS) return { tps: (out * 1000) / gen, basis: 'gen' };
+  return { tps: (out * 1000) / total, basis: 'e2e' };
+}
+
+function fmtTps(v) {
+  return v >= 100 ? Math.round(v).toLocaleString('en-US') : v.toFixed(1);
+}
+
+function cacheCell(r) {
+  const hit = cacheHit(r);
+  if (hit === null) return el('span', { className: 'muted' }, '-');
+  const pct = Math.round(hit * 100);
+  return el('span', { className: 'cache-cell', title: `命中 ${fmtNum(r.cached_tokens)} / 输入 ${fmtNum(r.prompt_tokens)} Token` },
+    el('span', { className: 'cache-bar', 'aria-hidden': 'true' },
+      el('span', { className: 'cache-bar-fill', style: { width: `${pct}%` } })),
+    el('span', { className: pct ? 'num' : 'num muted' }, `${pct}%`)
+  );
+}
+
+function speedCell(r) {
+  const sp = outputSpeed(r);
+  if (!sp) return el('span', { className: 'muted' }, '-');
+  return el('span', {
+    className: sp.basis === 'gen' ? 'num' : 'num muted-2',
+    title: sp.basis === 'gen' ? '首字之后的生成速度' : '按端到端耗时计算（含预填充）',
+  }, fmtTps(sp.tps));
+}
+
 function sectionGroup(title, rows) {
   return el('div', null,
     el('div', { className: 'muted', style: { fontSize: '12px', fontWeight: 600, marginBottom: '4px' } }, title),
@@ -72,8 +119,14 @@ export function renderLogs(container, ctx) {
           kvRow('输入 Token', fmtNum(r.prompt_tokens)),
           kvRow('输出 Token', fmtNum(r.completion_tokens)),
           kvRow('缓存命中 Token', fmtNum(r.cached_tokens)),
+          kvRow('缓存命中率', cacheHit(r) === null ? '-' : `${(cacheHit(r) * 100).toFixed(1)}%`),
           kvRow('端到端耗时', `${fmtNum(r.latency_ms)} ms`),
           kvRow('首字延迟 TTFT', r.ttft_ms ? `${fmtNum(r.ttft_ms)} ms` : '-'),
+          kvRow('输出速度', (() => {
+            const sp = outputSpeed(r);
+            if (!sp) return '-';
+            return `${fmtTps(sp.tps)} tok/s（${sp.basis === 'gen' ? '首字后生成段' : '端到端，含预填充'}）`;
+          })()),
         ]),
         sectionGroup('脱敏审计', [
           kvRow('脱敏策略', r.redaction_mode || 'none'),
@@ -212,8 +265,10 @@ export function renderLogs(container, ctx) {
                 el('th', null, '路由'),
                 el('th', null, '状态'),
                 el('th', { className: 'th-right' }, 'Token (输入 / 输出)'),
+                el('th', null, '缓存命中'),
                 el('th', null, '脱敏'),
-                el('th', { className: 'th-right' }, '耗时 / TTFT')
+                el('th', { className: 'th-right' }, '耗时 / TTFT'),
+                el('th', { className: 'th-right', title: '输出 Token 每秒' }, 'tok/s')
               )
             ),
             el('tbody', null,
@@ -239,14 +294,16 @@ export function renderLogs(container, ctx) {
                       : el('span', { className: 'muted' }, '-')
                   ),
                   el('td', { className: 'nowrap' },
-                    el('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+                    // Error code under the badge, like the model path, so the table fits 1440px.
+                    el('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '2px' } },
                       statusBadge(r.status),
-                      r.error_code ? el('span', { className: 'mono muted', style: { fontSize: '12px' } }, r.error_code) : null
+                      r.error_code ? el('span', { className: 'mono muted', style: { fontSize: '11px' } }, r.error_code) : null
                     )
                   ),
                   el('td', { className: 'td-right num' },
                     `${fmtNum(r.prompt_tokens)} / ${fmtNum(r.completion_tokens)}`
                   ),
+                  el('td', { className: 'nowrap' }, cacheCell(r)),
                   el('td', null,
                     r.redaction_count > 0 || (r.redaction_mode && r.redaction_mode !== 'off' && r.redaction_mode !== 'none')
                       ? el('span', { className: `pill ${r.redaction_mode === 'block' ? 'pill-err' : 'pill-brass'} num` },
@@ -256,7 +313,8 @@ export function renderLogs(container, ctx) {
                   ),
                   el('td', { className: 'td-right num', style: { whiteSpace: 'nowrap' } },
                     `${fmtNum(r.latency_ms)}ms${r.ttft_ms ? ` / ${fmtNum(r.ttft_ms)}ms` : ''}`
-                  )
+                  ),
+                  el('td', { className: 'td-right' }, speedCell(r))
                 )
               )
             )

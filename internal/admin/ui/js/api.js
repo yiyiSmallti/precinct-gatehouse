@@ -69,6 +69,11 @@ export const api = {
   me: () => request('GET', '/admin/api/me', undefined, { skipAuthRedirect: true }),
   login: (username, password) =>
     request('POST', '/admin/api/login', { username, password }, { skipAuthRedirect: true }),
+  setupStatus: () => request('GET', '/admin/api/setup', undefined, { skipAuthRedirect: true }),
+  setup: (code, username, password) =>
+    request('POST', '/admin/api/setup', { code, username, password }, { skipAuthRedirect: true }),
+  stats: (params) => request('GET', `/admin/api/stats${buildQuery(params)}`),
+  resetKeyUsage: (id) => request('POST', `/admin/api/keys/${encodeURIComponent(id)}/reset-usage`, {}),
   logout: () => request('POST', '/admin/api/logout', {}),
   changePassword: (oldPwd, newPwd) =>
     request('POST', '/admin/api/password', { old: oldPwd, new: newPwd }),

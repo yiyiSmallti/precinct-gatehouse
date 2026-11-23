@@ -124,7 +124,7 @@ type reqState struct {
 	written       bool
 	keepaliveOnly bool
 	ttft          time.Duration
-	release       func(status int)
+	release       func(status int, tokens int64)
 	admitted      bool
 	errorCode     string
 	clientStream  bool
@@ -174,7 +174,7 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 		}
 	}
 	if st.release != nil {
-		st.release(st.rec.Status)
+		st.release(st.rec.Status, int64(st.rec.PromptTokens+st.rec.CompletionTokens))
 	}
 	st.rec.LatencyMS = time.Since(st.start).Milliseconds()
 	if p.Meter != nil {
@@ -331,8 +331,8 @@ func (p *Pipeline) handle(ctx context.Context, st *reqState, r *http.Request) er
 			}
 			return lerr.Err
 		}
-		st.release = func(status int) {
-			rel(status > 0 && status < 500)
+		st.release = func(status int, tokens int64) {
+			rel(status > 0 && status < 500, tokens)
 		}
 	}
 	st.admitted = true

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -594,6 +595,14 @@ func (c *Config) Validate() []string {
 	if c.RequestLogDays != nil && *c.RequestLogDays < 0 {
 		add("request_log_days: must be >= 0")
 	}
+	for _, l := range [][2]string{{"listen", c.Listen}, {"admin.listen", c.Admin.Listen}} {
+		if l[1] == "" {
+			continue
+		}
+		if _, port, err := net.SplitHostPort(l[1]); err != nil || port == "" {
+			add("%s: must look like 127.0.0.1:7788, got %q", l[0], l[1])
+		}
+	}
 	if c.Mode != "personal" && c.Mode != "org" {
 		add("mode: must be personal or org, got %q", c.Mode)
 	}
@@ -608,9 +617,6 @@ func (c *Config) Validate() []string {
 		add("mode: org needs exactly one plugin of kind auth_policy, found %d", policies)
 	case c.Mode != "org" && policies > 0:
 		add("plugins: auth_policy plugins are only used in org mode")
-	}
-	if len(c.Providers) == 0 {
-		add("providers: at least one provider is required")
 	}
 	provs := map[string]*Provider{}
 	for i := range c.Providers {
@@ -902,47 +908,19 @@ func normalizeYAMLValue(v any) any {
 	}
 }
 
-// Sample is written by `gatehouse serve` when no config exists.
-const Sample = `# Gatehouse personal-mode configuration.
-# Docs: https://github.com/yiyiSmallti/precinct-gatehouse
+// Sample is written by `gatehouse serve` when no config exists. It boots
+// with no providers; everything else is configured from the web console,
+// which rewrites this file.
+const Sample = `# Gatehouse configuration. Edit it from the web console instead of by hand:
+#   http://127.0.0.1:7789/admin/
 listen: 127.0.0.1:7788
 mode: personal
 
-providers:
-  - name: ds
-    base_url: https://api.deepseek.com/v1
-    key_ref: keychain:ds          # store it with: gatehouse key set ds
-    models: [deepseek-chat, deepseek-reasoner]
-    pricing:
-      deepseek-chat: { input: 2, output: 8 }
-      deepseek-reasoner: { input: 4, output: 16 }
-  - name: local
-    base_url: http://127.0.0.1:11434/v1   # Ollama; loopback targets count as "local"
-    models: [qwen2.5:3b]
-
-default_group: default
-routing_groups:
-  default:
-    type: order
-    members: [ds/deepseek-chat, local/qwen2.5:3b]
-    classifier: local/qwen2.5:3b
-    rules:
-      - intent: "闲聊、问候、简单问答"
-        use: local/qwen2.5:3b
-        useEffort: low
-      - tokens_gt: 20000
-        use: ds/deepseek-chat
-      - intent: "多步推理或写长文"
-        use: ds/deepseek-reasoner
-        useEffort: medium
+admin:
+  listen: 127.0.0.1:7789
 
 redaction:
   mode_by_target: { local: audit, external: mask }
   categories: { phone: mask, id_card: mask, bank_card: mask, secret: block }
-  # dictionary: ~/.gatehouse/words.txt
-  never_mask: []
   fail_closed: true
-
-# meter:
-#   otlp: { endpoint: http://127.0.0.1:4318, interval: 30s }
 `

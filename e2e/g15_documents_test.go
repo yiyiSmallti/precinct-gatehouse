@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-const g14Config = `
+const g15Config = `
 listen: {{LISTEN}}
 mode: personal
 providers:
@@ -31,25 +31,25 @@ model_aliases:
 `
 
 const (
-	g14DocxText = "季度报告正文：营收增长百分之十二。"
-	g14PDFText  = "Gatehouse quarterly PDF revenue"
+	g15DocxText = "季度报告正文：营收增长百分之十二。"
+	g15PDFText  = "Gatehouse quarterly PDF revenue"
 )
 
-// g14Docx builds a .docx whose body is two paragraphs.
-func g14Docx() []byte {
+// g15Docx builds a .docx whose body is two paragraphs.
+func g15Docx() []byte {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	w, _ := zw.Create("[Content_Types].xml")
 	w.Write([]byte(`<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`))
 	w, _ = zw.Create("word/document.xml")
 	w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>` +
-		`<w:p><w:r><w:t>` + g14DocxText + `</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">第二段 </w:t></w:r><w:r><w:t>结束</w:t></w:r></w:p></w:body></w:document>`))
+		`<w:p><w:r><w:t>` + g15DocxText + `</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">第二段 </w:t></w:r><w:r><w:t>结束</w:t></w:r></w:p></w:body></w:document>`))
 	zw.Close()
 	return buf.Bytes()
 }
 
-// g14PDF builds a one-page PDF showing text, with a correct xref table.
-func g14PDF(text string) []byte {
+// g15PDF builds a one-page PDF showing text, with a correct xref table.
+func g15PDF(text string) []byte {
 	stream := "BT /F1 18 Tf 50 700 Td (" + text + ") Tj ET"
 	objs := []string{
 		"<< /Type /Catalog /Pages 2 0 R >>",
@@ -74,13 +74,13 @@ func g14PDF(text string) []byte {
 	return b.Bytes()
 }
 
-func g14Rand(seed int64, n int) []byte {
+func g15Rand(seed int64, n int) []byte {
 	b := make([]byte, n)
 	rand.New(rand.NewSource(seed)).Read(b)
 	return b
 }
 
-func g14Roles(ms []any) string {
+func g15Roles(ms []any) string {
 	var r []string
 	for _, m := range ms {
 		r = append(r, fmt.Sprint(m.(map[string]any)["role"]))
@@ -88,11 +88,11 @@ func g14Roles(ms []any) string {
 	return strings.Join(r, ",")
 }
 
-func TestG14Documents(t *testing.T) {
-	rep := newReport(t, "G14-documents", "G14 文档块、Codex 输入项与二进制工具输出（issue #11 补充需求）",
+func TestG15Documents(t *testing.T) {
+	rep := newReport(t, "G15-documents", "G15 文档块、Codex 输入项与二进制工具输出（issue #11 补充需求）",
 		"假上游记录网关转发的 Chat Completions 请求。覆盖 `/v1/messages` 的 `document` 块与 `tool_result` 图片、`/v1/responses` 的 `input_file`、`custom` 工具与 Codex 输入项、assistant 文本与工具调用合并，以及所有协议共用的二进制工具输出拦截。")
 	fake := startFake(t, "ds")
-	g := startGateway(t, fmt.Sprintf(g14Config, fake.URL), nil)
+	g := startGateway(t, fmt.Sprintf(g15Config, fake.URL), nil)
 	createOut := g.CLI(t, "apikey", "create", "--name", "doc-key", "--json")
 	var keyRes struct {
 		Key string `json:"key"`
@@ -103,10 +103,10 @@ func TestG14Documents(t *testing.T) {
 	antHdr := map[string]string{"x-api-key": keyRes.Key}
 	oaiHdr := map[string]string{"Authorization": "Bearer " + keyRes.Key}
 
-	docx := base64.StdEncoding.EncodeToString(g14Docx())
-	pdfB64 := base64.StdEncoding.EncodeToString(g14PDF(g14PDFText))
-	badPDF := base64.StdEncoding.EncodeToString(append([]byte("%PDF-1.7\n"), g14Rand(7, 30<<10)...))
-	png := base64.StdEncoding.EncodeToString(g14Rand(8, 6<<10))
+	docx := base64.StdEncoding.EncodeToString(g15Docx())
+	pdfB64 := base64.StdEncoding.EncodeToString(g15PDF(g15PDFText))
+	badPDF := base64.StdEncoding.EncodeToString(append([]byte("%PDF-1.7\n"), g15Rand(7, 30<<10)...))
+	png := base64.StdEncoding.EncodeToString(g15Rand(8, 6<<10))
 	lastUp := func() (map[string]any, string) {
 		reqs := fake.Requests()
 		raw := reqs[len(reqs)-1]
@@ -151,13 +151,13 @@ func TestG14Documents(t *testing.T) {
 	}
 	ft := firstText.String()
 	rep.Check("`/v1/messages` document：docx 解出中文正文、PDF 解出文本、无法解析的 PDF 换成提示",
-		rA.Status == 200 && strings.Contains(ft, g14DocxText) && strings.Contains(ft, "第二段 结束") && strings.Contains(ft, g14PDFText) &&
+		rA.Status == 200 && strings.Contains(ft, g15DocxText) && strings.Contains(ft, "第二段 结束") && strings.Contains(ft, g15PDFText) &&
 			strings.Contains(ft, "未解析的二进制文档（scan.pdf"),
 		"status=%d text=%.300q", rA.Status, ft)
 	rep.Check("`/v1/messages` 不向上游透传文档原始 base64",
 		!strings.Contains(rawA, docx[:200]) && !strings.Contains(rawA, pdfB64[:120]) && !strings.Contains(rawA, badPDF[:200]),
 		"docx=%v pdf=%v bad=%v", strings.Contains(rawA, docx[:200]), strings.Contains(rawA, pdfB64[:120]), strings.Contains(rawA, badPDF[:200]))
-	rolesA := g14Roles(msgsA)
+	rolesA := g15Roles(msgsA)
 	toolA1, _ := msgsA[2].(map[string]any)["content"].(string)
 	toolA2, _ := msgsA[3].(map[string]any)["content"].(string)
 	carrierA, _ := msgsA[4].(map[string]any)["content"].([]any)
@@ -168,7 +168,7 @@ func TestG14Documents(t *testing.T) {
 		}
 	}
 	rep.Check("`/v1/messages` tool_result 图片拆到该批 tool 之后的 user 消息，tool_result 里的 PDF 转为文本",
-		rolesA == "user,assistant,tool,tool,user,user" && toolA1 == "截图完成" && strings.Contains(toolA2, g14PDFText) &&
+		rolesA == "user,assistant,tool,tool,user,user" && toolA1 == "截图完成" && strings.Contains(toolA2, g15PDFText) &&
 			carrierImg == "data:image/png;base64,"+png,
 		"roles=%s tool1=%q tool2=%.80q image_ok=%v", rolesA, toolA1, toolA2, carrierImg == "data:image/png;base64,"+png)
 
@@ -204,7 +204,7 @@ func TestG14Documents(t *testing.T) {
 	})
 	upR, rawR := lastUp()
 	msgsR, _ := upR["messages"].([]any)
-	rolesR := g14Roles(msgsR)
+	rolesR := g15Roles(msgsR)
 	rep.Check("`/v1/responses` 含 compaction/web_search_call/item_reference/custom_tool_call/local_shell_call 不再 400，跳过项写入 `X-Gatehouse-Dropped-Items`",
 		rR.Status == 200 && rR.Header.Get("X-Gatehouse-Dropped-Items") == "web_search_call, item_reference",
 		"status=%d dropped_items=%q body=%.150s", rR.Status, rR.Header.Get("X-Gatehouse-Dropped-Items"), rR.Raw)
@@ -229,8 +229,8 @@ func TestG14Documents(t *testing.T) {
 	toolR1, _ := msgsR[3].(map[string]any)["content"].(string)
 	toolR2, _ := msgsR[4].(map[string]any)["content"].(string)
 	rep.Check("compaction 摘要保留为文本；input_file（消息与工具输出）解析为文本且无原始 base64；JSON 字符串形式的 input_file 工具输出也转为文本",
-		strings.Contains(comp, "之前讨论了季度报告") && strings.Contains(userRText.String(), g14DocxText) &&
-			strings.Contains(toolR1, g14PDFText) && strings.Contains(toolR2, "[文档：patch.pdf]") && strings.Contains(toolR2, g14PDFText) && !strings.Contains(rawR, docx[:200]) && !strings.Contains(rawR, pdfB64[:120]),
+		strings.Contains(comp, "之前讨论了季度报告") && strings.Contains(userRText.String(), g15DocxText) &&
+			strings.Contains(toolR1, g15PDFText) && strings.Contains(toolR2, "[文档：patch.pdf]") && strings.Contains(toolR2, g15PDFText) && !strings.Contains(rawR, docx[:200]) && !strings.Contains(rawR, pdfB64[:120]),
 		"compaction=%q user=%.80q tool_read=%.60q tool_patch=%q", comp, userRText.String(), toolR1, toolR2)
 	var fnTool map[string]any
 	upTools, _ := upR["tools"].([]any)
@@ -324,8 +324,8 @@ func TestG14Documents(t *testing.T) {
 		"custom_items=%v custom_input=%q function_items=%v function_args=%q", lTypes, lInput, fTypes, fArgs)
 
 	// --- binary tool output guard (all protocols) ---
-	garbage := string(g14Rand(9, 24<<10))                                                                   // invalid UTF-8 → U+FFFD after JSON
-	zipText := "PK\x03\x04" + strings.Repeat("word/document.xml docProps ", 400) + string(g14Rand(10, 300)) // mostly printable
+	garbage := string(g15Rand(9, 24<<10))                                                                   // invalid UTF-8 → U+FFFD after JSON
+	zipText := "PK\x03\x04" + strings.Repeat("word/document.xml docProps ", 400) + string(g15Rand(10, 300)) // mostly printable
 	var normal strings.Builder
 	for normal.Len() < 24<<10 {
 		normal.WriteString("2026-11-23 10:00:01 \x1b[32mINFO\x1b[0m 处理请求 id=42 耗时 12ms\nfunc main() {\n\tfmt.Println(\"你好\")\n}\n")
