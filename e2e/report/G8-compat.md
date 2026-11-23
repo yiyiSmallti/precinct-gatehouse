@@ -1,6 +1,6 @@
 # G8 协议适配（Anthropic Messages & OpenAI Responses）
 
-结果：**通过** · 运行于 2026-11-22 20:17:19 PST · darwin/arm64
+结果：**通过** · 运行于 2026-11-22 20:38:37 PST · darwin/arm64
 
 验证 `/v1/messages`、`/v1/messages/count_tokens`、`/v1/responses` 的非流式/流式、thinking、tool_calls、别名路由、`system_prompt`/`extra_body` 注入及限额与 `request_log`。
 

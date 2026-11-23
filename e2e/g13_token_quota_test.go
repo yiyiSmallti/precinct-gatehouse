@@ -22,6 +22,12 @@ listen: {{LISTEN}}
 mode: personal
 admin:
   listen: %s
+meter:
+  otlp:
+    endpoint: http://127.0.0.1:9
+    interval: 1h
+    headers:
+      X-Collector-Tenant: g13-e2e
 providers:
   - name: p
     base_url: %s
@@ -200,6 +206,23 @@ func TestG13TokenQuota(t *testing.T) {
 	byKey, _ := stats["by_key"].([]any)
 	rep.Check("统计接口返回请求数、限流数与按 Key 排行", st == 200 && reqs >= 5 && limited >= 3 && len(byKey) >= 2,
 		"status=%d requests=%v rate_limited=%v by_key=%d", st, totals["requests"], totals["rate_limited"], len(byKey))
+
+	st, statsM := adm(http.MethodGet, "/admin/api/stats?days=1&model=p/model-a", nil)
+	totalsM, _ := statsM["totals"].(map[string]any)
+	limitedM, _ := totalsM["rate_limited"].(float64)
+	rep.Check("按模型筛选时保留路由前被拒的请求（配额 429 仍计入该模型）", st == 200 && limitedM == limited,
+		"status=%d rate_limited all=%v model=%v", st, limited, totalsM["rate_limited"])
+
+	// 5b. Saving the general section from the console keeps OTLP headers it does not edit.
+	_, cfgView := adm(http.MethodGet, "/admin/api/config", nil)
+	hash, _ := cfgView["hash"].(string)
+	st, _ = adm(http.MethodPut, "/admin/api/config/sections/general", map[string]any{
+		"base_hash": hash,
+		"data":      map[string]any{"max_body_mb": 16, "meter": map[string]any{"otlp": map[string]any{"endpoint": "http://127.0.0.1:9", "interval": "2h"}}},
+	})
+	saved, _ := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	rep.Check("控制台保存常规参数后 OTLP headers 不丢失", st == 200 && strings.Contains(string(saved), "X-Collector-Tenant: g13-e2e") && strings.Contains(string(saved), "max_body_mb: 16"),
+		"status=%d headers_kept=%v", st, strings.Contains(string(saved), "X-Collector-Tenant"))
 
 	// 6. Restart: the ledger keeps the total quota enforced.
 	g.Stop()

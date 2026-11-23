@@ -1,6 +1,6 @@
 # G3 fail-closed
 
-结果：**通过** · 运行于 2026-11-22 20:16:56 PST · darwin/arm64
+结果：**通过** · 运行于 2026-11-22 20:38:13 PST · darwin/arm64
 
 检测器插件 `ner`（e2e/fakedetector，go-plugin gRPC 子进程，识别人名 PERSON）被声明为必需（`redaction.detectors: [ner]`）。分三种情况：插件正常、配置里禁用、运行中进程被杀。
 

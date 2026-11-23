@@ -135,6 +135,11 @@ func applySectionToRaw(raw *config.Config, section string, data json.RawMessage)
 			raw.Admin = *gen.Admin
 		}
 		if gen.Meter != nil {
+			// The console edits only endpoint and interval; keep collector
+			// headers (often auth) when the submission does not carry them.
+			if gen.Meter.OTLP != nil && gen.Meter.OTLP.Headers == nil && raw.Meter.OTLP != nil {
+				gen.Meter.OTLP.Headers = raw.Meter.OTLP.Headers
+			}
 			raw.Meter = *gen.Meter
 			if raw.Meter.OTLP != nil && strings.TrimSpace(raw.Meter.OTLP.Endpoint) == "" {
 				raw.Meter.OTLP = nil

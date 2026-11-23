@@ -43,6 +43,12 @@ type statsSlice struct {
 	AvgLatencyMS     float64 `json:"avg_latency_ms"`
 }
 
+// effectiveModelExpr names the model a log row is attributed to. Requests
+// rejected before routing (quota, permission) have no upstream model but keep
+// requested_model; ranking and filtering must use the same expression so that
+// drilling into a ranked model keeps its errors.
+const effectiveModelExpr = `COALESCE(NULLIF(model,''), NULLIF(requested_model,''), '(unknown)')`
+
 // stats serves GET /admin/api/stats?days=1|7|14|30|90&key=<key_id>&model=<model>.
 // days=1 returns 24 hourly buckets; longer ranges return daily buckets. Every
 // bucket in the range is present (zero-filled) so charts need no gap logic.
@@ -71,7 +77,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request, _ string) {
 		fargs = append(fargs, k)
 	}
 	if m := strings.TrimSpace(q.Get("model")); m != "" {
-		filter = append(filter, "model = ?")
+		filter = append(filter, effectiveModelExpr+" = ?")
 		fargs = append(fargs, m)
 	}
 	where = append(where, filter...)
@@ -91,7 +97,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request, _ string) {
 		var t statsTotals
 		err := db.QueryRow(`SELECT `+aggCols+`,
 			COALESCE(SUM(CASE WHEN status=429 THEN 1 ELSE 0 END),0),
-			COUNT(DISTINCT NULLIF(key_id,'')), COUNT(DISTINCT NULLIF(model,''))
+			COUNT(DISTINCT NULLIF(key_id,'')), COUNT(DISTINCT COALESCE(NULLIF(model,''), NULLIF(requested_model,'')))
 			FROM request_log WHERE `+c, a...).Scan(
 			&t.Requests, &t.Errors, &t.PromptTokens, &t.CompletionTokens, &t.CachedTokens,
 			&t.AvgLatencyMS, &t.AvgTTFTMS, &t.RateLimited, &t.ActiveKeys, &t.ActiveModels)
@@ -168,7 +174,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request, _ string) {
 		}
 		return out, rows.Err()
 	}
-	byModel, err := slices(`COALESCE(NULLIF(model,''), NULLIF(requested_model,''), '(unknown)')`, `''`, 12)
+	byModel, err := slices(effectiveModelExpr, `''`, 12)
 	if err != nil {
 		fail(err)
 		return

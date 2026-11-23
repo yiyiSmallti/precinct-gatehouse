@@ -290,7 +290,8 @@ export function renderSettings(container) {
                 label: '启用 OTLP 指标导出',
                 onChange: (on) => {
                   otlpEndpoint.disabled = !on;
-                  setGen((n) => { n.meter = { otlp: on ? { endpoint: otlpEndpoint.value.trim() || 'http://127.0.0.1:4318', interval: '' } : null }; });
+                  // Re-enabling restores the saved OTLP block (headers included) rather than a bare endpoint.
+                  setGen((n) => { n.meter = { otlp: on ? { ...(gen.meter?.otlp || {}), endpoint: otlpEndpoint.value.trim() || 'http://127.0.0.1:4318' } : null }; });
                   if (on && !otlpEndpoint.value) otlpEndpoint.value = 'http://127.0.0.1:4318';
                 },
               }),

@@ -50,6 +50,14 @@ type Limiter struct {
 	db     *sql.DB
 	mu     sync.Mutex
 	states map[string]*keyState
+
+	// ledgerMu orders token-ledger writes against ledger reloads. A charge
+	// (ledger write + in-memory increment) is therefore either fully before
+	// a reload's query, so the snapshot includes it, or fully after the
+	// reload's assignment, so it adds on top; a stale snapshot can never
+	// overwrite a live charge. Lock order: ledgerMu, then mu. mu is still
+	// never held across database access.
+	ledgerMu sync.Mutex
 }
 
 // New creates a Limiter backed by db for daily count initialization.
@@ -70,6 +78,8 @@ func (l *Limiter) ensureDay(keyID, day string) error {
 	}
 
 	// Never hold l.mu across database access.
+	l.ledgerMu.Lock()
+	defer l.ledgerMu.Unlock()
 	var count int
 	var tokToday, tokMonth, tokTotal int64
 	if l.db != nil {
@@ -179,22 +189,27 @@ func (l *Limiter) Acquire(keyID string, lim keys.Limits, now time.Time) (func(co
 					ks.todayCount++
 				}
 			}
-			if tokens > 0 {
-				if ks.day == day {
-					ks.tokToday += tokens
-				}
-				if ks.day[:7] == day[:7] {
-					ks.tokMonth += tokens
-				}
-				ks.tokTotal += tokens
-			}
 			l.mu.Unlock()
-			if tokens > 0 && l.db != nil {
+			if tokens <= 0 {
+				return
+			}
+			l.ledgerMu.Lock()
+			defer l.ledgerMu.Unlock()
+			if l.db != nil {
 				// Charge the day the request was admitted on, matching the
-				// in-memory counters above.
+				// in-memory counters below.
 				_, _ = l.db.Exec(`INSERT INTO key_token_usage(key_id, day, tokens) VALUES(?,?,?)
 					ON CONFLICT(key_id, day) DO UPDATE SET tokens = tokens + excluded.tokens`, keyID, day, tokens)
 			}
+			l.mu.Lock()
+			if ks.day == day {
+				ks.tokToday += tokens
+			}
+			if len(ks.day) >= 7 && ks.day[:7] == day[:7] {
+				ks.tokMonth += tokens
+			}
+			ks.tokTotal += tokens
+			l.mu.Unlock()
 		})
 	}, nil
 }
@@ -228,6 +243,8 @@ func quotaErr(period string, used, limit int64, wait time.Duration) *Error {
 // ResetTokens forgets all recorded token usage for keyID, so every token
 // quota of the key starts again from zero.
 func (l *Limiter) ResetTokens(keyID string) error {
+	l.ledgerMu.Lock()
+	defer l.ledgerMu.Unlock()
 	if l.db != nil {
 		if _, err := l.db.Exec(`DELETE FROM key_token_usage WHERE key_id=?`, keyID); err != nil {
 			return err
