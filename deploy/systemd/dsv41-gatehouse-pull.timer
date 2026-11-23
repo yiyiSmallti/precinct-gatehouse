@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic check for Precinct Gatehouse updates on domestic OCI mirror (disabled by default)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

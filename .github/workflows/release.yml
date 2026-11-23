@@ -1,0 +1,274 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label (leave empty for manual-<short_sha>)"
+        required: false
+        default: ""
+        type: string
+      create_github_release:
+        description: "Also publish a GitHub Release when triggered manually"
+        required: false
+        default: false
+        type: boolean
+      push_mirror:
+        description: "Push artifact OCI image to domestic mirror (CN_REGISTRY_*)"
+        required: false
+        default: true
+        type: boolean
+      update_latest:
+        description: "Also update :latest tag on domestic mirror (stable v* tags always update :latest)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Quality gate (gofmt, vet, tests)
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: Resolve version and release metadata
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_CREATE_RELEASE: ${{ inputs.create_github_release }}
+          INPUT_UPDATE_LATEST: ${{ inputs.update_latest }}
+        run: |
+          set -euo pipefail
+          IS_TAG="false"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+            IS_TAG="true"
+          elif [ -n "${INPUT_VERSION}" ]; then
+            if ! [[ "${INPUT_VERSION}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::Invalid version '${INPUT_VERSION}'. Allowed characters: A-Z a-z 0-9 . _ -"
+              exit 1
+            fi
+            VERSION="${INPUT_VERSION}"
+          else
+            VERSION="manual-$(git rev-parse --short=7 HEAD)"
+          fi
+
+          if ! [[ "${VERSION}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Resolved version '${VERSION}' contains invalid characters."
+            exit 1
+          fi
+
+          IS_PRERELEASE="false"
+          if [[ "${VERSION}" == *-* ]]; then
+            IS_PRERELEASE="true"
+          fi
+
+          SHOULD_UPDATE_LATEST="false"
+          if { [ "${IS_TAG}" = "true" ] && [ "${IS_PRERELEASE}" = "false" ]; } || [ "${INPUT_UPDATE_LATEST}" = "true" ]; then
+            SHOULD_UPDATE_LATEST="true"
+          fi
+
+          SHOULD_CREATE_RELEASE="false"
+          if [ "${IS_TAG}" = "true" ] || [ "${INPUT_CREATE_RELEASE}" = "true" ]; then
+            SHOULD_CREATE_RELEASE="true"
+          fi
+
+          COMMIT="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          {
+            echo "version=${VERSION}"
+            echo "commit=${COMMIT}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "built_at=${BUILT_AT}"
+            echo "is_tag=${IS_TAG}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "should_update_latest=${SHOULD_UPDATE_LATEST}"
+            echo "should_create_release=${SHOULD_CREATE_RELEASE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build static linux/amd64 binary and package
+        id: build
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+          BUILT_AT: ${{ steps.meta.outputs.built_at }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stage
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o dist/stage/gatehouse \
+            ./cmd/gatehouse
+          chmod 0755 dist/stage/gatehouse
+
+          VERSION_OUT="$(./dist/stage/gatehouse version)"
+          echo "Binary reported: ${VERSION_OUT}"
+          if [[ "${VERSION_OUT}" != *"${VERSION}"* ]]; then
+            echo "::error::Expected 'gatehouse version' to contain '${VERSION}', got '${VERSION_OUT}'"
+            exit 1
+          fi
+
+          BINARY_SHA256="$(sha256sum dist/stage/gatehouse | awk '{print $1}')"
+          printf '%s  gatehouse\n' "${BINARY_SHA256}" > dist/stage/SHA256SUMS
+
+          jq -n \
+            --arg version "${VERSION}" \
+            --arg commit "${COMMIT}" \
+            --arg short_sha "${SHORT_SHA}" \
+            --arg built_at "${BUILT_AT}" \
+            --arg arch "linux/amd64" \
+            --arg binary_sha256 "${BINARY_SHA256}" \
+            '{
+              version: $version,
+              commit: $commit,
+              short_sha: $short_sha,
+              built_at: $built_at,
+              arch: $arch,
+              binary_sha256: $binary_sha256
+            }' > dist/stage/RELEASE_META
+
+          TARBALL_NAME="gatehouse_${VERSION}_linux_amd64.tar.gz"
+          tar -C dist/stage -czf "dist/${TARBALL_NAME}" gatehouse SHA256SUMS RELEASE_META
+          (cd dist && sha256sum "${TARBALL_NAME}" > SHA256SUMS)
+
+          {
+            echo "binary_sha256=${BINARY_SHA256}"
+            echo "tarball_name=${TARBALL_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatehouse-${{ steps.meta.outputs.version }}-linux-amd64
+          path: |
+            dist/gatehouse_*_linux_amd64.tar.gz
+            dist/SHA256SUMS
+            dist/stage/RELEASE_META
+
+      - name: Publish GitHub Release
+        id: gh_release
+        if: ${{ steps.meta.outputs.should_create_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          IS_PRERELEASE: ${{ steps.meta.outputs.is_prerelease }}
+          TARBALL_NAME: ${{ steps.build.outputs.tarball_name }}
+        run: |
+          set -euo pipefail
+          ASSETS=(
+            "dist/${TARBALL_NAME}"
+            "dist/SHA256SUMS"
+            "dist/stage/RELEASE_META"
+          )
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            gh release upload "${VERSION}" "${ASSETS[@]}" --clobber
+          else
+            CREATE_ARGS=(
+              "${VERSION}"
+              "${ASSETS[@]}"
+              --title "${VERSION}"
+              --generate-notes
+            )
+            if [ "${IS_PRERELEASE}" = "true" ]; then
+              CREATE_ARGS+=(--prerelease)
+            fi
+            gh release create "${CREATE_ARGS[@]}"
+          fi
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push domestic mirror OCI artifact image
+        id: mirror
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_mirror }}
+        env:
+          CN_REGISTRY_IMAGE: ${{ secrets.CN_REGISTRY_IMAGE }}
+          CN_REGISTRY_USERNAME: ${{ secrets.CN_REGISTRY_USERNAME }}
+          CN_REGISTRY_PASSWORD: ${{ secrets.CN_REGISTRY_PASSWORD }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHOULD_UPDATE_LATEST: ${{ steps.meta.outputs.should_update_latest }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CN_REGISTRY_IMAGE}" ] || [ -z "${CN_REGISTRY_USERNAME}" ] || [ -z "${CN_REGISTRY_PASSWORD}" ]; then
+            echo "::notice::CN_REGISTRY_* secrets not configured; skipping domestic mirror push."
+            echo "mirror_pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          REGISTRY_HOST="${CN_REGISTRY_IMAGE%%/*}"
+          trap 'docker logout "${REGISTRY_HOST}" >/dev/null 2>&1 || true' EXIT
+
+          printf '%s' "${CN_REGISTRY_PASSWORD}" | docker login "${REGISTRY_HOST}" -u "${CN_REGISTRY_USERNAME}" --password-stdin
+
+          IMAGE_VER="${CN_REGISTRY_IMAGE}:${VERSION}"
+          BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker build \
+            --platform linux/amd64 \
+            -f deploy/Dockerfile.artifact \
+            -t "${IMAGE_VER}" \
+            dist/stage
+          docker push "${IMAGE_VER}"
+
+          if [ "${SHOULD_UPDATE_LATEST}" = "true" ]; then
+            IMAGE_LATEST="${CN_REGISTRY_IMAGE}:latest"
+            docker tag "${IMAGE_VER}" "${IMAGE_LATEST}"
+            docker push "${IMAGE_LATEST}"
+          fi
+
+          echo "mirror_pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Write release summary
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+          BINARY_SHA256: ${{ steps.build.outputs.binary_sha256 }}
+          SHOULD_CREATE_RELEASE: ${{ steps.meta.outputs.should_create_release }}
+          SHOULD_UPDATE_LATEST: ${{ steps.meta.outputs.should_update_latest }}
+          MIRROR_PUSHED: ${{ steps.mirror.outputs.mirror_pushed }}
+          GH_PUBLISHED: ${{ steps.gh_release.outputs.published }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Gatehouse Release Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Commit | \`${COMMIT}\` (\`${SHORT_SHA}\`) |"
+            echo "| Arch | \`linux/amd64\` |"
+            echo "| Binary SHA256 | \`${BINARY_SHA256}\` |"
+            echo "| GitHub Release | \`${GH_PUBLISHED:-false}\` (requested: \`${SHOULD_CREATE_RELEASE}\`) |"
+            echo "| Domestic Mirror Pushed | \`${MIRROR_PUSHED:-false}\` (latest updated: \`${SHOULD_UPDATE_LATEST}\`) |"
+            echo ""
+            echo "### Deploy to gpu1"
+            echo ""
+            echo "\`\`\`bash"
+            echo "# Option A: pull from domestic mirror (ACR/CCR)"
+            echo "./deploy/scripts/deploy-gpu1.sh pull ${VERSION}"
+            echo ""
+            echo "# Option B: fallback push directly from GitHub Release"
+            echo "./deploy/scripts/deploy-gpu1.sh release ${VERSION}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
