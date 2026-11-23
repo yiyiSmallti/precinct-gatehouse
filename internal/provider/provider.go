@@ -54,16 +54,17 @@ type Registry struct {
 
 // Provider is one upstream.
 type Provider struct {
-	Name         string
-	BaseURL      string
-	Target       string
-	Models       []string
-	Pricing      map[string]config.Pricing
-	SystemPrompt string
-	ExtraBody    map[string]any
-	key          string
-	client       *http.Client
-	plug         func(ctx context.Context, body []byte) (*http.Response, error)
+	Name            string
+	BaseURL         string
+	Target          string
+	Models          []string
+	Pricing         map[string]config.Pricing
+	SystemPrompt    string
+	ExtraBody       map[string]any
+	SSEKeepaliveSec int
+	key             string
+	client          *http.Client
+	plug            func(ctx context.Context, body []byte) (*http.Response, error)
 }
 
 // SetPlugin routes a provider's calls to a provider plugin.
@@ -89,9 +90,13 @@ func NewRegistry(cfg *config.Config, resolve func(ref string) (string, error)) (
 		if baseURL == "" && pc.Tiered != nil {
 			baseURL = "http://tiered.invalid/v1"
 		}
+		sseKeepaliveSec := 0
+		if pc.Tiered != nil {
+			sseKeepaliveSec = pc.Tiered.SSEKeepaliveSec
+		}
 		r.byName[pc.Name] = &Provider{
 			Name: pc.Name, BaseURL: baseURL, Target: pc.Target, Models: pc.Models, Pricing: pc.Pricing,
-			SystemPrompt: pc.SystemPrompt, ExtraBody: pc.ExtraBody, key: key,
+			SystemPrompt: pc.SystemPrompt, ExtraBody: pc.ExtraBody, SSEKeepaliveSec: sseKeepaliveSec, key: key,
 			client: &http.Client{
 				Timeout: pc.Timeout.D(300 * time.Second),
 				// never follow redirects: a redirect could replay the request

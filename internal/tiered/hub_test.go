@@ -895,3 +895,167 @@ func TestTieredLongPrefillSSEKeepaliveAndUpstreamError(t *testing.T) {
 		}
 	}
 }
+
+type hubCloseSpy struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (b *hubCloseSpy) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
+func TestTieredKeepaliveStreamPreservesBackendFailover(t *testing.T) {
+	var b1Mode atomic.Int32 // 0=503, 1=400 ctx len, 2=500 with sensitive body
+	b1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		time.Sleep(45 * time.Millisecond)
+		switch b1Mode.Load() {
+		case 0:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`unavailable`))
+		case 1:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"This model's maximum context length is 8192 tokens"}}`))
+		case 2:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`SECRET_PROMPT_ECHO`))
+		}
+	}))
+	defer b1.Close()
+
+	var b2Down atomic.Bool
+	b2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			if b2Down.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		if b2Down.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"from-b2\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer b2.Close()
+
+	hub := NewHub(t.TempDir(), nil)
+	defer func() { _ = hub.Close() }()
+
+	f := false
+	tc := config.TieredConfig{
+		Mode:               "active",
+		HeavyMissThreshold: 24000,
+		HealthIntervalSec:  60,
+		SSEKeepaliveSec:    1,
+		ZhThinkAnchor:      &f,
+		StarterCache:       &config.TieredStarterCache{Enabled: false},
+		Backends: []config.TieredBackend{
+			{ID: "b1", URL: b1.URL, Tier: 1, MaxContextTokens: 204800, MaxSafeInput: 185000, PromoteAt: 150000, SpeedScore: 55},
+			{ID: "b2", URL: b2.URL, Tier: 2, MaxContextTokens: 204800, MaxSafeInput: 185000, SpeedScore: 50},
+		},
+	}
+
+	tr, err := hub.Transport("p", "local", &tc, nil)
+	if err != nil {
+		t.Fatalf("Transport: %v", err)
+	}
+	hub.Activate(&config.Config{Providers: []config.Provider{{Name: "p", Target: "local", Tiered: &tc}}})
+	r, _ := hub.Router("p")
+	r.sseKeepaliveInitDelay.Store(int64(15 * time.Millisecond))
+
+	// 1. Slow b1 503 after keepalive starts must fail over to b2 seamlessly.
+	b1Mode.Store(0)
+	req1, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req1.Header.Set("Content-Type", "application/json")
+	resp1, err := tr.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("RoundTrip 1: %v", err)
+	}
+	body1Bytes, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	body1 := string(body1Bytes)
+	if !strings.HasPrefix(body1, ": keepalive\n\n") || !strings.Contains(body1, `"content":"from-b2"`) {
+		t.Fatalf("expected keepalive + failover content from b2 on 503, got %q", body1)
+	}
+
+	// 2. Slow b1 400 context-length error after keepalive starts must fail over to higher-tier b2.
+	b1Mode.Store(1)
+	req2, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"ctx"}]}`)))
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := tr.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("RoundTrip 2: %v", err)
+	}
+	body2Bytes, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	body2 := string(body2Bytes)
+	if !strings.HasPrefix(body2, ": keepalive\n\n") || !strings.Contains(body2, `"content":"from-b2"`) {
+		t.Fatalf("expected keepalive + failover content from b2 on 400 context-length, got %q", body2)
+	}
+
+	// 3. Post-keepalive HTTP 500 error body must NOT be embedded in SSE error chunk.
+	b1Mode.Store(2)
+	b2Down.Store(true)
+	req3, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"err"}]}`)))
+	req3.Header.Set("Content-Type", "application/json")
+	resp3, err := tr.RoundTrip(req3)
+	if err != nil {
+		t.Fatalf("RoundTrip 3: %v", err)
+	}
+	body3Bytes, _ := io.ReadAll(resp3.Body)
+	resp3.Body.Close()
+	body3 := string(body3Bytes)
+	if !strings.Contains(body3, "upstream status 500") || strings.Contains(body3, "SECRET_PROMPT_ECHO") {
+		t.Fatalf("expected sanitized status 500 without body leak, got %q", body3)
+	}
+
+	for _, b := range r.getBackends() {
+		if b.activeReqs.Load() != 0 || b.activeHeavy.Load() != 0 {
+			t.Fatalf("expected zero active counters on %s, got reqs=%d heavy=%d", b.config().ID, b.activeReqs.Load(), b.activeHeavy.Load())
+		}
+	}
+
+	// 4. rtCall concurrent abort vs deliver closes late response body cleanly under -race.
+	for i := 0; i < 40; i++ {
+		call := &rtCall{ch: make(chan activeRTRes, 1)}
+		spy := &hubCloseSpy{Reader: strings.NewReader("ok")}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			rr := &http.Response{StatusCode: http.StatusOK, Body: spy}
+			call.mu.Lock()
+			if call.canceled {
+				call.mu.Unlock()
+				_ = rr.Body.Close()
+				return
+			}
+			call.ch <- activeRTRes{resp: rr}
+			call.mu.Unlock()
+		}()
+		go func() {
+			defer wg.Done()
+			call.abort()
+		}()
+		wg.Wait()
+		if !spy.closed.Load() {
+			t.Fatalf("iteration %d: aborted rtCall leaked open response body", i)
+		}
+	}
+}

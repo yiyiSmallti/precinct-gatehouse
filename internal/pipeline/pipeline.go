@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
@@ -86,6 +87,19 @@ func (p *Pipeline) keepaliveInterval() time.Duration {
 		return 15 * time.Second
 	}
 	return p.SSEKeepaliveInterval
+}
+
+func (p *Pipeline) keepaliveIntervalFor(prov *provider.Provider) time.Duration {
+	if prov != nil && prov.SSEKeepaliveSec < 0 {
+		return 0
+	}
+	if p.SSEKeepaliveInterval < 0 {
+		return 0
+	}
+	if prov != nil && prov.SSEKeepaliveSec > 0 && p.SSEKeepaliveInterval == 0 {
+		return time.Duration(prov.SSEKeepaliveSec) * time.Second
+	}
+	return p.keepaliveInterval()
 }
 
 type principal struct {
@@ -771,7 +785,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 	fl, _ := st.w.(http.Flusher)
 	var usage oai.Usage
 	done := false // saw [DONE] or a finish_reason
-	var streamErr string
+	sawStreamErr := false
 	br := bufio.NewReaderSize(resp.Body, 64<<10)
 	var event bytes.Buffer
 	for {
@@ -779,7 +793,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		if len(line) > 0 {
 			event.Write(line)
 			if len(bytes.TrimSpace(line)) == 0 {
-				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done, &streamErr) && st.ttft == 0 {
+				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done, &sawStreamErr) && st.ttft == 0 {
 					st.ttft = time.Since(st.start)
 				}
 				event.Reset()
@@ -790,7 +804,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		}
 		if err != nil {
 			if event.Len() > 0 {
-				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done, &streamErr) && st.ttft == 0 {
+				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done, &sawStreamErr) && st.ttft == 0 {
 					st.ttft = time.Since(st.start)
 				}
 			}
@@ -798,8 +812,8 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 				fl.Flush()
 			}
 			if errors.Is(err, io.EOF) {
-				if streamErr != "" {
-					return usage, oai.Errorf(http.StatusBadGateway, "upstream_error", "%s", streamErr)
+				if sawStreamErr {
+					return usage, oai.Errorf(http.StatusBadGateway, "upstream_error", "upstream stream error")
 				}
 				if done {
 					return usage, nil
@@ -812,7 +826,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 	}
 }
 
-func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool, streamErr *string) bool {
+func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool, sawStreamErr *bool) bool {
 	hasContent := false
 	for _, l := range bytes.Split(ev, []byte("\n")) {
 		data, ok := bytes.CutPrefix(bytes.TrimSpace(l), []byte("data:"))
@@ -832,14 +846,7 @@ func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *o
 			continue
 		}
 		if errVal, hasErr := o["error"]; hasErr && errVal != nil {
-			if em, ok := errVal.(map[string]any); ok {
-				if msg := oai.Str(em, "message"); msg != "" {
-					*streamErr = msg
-				}
-			}
-			if *streamErr == "" {
-				*streamErr = string(data)
-			}
+			*sawStreamErr = true
 			*done = true
 			continue
 		}
@@ -963,7 +970,7 @@ type chatCallRes struct {
 
 func (p *Pipeline) callProviderWithKeepalive(ctx context.Context, st *reqState, prov *provider.Provider, body []byte, clientStream, upStream bool) (*http.Response, error) {
 	initDelay := p.keepaliveInitDelay()
-	keepaliveEvery := p.keepaliveInterval()
+	keepaliveEvery := p.keepaliveIntervalFor(prov)
 	if !clientStream || initDelay <= 0 || keepaliveEvery <= 0 {
 		return prov.Chat(ctx, body)
 	}
@@ -972,16 +979,21 @@ func (p *Pipeline) callProviderWithKeepalive(ctx context.Context, st *reqState, 
 	if upStream {
 		initDelay += initDelay / 10
 	}
+	var callMu sync.Mutex
+	canceled := false
 	ch := make(chan chatCallRes, 1)
 	go func() {
 		r, e := prov.Chat(ctx, body)
-		select {
-		case ch <- chatCallRes{resp: r, err: e}:
-		default:
+		callMu.Lock()
+		if canceled {
+			callMu.Unlock()
 			if r != nil && r.Body != nil {
 				_ = r.Body.Close()
 			}
+			return
 		}
+		ch <- chatCallRes{resp: r, err: e}
+		callMu.Unlock()
 	}()
 
 	timer := time.NewTimer(initDelay)
@@ -1000,6 +1012,18 @@ func (p *Pipeline) callProviderWithKeepalive(ctx context.Context, st *reqState, 
 		case <-ctx.Done():
 			if tk != nil {
 				tk.Stop()
+			}
+			callMu.Lock()
+			canceled = true
+			var late *http.Response
+			select {
+			case res := <-ch:
+				late = res.resp
+			default:
+			}
+			callMu.Unlock()
+			if late != nil && late.Body != nil {
+				_ = late.Body.Close()
 			}
 			return nil, &provider.UpstreamError{Err: ctx.Err()}
 		case <-timer.C:

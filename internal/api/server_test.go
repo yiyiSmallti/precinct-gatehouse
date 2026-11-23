@@ -884,3 +884,194 @@ providers:
 		t.Fatalf("expected latest request_log status 502 after post-keepalive failure, got %d", slowStatus)
 	}
 }
+
+type closeSpyBody struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (b *closeSpyBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
+func TestKeepaliveCodexFindingsRegression(t *testing.T) {
+	dir := t.TempDir()
+	var mode atomic.Int32 // 0 = sse-error-chunk, 1 = post-keepalive-500, 2 = slow-500-for-disabled
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		switch mode.Load() {
+		case 0:
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("data: {\"error\":{\"message\":\"SECRET_PROMPT_ECHO\"}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 1:
+			time.Sleep(45 * time.Millisecond)
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("SECRET_PROMPT_ECHO"))
+		case 2:
+			time.Sleep(45 * time.Millisecond)
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("SECRET_PROMPT_ECHO"))
+		}
+	}))
+	defer up.Close()
+
+	cfgRaw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    base_url: %s/v1
+    target: local
+    models: [m1]
+  - name: pdisabled
+    target: local
+    models: [m2]
+    tiered:
+      mode: active
+      sse_keepalive_sec: -1
+      health_interval_sec: 60
+      starter_cache:
+        enabled: false
+      backends:
+        - id: b1
+          url: %s
+          tier: 1
+          max_context_tokens: 32000
+          max_safe_input: 16000
+          promote_at: 16000
+          speed_score: 100
+default_group: main
+routing_groups:
+  main:
+    type: order
+    members: [p/m1]
+`, dir, up.URL, up.URL)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(cfgRaw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv.Pipeline.SSEKeepaliveInitDelay = 15 * time.Millisecond
+	srv.Pipeline.SSEKeepaliveInterval = 15 * time.Millisecond
+
+	// 1. SSE error event containing sensitive text must forward SSE to client,
+	//    log status=502, and NEVER record SECRET_PROMPT_ECHO into audit logs.
+	mode.Store(0)
+	req1, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req1.Header.Set("Authorization", "Bearer "+tok)
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec1, req1)
+	if !strings.Contains(rec1.Body.String(), "SECRET_PROMPT_ECHO") {
+		t.Fatalf("expected client to still receive upstream SSE error event, got %q", rec1.Body.String())
+	}
+
+	// 2. Post-keepalive HTTP 500 error body on regular provider must not leak to audit.
+	mode.Store(1)
+	req2, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req2.Header.Set("Authorization", "Bearer "+tok)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec2, req2)
+	if !strings.Contains(rec2.Body.String(), ": keepalive\n\n") || !strings.Contains(rec2.Body.String(), `"upstream_error"`) {
+		t.Fatalf("expected keepalive + upstream_error, got %q", rec2.Body.String())
+	}
+
+	// 3. Tiered provider with sse_keepalive_sec=-1 disables Pipeline keepalive wrapper too.
+	mode.Store(2)
+	req3, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"pdisabled/m2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req3.Header.Set("Authorization", "Bearer "+tok)
+	req3.Header.Set("Content-Type", "application/json")
+	rec3 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusBadGateway || strings.Contains(rec3.Body.String(), ": keepalive") {
+		t.Fatalf("expected 502 JSON with no keepalive when sse_keepalive_sec=-1, got code=%d body=%q", rec3.Code, rec3.Body.String())
+	}
+
+	// Verify audit files exist on disk, record upstream_error, and NEVER contain SECRET_PROMPT_ECHO.
+	var auditBytes strings.Builder
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr == nil && !info.IsDir() && strings.HasSuffix(path, ".jsonl") {
+			b, err := os.ReadFile(path)
+			if err == nil {
+				auditBytes.Write(b)
+			}
+		}
+		return nil
+	})
+	auditStr := auditBytes.String()
+	if !strings.Contains(auditStr, "upstream_error") {
+		t.Fatalf("expected audit log to contain upstream_error records, got %q", auditStr)
+	}
+	if strings.Contains(auditStr, "SECRET_PROMPT_ECHO") {
+		t.Fatalf("audit log leaked upstream error body: %s", auditStr)
+	}
+
+	// 4. Cancel racing with prov.Chat return must close late response body (tested under -race).
+	srv.Pipeline.SSEKeepaliveInitDelay = 200 * time.Millisecond
+	var bodiesMu sync.Mutex
+	var bodies []*closeSpyBody
+	srv.Live.Current().Reg.SetPlugin("p", func(ctx context.Context, body []byte) (*http.Response, error) {
+		time.Sleep(10 * time.Millisecond)
+		sb := &closeSpyBody{Reader: strings.NewReader(`{"id":"c1"}`)}
+		bodiesMu.Lock()
+		bodies = append(bodies, sb)
+		bodiesMu.Unlock()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       sb,
+		}, nil
+	})
+	for i := 0; i < 15; i++ {
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		r, _ := http.NewRequestWithContext(cctx, http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"race"}]}`)))
+		r.Header.Set("Authorization", "Bearer "+tok)
+		r.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(rec, r)
+		cancel()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		allClosed := true
+		bodiesMu.Lock()
+		for _, b := range bodies {
+			if !b.closed.Load() {
+				allClosed = false
+				break
+			}
+		}
+		bodiesMu.Unlock()
+		if allClosed {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("canceled late response body was not closed")
+}
