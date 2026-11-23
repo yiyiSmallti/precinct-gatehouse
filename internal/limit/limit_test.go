@@ -24,7 +24,7 @@ func TestCrossMidnightReleasePreservesNewDayReservation(t *testing.T) {
 	}
 
 	// Old day's request finishes on day 2: must not decrement day 2's todayReserved.
-	releaseA(true)
+	releaseA(true, 0)
 
 	snap := lim.Snapshot("key_1", day2)
 	if snap.TodayUsed != 1 || snap.Inflight != 1 {
@@ -35,7 +35,7 @@ func TestCrossMidnightReleasePreservesNewDayReservation(t *testing.T) {
 		t.Fatalf("expected daily_limit_exceeded while B is still pending, got %+v", lerr)
 	}
 
-	releaseB(true)
+	releaseB(true, 0)
 	snapAfterB := lim.Snapshot("key_1", day2)
 	if snapAfterB.TodayUsed != 1 || snapAfterB.Inflight != 0 {
 		t.Fatalf("unexpected snapshot after releaseB: %+v", snapAfterB)

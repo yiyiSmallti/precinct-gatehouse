@@ -1,9 +1,12 @@
-// Package limit enforces per-key request-count rate limits (concurrency, RPM
-// and daily RPD) in memory, recovering daily counts from request_log on start.
+// Package limit enforces per-key limits in memory: request counts
+// (concurrency, RPM, daily RPD) and token quotas (daily, monthly, total).
+// Daily request counts are recovered from request_log; token usage lives in
+// the key_token_usage ledger, which is not pruned with request_log.
 package limit
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -15,7 +18,7 @@ import (
 // Error describes a rate-limit rejection.
 type Error struct {
 	Err        *oai.Error
-	RetryAfter int // seconds, >0 for RPM rejections
+	RetryAfter int // seconds, >0 for RPM and daily/monthly token quota rejections
 }
 
 // Snapshot is a point-in-time view of a key's live limit counters.
@@ -23,6 +26,10 @@ type Snapshot struct {
 	Inflight  int `json:"inflight"`
 	RPMUsed   int `json:"rpm_used"`
 	TodayUsed int `json:"today_used"`
+
+	TokensToday int64 `json:"tokens_today"`
+	TokensMonth int64 `json:"tokens_month"`
+	TokensTotal int64 `json:"tokens_total"`
 }
 
 type keyState struct {
@@ -32,6 +39,10 @@ type keyState struct {
 	todayCount    int
 	todayReserved int
 	initialized   bool
+
+	tokToday int64
+	tokMonth int64
+	tokTotal int64
 }
 
 // Limiter enforces concurrency, RPM and RPD limits per API key.
@@ -60,8 +71,16 @@ func (l *Limiter) ensureDay(keyID, day string) error {
 
 	// Never hold l.mu across database access.
 	var count int
+	var tokToday, tokMonth, tokTotal int64
 	if l.db != nil {
 		if err := l.db.QueryRow(`SELECT COUNT(*) FROM request_log WHERE key_id=? AND day=? AND admitted=1 AND status<500`, keyID, day).Scan(&count); err != nil {
+			return err
+		}
+		if err := l.db.QueryRow(`SELECT
+			COALESCE(SUM(CASE WHEN day=? THEN tokens END),0),
+			COALESCE(SUM(CASE WHEN substr(day,1,7)=? THEN tokens END),0),
+			COALESCE(SUM(tokens),0)
+			FROM key_token_usage WHERE key_id=?`, day, day[:7], keyID).Scan(&tokToday, &tokMonth, &tokTotal); err != nil {
 			return err
 		}
 	}
@@ -77,15 +96,17 @@ func (l *Limiter) ensureDay(keyID, day string) error {
 		ks.day = day
 		ks.todayCount = count
 		ks.todayReserved = 0
+		ks.tokToday, ks.tokMonth, ks.tokTotal = tokToday, tokMonth, tokTotal
 		ks.initialized = true
 	}
 	return nil
 }
 
-// Acquire checks concurrency → RPM → RPD and admits one request if allowed.
-// The caller must invoke release(countable) when the request completes;
-// countable should be true when the final HTTP status is < 500.
-func (l *Limiter) Acquire(keyID string, lim keys.Limits, now time.Time) (func(countable bool), *Error) {
+// Acquire checks concurrency → RPM → RPD → token quotas and admits one
+// request if allowed. The caller must invoke release(countable, tokens) when
+// the request completes; countable should be true when the final HTTP status
+// is < 500, and tokens is the prompt + completion tokens the request used.
+func (l *Limiter) Acquire(keyID string, lim keys.Limits, now time.Time) (func(countable bool, tokens int64), *Error) {
 	day := now.Local().Format("2006-01-02")
 	if err := l.ensureDay(keyID, day); err != nil {
 		return nil, &Error{Err: oai.Errorf(http.StatusInternalServerError, "limiter_error", "%v", err)}
@@ -96,9 +117,15 @@ func (l *Limiter) Acquire(keyID string, lim keys.Limits, now time.Time) (func(co
 
 	ks := l.states[keyID]
 	if ks.day != day {
+		// ensureDay just loaded this day; a rollover between the two locks
+		// is reloaded on the next request.
+		if len(ks.day) < 7 || ks.day[:7] != day[:7] {
+			ks.tokMonth = 0
+		}
 		ks.day = day
 		ks.todayCount = 0
 		ks.todayReserved = 0
+		ks.tokToday = 0
 	}
 
 	if lim.Concurrency > 0 && ks.inflight >= lim.Concurrency {
@@ -129,15 +156,18 @@ func (l *Limiter) Acquire(keyID string, lim keys.Limits, now time.Time) (func(co
 		}
 	}
 
+	if e := tokenQuotaError(ks, lim, now); e != nil {
+		return nil, e
+	}
+
 	ks.inflight++
 	ks.rpm = append(ks.rpm, now)
 	ks.todayReserved++
 
 	var once sync.Once
-	return func(countable bool) {
+	return func(countable bool, tokens int64) {
 		once.Do(func() {
 			l.mu.Lock()
-			defer l.mu.Unlock()
 			if ks.inflight > 0 {
 				ks.inflight--
 			}
@@ -149,8 +179,66 @@ func (l *Limiter) Acquire(keyID string, lim keys.Limits, now time.Time) (func(co
 					ks.todayCount++
 				}
 			}
+			if tokens > 0 {
+				if ks.day == day {
+					ks.tokToday += tokens
+				}
+				if ks.day[:7] == day[:7] {
+					ks.tokMonth += tokens
+				}
+				ks.tokTotal += tokens
+			}
+			l.mu.Unlock()
+			if tokens > 0 && l.db != nil {
+				// Charge the day the request was admitted on, matching the
+				// in-memory counters above.
+				_, _ = l.db.Exec(`INSERT INTO key_token_usage(key_id, day, tokens) VALUES(?,?,?)
+					ON CONFLICT(key_id, day) DO UPDATE SET tokens = tokens + excluded.tokens`, keyID, day, tokens)
+			}
 		})
 	}, nil
+}
+
+// tokenQuotaError reports the first exhausted token quota, or nil.
+func tokenQuotaError(ks *keyState, lim keys.Limits, now time.Time) *Error {
+	local := now.Local()
+	switch {
+	case lim.TokensDaily > 0 && ks.tokToday >= lim.TokensDaily:
+		next := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, local.Location())
+		return quotaErr("daily", ks.tokToday, lim.TokensDaily, next.Sub(local))
+	case lim.TokensMonthly > 0 && ks.tokMonth >= lim.TokensMonthly:
+		next := time.Date(local.Year(), local.Month()+1, 1, 0, 0, 0, 0, local.Location())
+		return quotaErr("monthly", ks.tokMonth, lim.TokensMonthly, next.Sub(local))
+	case lim.TokensTotal > 0 && ks.tokTotal >= lim.TokensTotal:
+		return quotaErr("total", ks.tokTotal, lim.TokensTotal, 0)
+	}
+	return nil
+}
+
+func quotaErr(period string, used, limit int64, wait time.Duration) *Error {
+	e := &Error{Err: oai.Errorf(http.StatusTooManyRequests, "token_quota_exceeded",
+		"%s token quota exhausted for key: used %d of %d tokens", period, used, limit)}
+	if wait > 0 {
+		e.RetryAfter = int((wait + time.Second - 1) / time.Second)
+		e.Err.Message += fmt.Sprintf("; resets in %ds", e.RetryAfter)
+	}
+	return e
+}
+
+// ResetTokens forgets all recorded token usage for keyID, so every token
+// quota of the key starts again from zero.
+func (l *Limiter) ResetTokens(keyID string) error {
+	if l.db != nil {
+		if _, err := l.db.Exec(`DELETE FROM key_token_usage WHERE key_id=?`, keyID); err != nil {
+			return err
+		}
+	}
+	l.mu.Lock()
+	if ks := l.states[keyID]; ks != nil {
+		ks.tokToday, ks.tokMonth, ks.tokTotal = 0, 0, 0
+	}
+	l.mu.Unlock()
+	return nil
 }
 
 // Snapshot returns live usage counters for keyID.
@@ -166,13 +254,21 @@ func (l *Limiter) Snapshot(keyID string, now time.Time) Snapshot {
 	}
 	pruneRPM(ks, now)
 	todayUsed := 0
+	var tokToday, tokMonth int64
 	if ks.day == day {
 		todayUsed = ks.todayCount + ks.todayReserved
+		tokToday = ks.tokToday
+	}
+	if ks.day[:7] == day[:7] {
+		tokMonth = ks.tokMonth
 	}
 	return Snapshot{
-		Inflight:  ks.inflight,
-		RPMUsed:   len(ks.rpm),
-		TodayUsed: todayUsed,
+		Inflight:    ks.inflight,
+		RPMUsed:     len(ks.rpm),
+		TodayUsed:   todayUsed,
+		TokensToday: tokToday,
+		TokensMonth: tokMonth,
+		TokensTotal: ks.tokTotal,
 	}
 }
 

@@ -11,6 +11,86 @@ import {
   toast,
 } from '/admin/js/ui.js';
 import { store } from '/admin/js/store.js';
+import { createSwitch } from '/admin/js/ui.js';
+
+// A select with preset values plus "custom", so common settings are a click
+// and only unusual ones need typing.
+function optionSelect({ options, value, onChange, customPlaceholder = '自定义值', customType = 'text', mono = false }) {
+  const isPreset = options.some((o) => String(o.value) === String(value));
+  const wrap = el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } });
+  const custom = el('input', {
+    className: `input${mono ? ' mono' : ''}`,
+    type: customType,
+    placeholder: customPlaceholder,
+    value: isPreset ? '' : String(value ?? ''),
+    style: { display: isPreset ? 'none' : 'block', maxWidth: '180px' },
+    onChange: (e) => onChange(customType === 'number' ? Math.max(0, Math.trunc(Number(e.target.value) || 0)) : e.target.value.trim()),
+  });
+  const sel = el('select', {
+    className: 'select',
+    onChange: (e) => {
+      if (e.target.value === '__custom') {
+        custom.style.display = 'block';
+        custom.focus();
+        return;
+      }
+      custom.style.display = 'none';
+      const opt = options[Number(e.target.value)];
+      onChange(opt.value);
+    },
+  },
+    ...options.map((o, i) => el('option', { value: String(i), selected: isPreset && String(o.value) === String(value) }, o.label)),
+    el('option', { value: '__custom', selected: !isPreset }, '自定义…')
+  );
+  wrap.append(sel, custom);
+  return wrap;
+}
+
+function splitAddr(addr) {
+  const s = String(addr || '');
+  const i = s.lastIndexOf(':');
+  if (i < 0) return { host: '127.0.0.1', port: '' };
+  return { host: s.slice(0, i) || '0.0.0.0', port: s.slice(i + 1) };
+}
+
+// Listen address as two options: who may connect, and which port.
+function addrPicker({ value, onChange, allowOff = false }) {
+  const { host, port } = splitAddr(value);
+  const hosts = [
+    { value: '127.0.0.1', label: '仅本机（127.0.0.1）' },
+    { value: '0.0.0.0', label: '所有网卡（局域网可访问）' },
+  ];
+  let curHost = value ? host : (allowOff ? '' : '127.0.0.1');
+  let curPort = port;
+  const emit = () => onChange(curHost ? `${curHost}:${curPort || ''}` : '');
+  const portIn = el('input', {
+    className: 'input num mono',
+    type: 'number',
+    min: 1,
+    max: 65535,
+    placeholder: '端口',
+    value: curPort,
+    style: { width: '110px', display: curHost ? 'block' : 'none' },
+    onChange: (e) => {
+      curPort = e.target.value.trim();
+      emit();
+    },
+  });
+  const custom = !hosts.some((h) => h.value === curHost) && curHost;
+  const sel = el('select', {
+    className: 'select',
+    onChange: (e) => {
+      curHost = e.target.value;
+      portIn.style.display = curHost ? 'block' : 'none';
+      emit();
+    },
+  },
+    allowOff ? el('option', { value: '', selected: !curHost }, '关闭') : null,
+    ...hosts.map((h) => el('option', { value: h.value, selected: h.value === curHost }, h.label)),
+    custom ? el('option', { value: curHost, selected: true }, curHost) : null
+  );
+  return el('div', { style: { display: 'flex', gap: '8px' } }, sel, portIn);
+}
 
 function computeLineDiff(oldText, newText) {
   const a = String(oldText || '').split('\n');
@@ -106,42 +186,132 @@ export function renderSettings(container) {
     const gen = store.getSection('general') || {};
 
     // 1. General Runtime Settings + Live Status
-    const maxBodyIn = el('input', {
-      className: 'input num',
-      type: 'number',
-      min: 0,
-      value: String(gen.max_body_mb ?? 32),
-      onChange: (e) => {
-        const next = clone(store.getSection('general'));
-        const rawVal = e.target.value.trim();
-        const parsed = rawVal === '' ? 32 : Number(rawVal);
-        next.max_body_mb = Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : 32;
-        store.setDraft('general', next);
-      },
+    const setGen = (fn) => {
+      const next = clone(store.getSection('general'));
+      fn(next);
+      store.setDraft('general', next);
+    };
+    const maxBodyIn = optionSelect({
+      value: gen.max_body_mb ?? 32,
+      customType: 'number',
+      customPlaceholder: 'MB',
+      options: [
+        { value: 8, label: '8 MB' },
+        { value: 32, label: '32 MB（默认）' },
+        { value: 64, label: '64 MB' },
+        { value: 128, label: '128 MB（多图长上下文）' },
+        { value: 0, label: '不限制' },
+      ],
+      onChange: (v) => setGen((n) => { n.max_body_mb = Number(v); }),
     });
-    const logDaysIn = el('input', {
-      className: 'input num',
-      type: 'number',
-      min: 0,
-      value: String(gen.request_log_days ?? 90),
-      onChange: (e) => {
-        const next = clone(store.getSection('general'));
-        const rawVal = e.target.value.trim();
-        const parsed = rawVal === '' ? 90 : Number(rawVal);
-        next.request_log_days = Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : 90;
-        store.setDraft('general', next);
-      },
+    const logDaysIn = optionSelect({
+      value: gen.request_log_days ?? 90,
+      customType: 'number',
+      customPlaceholder: '天',
+      options: [
+        { value: 7, label: '7 天' },
+        { value: 30, label: '30 天' },
+        { value: 90, label: '90 天（默认）' },
+        { value: 180, label: '180 天' },
+        { value: 365, label: '1 年' },
+        { value: 0, label: '永久保留' },
+      ],
+      onChange: (v) => setGen((n) => { n.request_log_days = Number(v); }),
     });
-    const ttlIn = el('input', {
-      className: 'input mono',
+    const ttlIn = optionSelect({
       value: gen.tokens?.default_ttl || '',
-      placeholder: '24h（留空默认 24h）',
-      onChange: (e) => {
-        const next = clone(store.getSection('general'));
-        next.tokens = { ...(next.tokens || {}), default_ttl: e.target.value.trim() };
-        store.setDraft('general', next);
-      },
+      mono: true,
+      customPlaceholder: '如 36h',
+      options: [
+        { value: '', label: '24 小时（默认）' },
+        { value: '1h', label: '1 小时' },
+        { value: '168h', label: '7 天' },
+        { value: '720h', label: '30 天' },
+      ],
+      onChange: (v) => setGen((n) => { n.tokens = { ...(n.tokens || {}), default_ttl: v }; }),
     });
+
+    const restartTag = el('span', { className: 'restart-tag' }, '重启生效');
+    const otlpOn = Boolean(gen.meter?.otlp);
+    const otlpEndpoint = el('input', {
+      className: 'input mono',
+      placeholder: 'http://127.0.0.1:4318',
+      value: gen.meter?.otlp?.endpoint || '',
+      disabled: !otlpOn,
+      onChange: (e) => setGen((n) => { n.meter = { otlp: { ...(n.meter?.otlp || {}), endpoint: e.target.value.trim() } }; }),
+    });
+    const serviceSheet = el('section', { className: 'sheet' },
+      el('div', { className: 'sheet-head' },
+        el('div', { className: 'sheet-title-group' },
+          el('h3', { className: 'sheet-title' }, '服务与端口'),
+          el('p', { className: 'sheet-sub' }, '监听地址、控制台会话与指标导出。这些项写入配置后需要重启进程才生效。')
+        )
+      ),
+      el('div', { className: 'sheet-body' },
+        el('div', { className: 'opt-grid' },
+          el('div', { className: 'opt-item' },
+            el('label', { className: 'field-label' }, '数据面监听（客户端调用地址）', restartTag.cloneNode(true)),
+            addrPicker({ value: gen.listen, onChange: (v) => setGen((n) => { n.listen = v; }) })
+          ),
+          el('div', { className: 'opt-item' },
+            el('label', { className: 'field-label' }, '控制台监听', restartTag.cloneNode(true)),
+            addrPicker({ value: gen.admin?.listen, allowOff: true, onChange: (v) => setGen((n) => { n.admin = { ...(n.admin || {}), listen: v }; }) }),
+            el('p', { className: 'field-hint' }, '对外暴露时建议只开在内网，或经带白名单的反向代理访问。')
+          ),
+          el('div', { className: 'opt-item' },
+            el('label', { className: 'field-label' }, '控制台登录有效期'),
+            optionSelect({
+              value: gen.admin?.session_ttl || '',
+              mono: true,
+              customPlaceholder: '如 48h',
+              options: [
+                { value: '1h', label: '1 小时' },
+                { value: '', label: '12 小时（默认）' },
+                { value: '24h', label: '24 小时' },
+                { value: '168h', label: '7 天' },
+              ],
+              onChange: (v) => setGen((n) => { n.admin = { ...(n.admin || {}), session_ttl: v }; }),
+            })
+          ),
+          el('div', { className: 'opt-item' },
+            el('label', { className: 'field-label' }, '审计记录目录', restartTag.cloneNode(true)),
+            el('input', {
+              className: 'input mono',
+              placeholder: '默认 <数据目录>/audit',
+              value: gen.audit?.dir || '',
+              onChange: (e) => setGen((n) => { n.audit = { dir: e.target.value.trim() }; }),
+            })
+          ),
+          el('div', { className: 'opt-item', style: { gridColumn: '1 / -1' } },
+            el('label', { className: 'field-label' }, 'OTLP 指标导出', restartTag.cloneNode(true)),
+            el('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } },
+              createSwitch({
+                checked: otlpOn,
+                label: '启用 OTLP 指标导出',
+                onChange: (on) => {
+                  otlpEndpoint.disabled = !on;
+                  setGen((n) => { n.meter = { otlp: on ? { endpoint: otlpEndpoint.value.trim() || 'http://127.0.0.1:4318', interval: '' } : null }; });
+                  if (on && !otlpEndpoint.value) otlpEndpoint.value = 'http://127.0.0.1:4318';
+                },
+              }),
+              el('div', { style: { flex: '1', minWidth: '240px' } }, otlpEndpoint),
+              optionSelect({
+                value: gen.meter?.otlp?.interval || '',
+                mono: true,
+                customPlaceholder: '如 2m',
+                options: [
+                  { value: '10s', label: '每 10 秒' },
+                  { value: '', label: '每 30 秒（默认）' },
+                  { value: '1m', label: '每分钟' },
+                  { value: '5m', label: '每 5 分钟' },
+                ],
+                onChange: (v) => setGen((n) => { if (n.meter?.otlp) n.meter.otlp.interval = v; }),
+              })
+            )
+          )
+        )
+      )
+    );
 
     const generalSheet = el('section', { className: 'sheet' },
       el('div', { className: 'sheet-head' },
@@ -184,7 +354,7 @@ export function renderSettings(container) {
             logDaysIn
           ),
           el('div', { className: 'field' },
-            el('label', { className: 'field-label' }, '默认令牌 TTL'),
+            el('label', { className: 'field-label' }, '本地令牌默认有效期'),
             ttlIn
           )
         ),
@@ -497,7 +667,15 @@ export function renderSettings(container) {
       )
     );
 
-    root.append(generalSheet, yamlSheet, historySheet, pwdSheet);
+    // Raw YAML stays available for edge cases, folded away by default.
+    const advanced = el('details', { className: 'advanced-yaml', open: yamlFeedback ? true : undefined },
+      el('summary', null,
+        el('span', { className: 'advanced-yaml-title' }, '高级：直接编辑 YAML'),
+        el('span', { className: 'muted', style: { fontSize: '12px' } }, '上面的选项和各页面已覆盖常用配置，只有插件、org 模式等少见场景需要这里')
+      ),
+      yamlSheet
+    );
+    root.append(generalSheet, serviceSheet, historySheet, pwdSheet, advanced);
   };
 
   loadYAMLAndHistory();

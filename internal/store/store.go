@@ -82,6 +82,12 @@ CREATE TABLE IF NOT EXISTS request_log (
 );
 CREATE INDEX IF NOT EXISTS request_log_key_day ON request_log(key_id, day);
 CREATE INDEX IF NOT EXISTS request_log_ts ON request_log(ts);
+CREATE TABLE IF NOT EXISTS key_token_usage (
+  key_id  TEXT NOT NULL,
+  day     TEXT NOT NULL,
+  tokens  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (key_id, day)
+);
 CREATE TABLE IF NOT EXISTS settings (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
@@ -99,6 +105,11 @@ func Open(dataDir string) (*sql.DB, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	var hadQuotaTable int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='key_token_usage'`).Scan(&hadQuotaTable); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
@@ -122,6 +133,22 @@ func Open(dataDir string) (*sql.DB, error) {
 	if err := ensureColumn(db, "request_log", "route_reason", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	for _, col := range []string{"tokens_daily", "tokens_monthly", "tokens_total"} {
+		if err := ensureColumn(db, "api_keys", col, "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate %s: %w", path, err)
+		}
+	}
+	if hadQuotaTable == 0 {
+		// key_token_usage is the durable ledger behind token quotas; request_log
+		// is pruned, so seed the ledger once from whatever history is left.
+		if _, err := db.Exec(`INSERT OR IGNORE INTO key_token_usage(key_id, day, tokens)
+			SELECT key_id, day, SUM(prompt_tokens + completion_tokens) FROM request_log
+			WHERE key_id LIKE 'key\_%' ESCAPE '\' GROUP BY key_id, day`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate %s: %w", path, err)
+		}
 	}
 	return db, nil
 }

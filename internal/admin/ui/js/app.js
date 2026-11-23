@@ -29,7 +29,7 @@ const NAV_GROUPS = [
     items: [
       { id: 'overview', title: '概览与门禁流', ic: 'overview' },
       { id: 'logs', title: '请求日志', ic: 'logs' },
-      { id: 'usage', title: '用量统计', ic: 'usage' },
+      { id: 'usage', title: '统计分析', ic: 'usage' },
     ],
   },
   {
@@ -48,7 +48,7 @@ const NAV_GROUPS = [
 const ROUTE_TITLES = {
   overview: '概览与门禁流',
   logs: '请求日志',
-  usage: '用量统计',
+  usage: '统计分析',
   keys: '访问密钥',
   channels: '模型渠道',
   routing: '路由与别名',
@@ -94,7 +94,7 @@ function toggleTheme() {
 function parseHash() {
   const raw = window.location.hash.replace(/^#\/?/, '') || 'overview';
   const [pathPart, qPart] = raw.split('?');
-  const route = ROUTE_TITLES[pathPart] ? pathPart : 'overview';
+  const route = ROUTE_TITLES[pathPart] || pathPart === 'setup' ? pathPart : 'overview';
   const query = {};
   if (qPart) {
     new URLSearchParams(qPart).forEach((v, k) => {
@@ -107,6 +107,23 @@ function parseHash() {
 export function navigate(route, query = {}) {
   const qs = new URLSearchParams(query).toString();
   window.location.hash = `#/${route}${qs ? `?${qs}` : ''}`;
+}
+
+function authLayout(card) {
+  return el('div', { className: 'login-shell' },
+    el('section', { className: 'login-hero', 'aria-hidden': 'true' },
+      el('div', { className: 'login-hero-brand' },
+        el('img', { src: '/admin/img/icon-128.png', alt: '' }),
+        'Precinct Gatehouse'
+      ),
+      el('img', { className: 'login-hero-art', src: '/admin/img/icon-512.png', alt: '' }),
+      el('div', { className: 'login-hero-copy' },
+        el('h2', null, '模型调用的唯一出口'),
+        el('p', null, '多协议接入、路由分流、隐私脱敏、按 Token 计量与限额，一个控制台全部完成。')
+      )
+    ),
+    el('section', { className: 'login-pane' }, card)
+  );
 }
 
 function renderLogin() {
@@ -167,21 +184,98 @@ function renderLogin() {
     submitBtn
   );
 
-  appRoot.appendChild(
-    el('div', { className: 'login-shell' },
-      el('div', { className: 'login-card' },
-        el('div', { className: 'login-head' },
-          el('div', { className: 'brand-mark' }, icon('gatehouse', 18)),
-          el('div', null,
-            el('h1', { className: 'login-title' }, '门禁网关'),
-            el('p', { className: 'login-sub' }, 'Precinct Gatehouse 控制面板')
-          )
-        ),
-        form
-      )
+  appRoot.appendChild(authLayout(
+    el('div', { className: 'login-card' },
+      el('div', { className: 'login-head' },
+        el('h1', { className: 'login-title' }, '欢迎回来'),
+        el('p', { className: 'login-sub' }, '登录门禁网关控制台')
+      ),
+      form
     )
-  );
+  ));
   passInput.focus();
+}
+
+// First run: no admin account yet. The one-time code comes from the server
+// log (the printed setup link carries it in the hash).
+function renderSetup() {
+  stopPolling();
+  clear(pendingRoot);
+  clear(appRoot);
+
+  const errorBox = el('div', { className: 'banner banner-err', style: { display: 'none' } });
+  const codeInput = el('input', {
+    className: 'input mono',
+    type: 'text',
+    id: 'setup-code',
+    value: (state.query.code || '').toUpperCase(),
+    placeholder: '启动日志中的 10 位设置码',
+    autocomplete: 'off',
+    required: true,
+  });
+  const userInput = el('input', { className: 'input', type: 'text', id: 'setup-user', value: 'admin', autocomplete: 'username', required: true });
+  const passInput = el('input', { className: 'input', type: 'password', id: 'setup-pass', placeholder: '至少 8 位', autocomplete: 'new-password', required: true });
+  const pass2Input = el('input', { className: 'input', type: 'password', id: 'setup-pass2', placeholder: '再输入一次', autocomplete: 'new-password', required: true });
+  const submitBtn = el('button', { type: 'submit', className: 'btn btn-primary', style: { width: '100%' } }, '创建管理员并进入控制台');
+
+  const showErr = (msg) => {
+    errorBox.textContent = msg;
+    errorBox.style.display = 'flex';
+  };
+
+  const form = el('form', {
+    className: 'login-form',
+    onSubmit: async (e) => {
+      e.preventDefault();
+      errorBox.style.display = 'none';
+      if (passInput.value.length < 8) return showErr('密码至少 8 位');
+      if (passInput.value !== pass2Input.value) return showErr('两次输入的密码不一致');
+      submitBtn.disabled = true;
+      try {
+        const res = await api.setup(codeInput.value.trim(), userInput.value.trim() || 'admin', passInput.value);
+        state.user = res.username || 'admin';
+        await store.refresh();
+        startPolling();
+        navigate(store.server?.raw?.providers?.length ? 'overview' : 'channels');
+        renderApp();
+        toast('管理员已创建。下一步：添加一个模型渠道。');
+      } catch (err) {
+        if (err.status === 409) {
+          renderLogin();
+          return;
+        }
+        showErr(err.status === 401 ? '设置码不正确，请对照启动日志' : err.status === 429 ? '尝试次数过多，请稍后再试' : err.message);
+      } finally {
+        submitBtn.disabled = false;
+      }
+    },
+  },
+    errorBox,
+    el('div', { className: 'field' }, el('label', { className: 'field-label', for: 'setup-code' }, '设置码'), codeInput,
+      el('p', { className: 'field-hint' }, '首次启动时打印在终端里，只能使用一次。')),
+    el('div', { className: 'field' }, el('label', { className: 'field-label', for: 'setup-user' }, '管理员账号'), userInput),
+    el('div', { className: 'field-row' },
+      el('div', { className: 'field' }, el('label', { className: 'field-label', for: 'setup-pass' }, '密码'), passInput),
+      el('div', { className: 'field' }, el('label', { className: 'field-label', for: 'setup-pass2' }, '确认密码'), pass2Input)
+    ),
+    submitBtn
+  );
+
+  appRoot.appendChild(authLayout(
+    el('div', { className: 'login-card' },
+      el('div', { className: 'setup-steps' },
+        el('span', { className: 'on' }, el('b', null, '1'), '创建管理员'),
+        el('span', null, el('b', null, '2'), '添加模型渠道'),
+        el('span', null, el('b', null, '3'), '签发访问密钥')
+      ),
+      el('div', { className: 'login-head' },
+        el('h1', { className: 'login-title' }, '初始化网关'),
+        el('p', { className: 'login-sub' }, '无需编辑配置文件。创建管理员后，渠道、路由、限额等全部在控制台里用选项完成。')
+      ),
+      form
+    )
+  ));
+  (codeInput.value ? passInput : codeInput).focus();
 }
 
 function buildPendingBar() {
@@ -404,7 +498,7 @@ function renderShell() {
 
   const sidebar = el('aside', { id: 'app-sidebar', className: 'sidebar' },
     el('div', { className: 'sidebar-brand' },
-      el('div', { className: 'brand-mark' }, icon('gatehouse', 17)),
+      el('img', { className: 'brand-mark', src: '/admin/img/icon-128.png', alt: '' }),
       el('div', { className: 'brand-text' },
         el('span', { className: 'brand-title' }, '门禁网关'),
         el('span', { className: 'brand-sub' }, 'Precinct Gatehouse')
@@ -486,12 +580,43 @@ function renderShell() {
   renderPage();
 }
 
+// Getting-started steps until the gateway has a provider and a key.
+function renderOnboarding(host) {
+  const raw = store.server?.raw || {};
+  const hasProvider = (raw.providers || []).length > 0;
+  const hasRoute = Object.keys(raw.routing_groups || {}).length > 0;
+  if (hasProvider && hasRoute) return;
+  const step = (n, done, title, text, route) =>
+    el('button', { type: 'button', className: `onboard-step${done ? ' done' : ''}`, onClick: () => navigate(route) },
+      el('span', { className: 'onboard-num' }, done ? '✓' : String(n)),
+      el('span', null, el('h4', null, title), el('p', null, text))
+    );
+  host.appendChild(
+    el('section', { className: 'sheet' },
+      el('div', { className: 'sheet-head' },
+        el('div', { className: 'sheet-title-group' },
+          el('h3', { className: 'sheet-title' }, '开始使用'),
+          el('p', { className: 'sheet-sub' }, '三步让网关跑起来，全部在控制台里完成，不需要编辑配置文件')
+        )
+      ),
+      el('div', { className: 'sheet-body' },
+        el('div', { className: 'onboard' },
+          step(1, hasProvider, '添加模型渠道', '填上游地址与密钥，点“测试”确认连通。', 'channels'),
+          step(2, hasRoute, '建立路由组', '把渠道里的模型放进一个路由组，并设为默认。', 'routing'),
+          step(3, false, '签发访问密钥', '给团队成员发 sk- 密钥，按需设置请求和 Token 配额。', 'keys')
+        )
+      )
+    )
+  );
+}
+
 let pageCleanups = [];
 function renderPage() {
   if (!pageHost) return;
   pageCleanups.forEach((fn) => fn());
   pageCleanups = [];
   clear(pageHost);
+  if (state.route === 'setup') state.route = 'overview';
   if (titleHost) titleHost.textContent = ROUTE_TITLES[state.route] || '';
   renderSidebarNav();
 
@@ -504,6 +629,7 @@ function renderPage() {
 
   switch (state.route) {
     case 'overview':
+      renderOnboarding(pageHost);
       renderOverview(pageHost, ctx);
       break;
     case 'keys':
@@ -596,7 +722,14 @@ async function boot() {
     renderShell();
   } catch {
     state.user = null;
-    renderLogin();
+    let setupRequired = false;
+    try {
+      setupRequired = (await api.setupStatus()).setup_required === true;
+    } catch {
+      // fall back to the login form
+    }
+    if (setupRequired) renderSetup();
+    else renderLogin();
   }
 }
 

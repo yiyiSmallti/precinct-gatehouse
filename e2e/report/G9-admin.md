@@ -1,6 +1,6 @@
 # G9 Web 控制面板与管理 API
 
-结果：**通过** · 运行于 2026-11-22 06:13:26 PST · darwin/arm64
+结果：**通过** · 运行于 2026-11-22 20:17:20 PST · darwin/arm64
 
 验证管理员密码设置、登录鉴权与防暴力破解、CSRF 头校验、API Key 在线增改启停立即生效、请求日志、概览/用量/渠道/脱敏策略接口以及内嵌前端页面。
 
@@ -15,6 +15,6 @@
 | Web 禁用 key 后立即 → 401 | ✅ | patch=200 status=401 code=key_disabled |
 | /admin/api/logs 返回请求记录 | ✅ | status=200 count=4 |
 | /overview、/usage、/channels 返回 200 且结构正确 | ✅ | ov=200(hourly=24) use=200(rows=1) ch=200(provs=2) |
-| GET /admin/ 返回含 app.js 的 HTML | ✅ | html=200 js=200(45536 bytes) |
+| GET /admin/ 返回含 js/app.js 的 HTML | ✅ | html=200 js=200(24003 bytes) |
 | GET /admin/api/redaction 返回矩阵 local/internal=off, external/internal=mask | ✅ | status=200 local=off external=mask |
-| POST /admin/api/redaction/try 脱敏手机号且校验 CSRF | ✅ | csrf=403 status=200 phone=1 text="请联系 {{PHONE_oqqdj6ht}}" |
+| POST /admin/api/redaction/try 脱敏手机号且校验 CSRF | ✅ | csrf=403 status=200 phone=1 text="请联系 {{PHONE_xxu3td7l}}" |
