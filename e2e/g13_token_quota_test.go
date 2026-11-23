@@ -187,7 +187,8 @@ func TestG13TokenQuota(t *testing.T) {
 
 	// 3. Total quota counts streaming usage too.
 	kTot, kTotID := createKey("--name", "total1", "--tokens-total", "1")
-	s1 := ask(g, kTot, true)
+	// #slow delays the fake's first byte by 1s, so the log gets a real TTFT.
+	s1 := g.Chat(t, kTot, map[string]any{"model": "p/model-a", "stream": true, "messages": msgs("user", "#slow quota probe")}, nil)
 	s2 := ask(g, kTot, false)
 	rep.Check("累计配额：流式请求的用量也计入，下一次 429",
 		s1.Status == 200 && s2.Status == 429 && s2.ErrCode() == "token_quota_exceeded",
@@ -212,6 +213,24 @@ func TestG13TokenQuota(t *testing.T) {
 	limitedM, _ := totalsM["rate_limited"].(float64)
 	rep.Check("按模型筛选时保留路由前被拒的请求（配额 429 仍计入该模型）", st == 200 && limitedM == limited,
 		"status=%d rate_limited all=%v model=%v", st, limited, totalsM["rate_limited"])
+
+	// 5a. The request log carries what the console's cache-hit and tok/s columns need.
+	_, logsView := adm(http.MethodGet, "/admin/api/logs?key="+kTotID+"&limit=10", nil)
+	logRows, _ := logsView["logs"].([]any)
+	var streamRow map[string]any
+	for _, lr := range logRows {
+		if m, _ := lr.(map[string]any); m["stream"] == true && m["status"] == float64(200) {
+			streamRow = m
+		}
+	}
+	cachedT, _ := streamRow["cached_tokens"].(float64)
+	promptT, _ := streamRow["prompt_tokens"].(float64)
+	complT, _ := streamRow["completion_tokens"].(float64)
+	ttftT, _ := streamRow["ttft_ms"].(float64)
+	latT, _ := streamRow["latency_ms"].(float64)
+	rep.Check("请求日志带缓存命中与输出速度所需字段（流式请求）",
+		streamRow != nil && cachedT > 0 && cachedT <= promptT && complT > 0 && ttftT > 0 && latT >= ttftT,
+		"cached=%v prompt=%v completion=%v ttft_ms=%v latency_ms=%v", cachedT, promptT, complT, ttftT, latT)
 
 	// 5b. Saving the general section from the console keeps OTLP headers it does not edit.
 	_, cfgView := adm(http.MethodGet, "/admin/api/config", nil)
