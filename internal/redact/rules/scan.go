@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -45,11 +46,44 @@ func (t *scanText) lowerText() (string, bool) {
 	if !t.done {
 		t.done = true
 		if !strings.ContainsRune(t.s, '\u017f') && !strings.ContainsRune(t.s, '\u212a') {
-			t.lower = strings.ToLower(t.s)
-			t.lowerOK = len(t.lower) == len(t.s)
+			t.lower, t.lowerOK = LowerSameOffsets(t.s)
 		}
 	}
 	return t.lower, t.lowerOK
+}
+
+// LowerSameOffsets lower-cases s and reports whether every byte offset of
+// the result matches s, that is whether each character kept its encoded
+// width (İ lowers to the one-byte i, Ⱥ to the three-byte ⱥ: equal total
+// lengths do not imply equal offsets). Invalid UTF-8 bytes are copied as is.
+func LowerSameOffsets(s string) (string, bool) {
+	ascii := true
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return strings.ToLower(s), true
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, n := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && n == 1 {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		l := unicode.ToLower(r)
+		if utf8.RuneLen(l) != n {
+			return "", false
+		}
+		b.WriteRune(l)
+		i += n
+	}
+	return b.String(), true
 }
 
 // run reports every match of p within its scope, exactly as

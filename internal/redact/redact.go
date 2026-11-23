@@ -219,8 +219,7 @@ func (e *Engine) detectSegment(ctx context.Context, text string) ([]Finding, err
 	}
 	// case-insensitive for ASCII; fall back to exact matching when lower-casing
 	// would shift byte offsets
-	lower := strings.ToLower(text)
-	fold := len(lower) == len(text)
+	lower, fold := rules.LowerSameOffsets(text)
 	if !fold {
 		lower = text
 	}
