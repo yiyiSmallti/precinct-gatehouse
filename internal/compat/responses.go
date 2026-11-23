@@ -478,9 +478,23 @@ func splitContentParts(v any) (text string, images []any, ok bool) {
 		return "", nil, false
 	}
 	var texts []string
+	// keepRaw keeps a part this adapter does not convert as text, so that
+	// pulling the images out of an output never loses the rest of it
+	keepRaw := func(raw any) {
+		s, ok := raw.(string)
+		if !ok {
+			s = string(oai.Encode(raw))
+		}
+		s, imgs := extractInlineImages(s)
+		if s != "" {
+			texts = append(texts, s)
+		}
+		images = append(images, imgs...)
+	}
 	for _, raw := range parts {
 		p, isObj := raw.(map[string]any)
 		if !isObj {
+			keepRaw(raw)
 			continue
 		}
 		switch oai.Str(p, "type") {
@@ -504,10 +518,10 @@ func splitContentParts(v any) (text string, images []any, ok bool) {
 			if img := imagePart(p); img != nil {
 				images = append(images, img)
 			} else {
-				// an image shape we cannot convert stays as JSON text
-				// rather than vanishing
-				texts = append(texts, string(oai.Encode(p)))
+				keepRaw(p)
 			}
+		default:
+			keepRaw(p)
 		}
 	}
 	return strings.Join(texts, "\n"), images, ok
