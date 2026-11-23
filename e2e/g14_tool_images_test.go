@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const g13Config = `
+const g14Config = `
 listen: {{LISTEN}}
 mode: personal
 providers:
@@ -40,18 +40,18 @@ redaction:
   categories: { phone: mask, id_card: mask }
 `
 
-// g13Phone sits right after an image payload on the same line.
-const g13Phone = "13698765432"
+// g14Phone sits right after an image payload on the same line.
+const g14Phone = "13698765432"
 
-// g13DataURI returns a PNG data URI whose base64 payload is payloadLen bytes.
-func g13DataURI(seed int64, payloadLen int) string {
+// g14DataURI returns a PNG data URI whose base64 payload is payloadLen bytes.
+func g14DataURI(seed int64, payloadLen int) string {
 	raw := make([]byte, payloadLen*3/4)
 	rand.New(rand.NewSource(seed)).Read(raw)
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
 }
 
-func TestG13ToolImages(t *testing.T) {
-	rep := newReport(t, "G13-tool-images", "G13 工具图片与大 base64（issue #11）",
+func TestG14ToolImages(t *testing.T) {
+	rep := newReport(t, "G14-tool-images", "G14 工具图片与大 base64（issue #11）",
 		"本地目标开启 `mask` 脱敏。`/v1/responses` 一轮内 4 个并行工具调用分别以内容数组、单个图片对象、JSON 编码字符串、内嵌 data URI 文本返回图片，并带 Codex Desktop 的 `additional_tools` 输入项；另以 Chat Completions 发送夹着 ~3 MB base64 图片的文本。断言假上游收到的消息结构、脱敏结果与耗时。")
 	fake := startFake(t, "ds")
 	var classified []string
@@ -62,13 +62,13 @@ func TestG13ToolImages(t *testing.T) {
 		}
 		return "0"
 	}
-	g := startGateway(t, fmt.Sprintf(g13Config, fake.URL), nil)
+	g := startGateway(t, fmt.Sprintf(g14Config, fake.URL), nil)
 	hdr := map[string]string{"Authorization": "Bearer " + g.Token}
 
-	big := g13DataURI(1, 3<<20)
-	smallB := g13DataURI(2, 8<<10)
-	smallC := g13DataURI(3, 8<<10)
-	smallD := g13DataURI(4, 8<<10)
+	big := g14DataURI(1, 3<<20)
+	smallB := g14DataURI(2, 8<<10)
+	smallC := g14DataURI(3, 8<<10)
+	smallD := g14DataURI(4, 8<<10)
 	jsonC, _ := json.Marshal([]any{
 		map[string]any{"type": "input_text", "text": "截图 C"},
 		map[string]any{"type": "input_image", "image_url": smallC},
@@ -191,7 +191,7 @@ func TestG13ToolImages(t *testing.T) {
 	// Inline ~3 MB base64 inside plain text with PII on both sides, including
 	// PII right after the payload on the same line and after a line-wrapped
 	// payload.
-	wrapped := g13DataURI(5, 4<<10)
+	wrapped := g14DataURI(5, 4<<10)
 	var wb strings.Builder
 	payload := strings.TrimPrefix(wrapped, "data:image/png;base64,")
 	wb.WriteString("data:image/png;base64,")
@@ -200,7 +200,7 @@ func TestG13ToolImages(t *testing.T) {
 		payload = payload[76:]
 	}
 	wb.WriteString(payload)
-	text := "联系 " + g2Phone + " 看图 " + big + " " + g13Phone + " 身份证 " + g2ID + "\n" + wb.String() + "\n" + g2Phone + " 结束"
+	text := "联系 " + g2Phone + " 看图 " + big + " " + g14Phone + " 身份证 " + g2ID + "\n" + wb.String() + "\n" + g2Phone + " 结束"
 	start = time.Now()
 	rc := g.Chat(t, g.Token, map[string]any{"model": "ds/deepseek-chat", "messages": msgs("user", text)}, nil)
 	chatElapsed := time.Since(start)
@@ -209,10 +209,10 @@ func TestG13ToolImages(t *testing.T) {
 	rep.Check("Chat 文本内 3 MB base64 在 mask 模式下不拖慢请求（< 1s，修复前本机 1.29s、线上 90s）",
 		rc.Status == 200 && chatElapsed < time.Second, "status=%d elapsed=%s", rc.Status, chatElapsed.Round(time.Millisecond))
 	rep.Check("base64 前后（含紧跟同行、换行包裹图片之后）的手机号、身份证仍被脱敏，图片数据原样保留",
-		!strings.Contains(sent, g2Phone) && !strings.Contains(sent, g13Phone) && !strings.Contains(sent, g2ID) &&
+		!strings.Contains(sent, g2Phone) && !strings.Contains(sent, g14Phone) && !strings.Contains(sent, g2ID) &&
 			strings.Contains(sent, big) && strings.Contains(sent, wb.String()),
 		"phone_masked=%v trailing_phone_masked=%v id_masked=%v image_intact=%v wrapped_intact=%v",
-		!strings.Contains(sent, g2Phone), !strings.Contains(sent, g13Phone), !strings.Contains(sent, g2ID), strings.Contains(sent, big), strings.Contains(sent, wb.String()))
+		!strings.Contains(sent, g2Phone), !strings.Contains(sent, g14Phone), !strings.Contains(sent, g2ID), strings.Contains(sent, big), strings.Contains(sent, wb.String()))
 
 	rep.Note("耗时（含 HTTP 往返与假上游）：Responses 4 路工具图片 %s；Chat 内嵌 3 MB base64 %s。", respElapsed.Round(time.Millisecond), chatElapsed.Round(time.Millisecond))
 }
