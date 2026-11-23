@@ -349,23 +349,41 @@ func (cm *ContextCompressor) ScheduleStage2(job *stage2Job) {
 	if !cfg.Enabled || !stage2Enabled(cfg) || job == nil {
 		return
 	}
+	upgraded := false
 	cm.mu.Lock()
+	if cp, ok := cm.checkpoints[job.checkpointID]; ok && job.confidential && !cp.Confidential {
+		cp.Confidential = true
+		cm.dirty = true
+		upgraded = true
+	}
 	if cm.inFlightSess[job.sessionRoot] {
 		cm.mu.Unlock()
+		if upgraded {
+			cm.saveToDisk()
+		}
 		return
 	}
 	if cp, ok := cm.checkpoints[job.checkpointID]; ok {
 		if cp.Stage == 2 && cp.Stage2Status == "ready" {
 			cm.mu.Unlock()
+			if upgraded {
+				cm.saveToDisk()
+			}
 			return
 		}
 		if cp.Stage2Status == "failed" && !cp.Stage2FailedAt.IsZero() && time.Since(cp.Stage2FailedAt) < stage2RetryCooldown {
 			cm.mu.Unlock()
+			if upgraded {
+				cm.saveToDisk()
+			}
 			return
 		}
 	}
 	cm.inFlightSess[job.sessionRoot] = true
 	cm.mu.Unlock()
+	if upgraded {
+		cm.saveToDisk()
+	}
 
 	select {
 	case cm.jobCh <- job:
@@ -496,6 +514,9 @@ func (cm *ContextCompressor) MaybeCompress(
 		tailMsgs := msgs[matchedCutIdx+1:]
 		tailEst := estimateMessagesTokens(tailMsgs)
 		effectiveConfidential := confidential || matchedCP.Confidential
+		if effectiveConfidential {
+			cm.upgradeConfidential(matchedCP.ID)
+		}
 
 		// Stage 2 ready checkpoint!
 		if matchedCP.Stage == 2 && matchedCP.SummaryText != "" {
@@ -1588,11 +1609,20 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 	start := time.Now()
 	cm.totalStage2Jobs.Add(1)
 
+	upgradedOnStart := false
 	cm.mu.Lock()
 	if cp, ok := cm.checkpoints[job.checkpointID]; ok {
+		if job.confidential && !cp.Confidential {
+			cp.Confidential = true
+			cm.dirty = true
+			upgradedOnStart = true
+		}
 		cp.Stage2Status = "running"
 	}
 	cm.mu.Unlock()
+	if upgradedOnStart {
+		cm.saveToDisk()
+	}
 
 	var summaryText string
 	var redactedChanged bool
@@ -1624,8 +1654,14 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 	durMs := time.Since(start).Milliseconds()
 	if err != nil {
 		cm.totalStage2Fail.Add(1)
+		upgradedOnErr := false
 		cm.mu.Lock()
 		if cp, ok := cm.checkpoints[job.checkpointID]; ok {
+			if job.confidential && !cp.Confidential {
+				cp.Confidential = true
+				cm.dirty = true
+				upgradedOnErr = true
+			}
 			cp.Stage2Status = "failed"
 			cp.Stage2Err = err.Error()
 			cp.Stage2Ms = durMs
@@ -1635,6 +1671,9 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 			}
 		}
 		cm.mu.Unlock()
+		if upgradedOnErr {
+			cm.saveToDisk()
+		}
 		cm.router.log.Warn("context compress stage2 failed", "provider", cm.router.name, "id", shortID(job.checkpointID), "backend", usedBackend, "ms", durMs, "err", err)
 		return
 	}
@@ -1666,6 +1705,10 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 	shouldPersist := false
 	cm.mu.Lock()
 	if cp, ok := cm.checkpoints[job.checkpointID]; ok {
+		wasNonConfidential := !cp.Confidential
+		if job.confidential && !cp.Confidential {
+			cp.Confidential = true
+		}
 		cp.Stage = 2
 		cp.SummaryText = summaryText
 		cp.HardConstraints = hardConstraints
@@ -1677,7 +1720,7 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 		cp.PrewarmPrompt = prewarmPrompt
 		cp.PrewarmCached = prewarmCached
 		cp.Stage1Msgs = nil
-		if !cp.Confidential {
+		if !cp.Confidential || (wasNonConfidential && cp.Confidential) {
 			cm.dirty = true
 			shouldPersist = true
 		}
@@ -2290,10 +2333,34 @@ func shortID(s string) string {
 
 // ---------- Persistence, Eviction & Management Views ----------
 
+func (cm *ContextCompressor) upgradeConfidential(id string) {
+	if id == "" {
+		return
+	}
+	upgraded := false
+	cm.mu.Lock()
+	if cp, ok := cm.checkpoints[id]; ok && !cp.Confidential {
+		cp.Confidential = true
+		cm.dirty = true
+		upgraded = true
+	}
+	cm.mu.Unlock()
+	if upgraded {
+		cm.saveToDisk()
+	}
+}
+
 func (cm *ContextCompressor) upsertCheckpoint(cp *ContextCheckpoint) {
 	cfg := cm.getCfg()
+	upgraded := false
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	if prev := cm.checkpoints[cp.ID]; prev != nil {
+		if prev.Confidential {
+			cp.Confidential = true
+		} else if cp.Confidential {
+			upgraded = true
+		}
+	}
 	if _, exists := cm.checkpoints[cp.ID]; !exists {
 		cm.bySessionRoot[cp.SessionRoot] = append(cm.bySessionRoot[cp.SessionRoot], cp)
 	} else {
@@ -2312,8 +2379,12 @@ func (cm *ContextCompressor) upsertCheckpoint(cp *ContextCheckpoint) {
 	}
 	cm.checkpoints[cp.ID] = cp
 	cm.trimLocked(cfg)
-	if !cp.Confidential {
+	if !cp.Confidential || upgraded {
 		cm.dirty = true
+	}
+	cm.mu.Unlock()
+	if upgraded {
+		cm.saveToDisk()
 	}
 }
 
