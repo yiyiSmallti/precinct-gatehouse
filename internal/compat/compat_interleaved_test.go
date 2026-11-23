@@ -211,20 +211,25 @@ func TestDecodeAnthropicToolResultPreservesImages(t *testing.T) {
 	if !oai.HasImage(req) {
 		t.Fatalf("expected oai.HasImage(req)=true when tool_result includes an image block")
 	}
+	// images leave the tool messages: Chat Completions only accepts image
+	// parts in user messages, so they follow the tool messages in one user
+	// message
 	msgs := oai.Messages(req)
-	if len(msgs) != 2 {
-		t.Fatalf("expected 2 tool messages, got %d: %#v", len(msgs), msgs)
+	if len(msgs) != 3 {
+		t.Fatalf("expected 2 tool messages and 1 image carrier, got %d: %#v", len(msgs), msgs)
 	}
-	parts, ok := msgs[0]["content"].([]any)
-	if !ok || len(parts) != 2 {
-		t.Fatalf("expected 2 content parts in first tool message, got %#v", msgs[0]["content"])
-	}
-	if p1, _ := parts[1].(map[string]any); oai.Str(p1, "type") != "image_url" {
-		t.Fatalf("expected image_url part, got %#v", parts[1])
-	} else if iu, _ := p1["image_url"].(map[string]any); oai.Str(iu, "url") != "data:image/png;base64,iVBORw0KGgo=" {
-		t.Fatalf("unexpected image_url value: %#v", iu)
+	if s, ok := msgs[0]["content"].(string); !ok || s != "Screenshot captured" {
+		t.Fatalf("expected the first tool message to keep only its text, got %#v", msgs[0]["content"])
 	}
 	if s, ok := msgs[1]["content"].(string); !ok || s != "plain text tool output" {
 		t.Fatalf("expected text-only tool_result content to remain string, got %#v", msgs[1]["content"])
+	}
+	if !oai.IsToolImageCarrier(msgs, 2) {
+		t.Fatalf("expected a tool image carrier after the tool messages, got %#v", msgs[2])
+	}
+	parts, _ := msgs[2]["content"].([]any)
+	p1, _ := parts[len(parts)-1].(map[string]any)
+	if iu, _ := p1["image_url"].(map[string]any); oai.Str(iu, "url") != "data:image/png;base64,iVBORw0KGgo=" {
+		t.Fatalf("unexpected image part: %#v", p1)
 	}
 }

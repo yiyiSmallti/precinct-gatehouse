@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 var (
@@ -191,12 +192,21 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	finish := "stop"
 	var toolArgsStr string
+	toolName := "echo"
 	hasTools := false
 	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
 		hasTools = true
 		args, _ := json.Marshal(map[string]string{"echo": user})
+		// a freeform apply_patch tool (sent as a function with one `input`
+		// string) is called with the user text as its input
+		for _, tl := range tools {
+			if fn, _ := tl.(map[string]any)["function"].(map[string]any); fn["name"] == "apply_patch" {
+				toolName = "apply_patch"
+				args, _ = json.Marshal(map[string]string{"input": user})
+			}
+		}
 		toolArgsStr = string(args)
-		msg["tool_calls"] = []any{map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "echo", "arguments": toolArgsStr}}}
+		msg["tool_calls"] = []any{map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": toolName, "arguments": toolArgsStr}}}
 		finish = "tool_calls"
 	}
 	promptTok := len(body) / 10
@@ -230,10 +240,20 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		if hasTools {
 			mid := len(toolArgsStr) / 2
+			for mid > 0 && !utf8.RuneStart(toolArgsStr[mid]) {
+				mid-- // a JSON string chunk cannot split a character
+			}
 			chunks := []map[string]any{
-				{"index": 0, "id": "call_1", "type": "function", "function": map[string]any{"name": "echo", "arguments": ""}},
+				{"index": 0, "id": "call_1", "type": "function", "function": map[string]any{"name": toolName, "arguments": ""}},
 				{"index": 0, "function": map[string]any{"arguments": toolArgsStr[:mid]}},
 				{"index": 0, "function": map[string]any{"arguments": toolArgsStr[mid:]}},
+			}
+			if strings.Contains(user, "#late-name") {
+				// the id and some arguments arrive before the name
+				chunks = []map[string]any{
+					{"index": 0, "id": "call_1", "type": "function", "function": map[string]any{"arguments": toolArgsStr[:mid]}},
+					{"index": 0, "function": map[string]any{"name": toolName, "arguments": toolArgsStr[mid:]}},
+				}
 			}
 			for _, tc := range chunks {
 				b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,

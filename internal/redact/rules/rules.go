@@ -38,6 +38,10 @@ type pattern struct {
 	check func(v string) bool              // validator on the reported span
 	edge  func(text string, s, e int) bool // boundary check on the reported span
 	ctx   bool                             // apply "order number" context exception
+	// scope narrows where re runs (see scan.go); nil means the whole text
+	scope scopeFunc
+	// anchored is re with a leading ^, for scopes that return match starts
+	anchored *regexp.Regexp
 }
 
 var (
@@ -47,27 +51,35 @@ var (
 
 var patterns = []pattern{
 	// Secrets first: they win overlaps.
-	{kind: Secret, re: regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)},
-	{kind: Secret, re: regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`)},
-	{kind: Secret, re: regexp.MustCompile(`\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|LTAI[0-9A-Za-z]{12,24}|AKID[0-9A-Za-z]{13,40}|gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,})`)},
-	{kind: Secret, re: regexp.MustCompile(`(?i)\bbearer\s+([A-Za-z0-9._~+/-]{20,}=*)`), group: 1},
-	{kind: Secret, re: regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:([^/\s@]{3,})@`), group: 1},
-	{kind: Secret, re: regexp.MustCompile(`(?i)(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|auth[_-]?token|access[_-]?token|client[_-]?secret|密码|口令|密钥)["']?\s*[:=：]\s*["']?([^\s"',;，；]{6,})`), group: 1},
+	{kind: Secret, re: regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----`), scope: ifContains("PRIVATE KEY-----")},
+	{kind: Secret, re: regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`), scope: ifContains("eyJ")},
+	{kind: Secret, re: regexp.MustCompile(`\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|LTAI[0-9A-Za-z]{12,24}|AKID[0-9A-Za-z]{13,40}|gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,})`),
+		scope: ifContains("sk-", "AKIA", "LTAI", "AKID", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-", "AIza", "glpat-")},
+	{kind: Secret, re: regexp.MustCompile(`(?i)\bbearer\s+([A-Za-z0-9._~+/-]{20,}=*)`), group: 1, scope: ifContainsFold("bearer")},
+	{kind: Secret, re: regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:([^/\s@]{3,})@`), group: 1, scope: ifContainsAll("://", "@")},
+	secretKV,
 
-	{kind: IDCard, re: regexp.MustCompile(`[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]`), check: idCardOK, edge: alnumEdge, ctx: true},
-	{kind: USCC, re: regexp.MustCompile(`[0-9A-HJ-NP-RTUW-Y]{2}\d{6}[0-9A-HJ-NP-RTUW-Y]{10}`), check: usccOK, edge: alnumEdge},
-	{kind: Phone, re: regexp.MustCompile(`(?:\+?86[- ]?)?1[3-9]\d(?:[- ]?\d{4}){2}`), edge: digitEdge, ctx: true},
-	{kind: BankCard, re: regexp.MustCompile(`\d{4}(?:[ -]?\d{4}){2,3}(?:[ -]?\d{1,3})?|\d{13,19}`), check: bankOK, edge: digitEdge, ctx: true},
-	{kind: Email, re: regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}`)},
-	{kind: Plate, re: regexp.MustCompile(`[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-HJ-NP-Z][·•]?[A-HJ-NP-Z0-9]{4,5}[A-HJ-NP-Z0-9挂学警]`), edge: alnumEdge},
-	{kind: IP, re: regexp.MustCompile(`\b(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b`), check: ipOK},
+	{kind: IDCard, re: regexp.MustCompile(`[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]`), check: idCardOK, edge: alnumEdge, ctx: true, scope: digitRuns},
+	{kind: USCC, re: regexp.MustCompile(`[0-9A-HJ-NP-RTUW-Y]{2}\d{6}[0-9A-HJ-NP-RTUW-Y]{10}`), check: usccOK, edge: alnumEdge, scope: digitRuns},
+	{kind: Phone, re: regexp.MustCompile(`(?:\+?86[- ]?)?1[3-9]\d(?:[- ]?\d{4}){2}`), edge: digitEdge, ctx: true, scope: digitRuns},
+	{kind: BankCard, re: regexp.MustCompile(`\d{4}(?:[ -]?\d{4}){2,3}(?:[ -]?\d{1,3})?|\d{13,19}`), check: bankOK, edge: digitEdge, ctx: true, scope: digitRuns},
+	{kind: Email, re: regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}`), scope: emailRuns},
+	plate,
+	{kind: IP, re: regexp.MustCompile(`\b(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b`), check: ipOK, scope: ipRuns},
 }
+
+var secretKV = anchoredPattern(pattern{kind: Secret, group: 1, scope: kvStarts},
+	`(?i)(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|auth[_-]?token|access[_-]?token|client[_-]?secret|密码|口令|密钥)["']?\s*[:=：]\s*["']?([^\s"',;，；]{6,})`)
+
+var plate = anchoredPattern(pattern{kind: Plate, edge: alnumEdge, scope: plateStarts},
+	`[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-HJ-NP-Z][·•]?[A-HJ-NP-Z0-9]{4,5}[A-HJ-NP-Z0-9挂学警]`)
 
 var orderCtx = regexp.MustCompile(`(?i)(?:订单号|订单编号|订单|工单号|工单编号|工单|单号|流水号|快递单|运单号|交易号|order[ _-]?(?:id|no|number)?|ticket[ _-]?(?:id|no)?|tracking[ _-]?(?:id|no)?|invoice[ _-]?no)["']?\s*[:：#=]?\s*["']?$`)
 
 // Detector runs the pack.
 type Detector struct {
 	domains *regexp.Regexp
+	suffix  []string // lower-case internal domain suffixes
 }
 
 // DefaultInternalDomains are the suffixes treated as internal host names.
@@ -83,7 +95,11 @@ func New(internalDomains []string) *Detector {
 		alts = append(alts, regexp.QuoteMeta(strings.TrimPrefix(d, ".")))
 	}
 	re := regexp.MustCompile(`(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:` + strings.Join(alts, "|") + `)\b`)
-	return &Detector{domains: re}
+	suffix := make([]string, 0, len(internalDomains))
+	for _, d := range internalDomains {
+		suffix = append(suffix, "."+strings.ToLower(strings.TrimPrefix(d, ".")))
+	}
+	return &Detector{domains: re, suffix: suffix}
 }
 
 // Detect returns non-overlapping findings ordered by position.
@@ -97,33 +113,34 @@ func (d *Detector) Detect(text string) []Finding {
 		}
 		return false
 	}
-	run := func(p pattern) {
-		for _, m := range p.re.FindAllStringSubmatchIndex(text, -1) {
+	sc := newScanText(text)
+	record := func(p pattern, m []int) {
+		{
 			s, e := m[2*p.group], m[2*p.group+1]
 			if s < 0 {
-				continue
+				return
 			}
 			v := text[s:e]
 			if p.edge != nil && !p.edge(text, s, e) {
-				continue
+				return
 			}
 			if p.check != nil && !p.check(v) {
-				continue
+				return
 			}
 			if p.ctx && orderCtx.MatchString(text[max(0, s-40):s]) {
-				continue
+				return
 			}
 			if taken(s, e) {
-				continue
+				return
 			}
 			out = append(out, Finding{Kind: p.kind, Start: s, End: e})
 		}
 	}
 	for _, p := range patterns {
-		run(p)
+		sc.run(p, record)
 		if p.kind == Email {
 			// internal domains after e-mail so that addresses stay whole
-			run(pattern{kind: Domain, re: d.domains})
+			sc.run(pattern{kind: Domain, re: d.domains, scope: domainRuns(d.suffix)}, record)
 		}
 	}
 	sortFindings(out)

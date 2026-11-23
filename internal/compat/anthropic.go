@@ -135,8 +135,13 @@ func convertAnthropicMessage(m map[string]any) ([]any, error) {
 	}
 }
 
+// convertAnthropicUserBlocks turns a user message into Chat messages: one
+// tool message per tool_result, then (when tools returned images) one user
+// message carrying those images, then the user's own content. Image parts
+// only go in user messages; see DecodeResponses.
 func convertAnthropicUserBlocks(role string, blocks []any) []any {
 	var toolMsgs []any
+	var toolImages []any
 	var parts []any
 	for _, b := range blocks {
 		blk, ok := b.(map[string]any)
@@ -145,10 +150,19 @@ func convertAnthropicUserBlocks(role string, blocks []any) []any {
 		}
 		switch oai.Str(blk, "type") {
 		case "tool_result":
+			id := oai.Str(blk, "tool_use_id")
+			text, images := anthropicToolResult(blk["content"])
+			if len(images) > 0 {
+				if text == "" {
+					text = toolImagePlaceholder
+				}
+				toolImages = append(toolImages, map[string]any{"type": "text", "text": oai.ToolImageLabel + id + ":"})
+				toolImages = append(toolImages, images...)
+			}
 			toolMsgs = append(toolMsgs, map[string]any{
 				"role":         "tool",
-				"tool_call_id": oai.Str(blk, "tool_use_id"),
-				"content":      extractToolResultContent(blk["content"]),
+				"tool_call_id": id,
+				"content":      text,
 			})
 		case "text":
 			parts = append(parts, map[string]any{"type": "text", "text": oai.Str(blk, "text")})
@@ -156,10 +170,15 @@ func convertAnthropicUserBlocks(role string, blocks []any) []any {
 			if img, ok := convertAnthropicImageBlock(blk); ok {
 				parts = append(parts, img)
 			}
+		case "document":
+			parts = append(parts, map[string]any{"type": "text", "text": documentText(anthropicDocument(blk))})
 		}
 	}
 	var out []any
 	out = append(out, toolMsgs...)
+	if len(toolImages) > 0 {
+		out = append(out, map[string]any{"role": "user", "content": toolImages})
+	}
 	if len(parts) == 1 {
 		if p, ok := parts[0].(map[string]any); ok && oai.Str(p, "type") == "text" {
 			out = append(out, map[string]any{"role": role, "content": oai.Str(p, "text")})
@@ -240,14 +259,18 @@ func convertAnthropicImageBlock(blk map[string]any) (map[string]any, bool) {
 	return nil, false
 }
 
-func extractToolResultContent(v any) any {
+// anthropicToolResult splits a tool_result's content into the tool message
+// text and the images it returned. Documents become extracted text or a
+// notice, never raw base64.
+func anthropicToolResult(v any) (string, []any) {
 	switch c := v.(type) {
+	case nil:
+		return "", nil
 	case string:
-		return c
+		return extractInlineImages(c)
 	case []any:
-		var textParts []string
-		var parts []any
-		hasImage := false
+		var texts []string
+		var images []any
 		for _, item := range c {
 			m, ok := item.(map[string]any)
 			if !ok {
@@ -255,27 +278,26 @@ func extractToolResultContent(v any) any {
 			}
 			switch oai.Str(m, "type") {
 			case "text":
-				txt := oai.Str(m, "text")
-				textParts = append(textParts, txt)
-				parts = append(parts, map[string]any{"type": "text", "text": txt})
+				s, imgs := extractInlineImages(oai.Str(m, "text"))
+				if s != "" {
+					texts = append(texts, s)
+				}
+				images = append(images, imgs...)
 			case "image":
 				if img, ok := convertAnthropicImageBlock(m); ok {
-					hasImage = true
-					parts = append(parts, img)
+					images = append(images, img)
+				} else {
+					texts = append(texts, string(oai.Encode(m)))
 				}
+			case "document":
+				texts = append(texts, documentText(anthropicDocument(m)))
+			default:
+				texts = append(texts, string(oai.Encode(m)))
 			}
 		}
-		if hasImage {
-			return parts
-		}
-		if len(textParts) > 0 {
-			return strings.Join(textParts, "\n")
-		}
-		return string(oai.Encode(c))
-	case nil:
-		return ""
+		return strings.Join(texts, "\n"), images
 	default:
-		return string(oai.Encode(c))
+		return extractInlineImages(string(oai.Encode(c)))
 	}
 }
 

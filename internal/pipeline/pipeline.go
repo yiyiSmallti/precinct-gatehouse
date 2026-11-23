@@ -432,6 +432,9 @@ func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error
 	if len(oai.Messages(req)) == 0 {
 		return nil, oai.Errorf(http.StatusBadRequest, "invalid_request", "messages is required")
 	}
+	if n := oai.GuardBinaryToolOutput(req); n > 0 {
+		st.w.Header().Set("X-Gatehouse-Binary-Tool-Output", strconv.Itoa(n))
+	}
 	origModel := oai.Str(req, "model")
 	st.rec.RequestedModel = origModel
 	st.clientStream = oai.Bool(req, "stream")
