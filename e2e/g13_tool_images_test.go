@@ -214,5 +214,41 @@ func TestG13ToolImages(t *testing.T) {
 		"phone_masked=%v trailing_phone_masked=%v id_masked=%v image_intact=%v wrapped_intact=%v",
 		!strings.Contains(sent, g2Phone), !strings.Contains(sent, g13Phone), !strings.Contains(sent, g2ID), strings.Contains(sent, big), strings.Contains(sent, wb.String()))
 
-	rep.Note("耗时（含 HTTP 往返与假上游）：Responses 4 路工具图片 %s；Chat 内嵌 3 MB base64 %s。", respElapsed.Round(time.Millisecond), chatElapsed.Round(time.Millisecond))
+	// A long agent history (~2 MB of code and logs) with PII in a few tool
+	// outputs: the rule pack only runs its regexps where they could match.
+	var hist []any
+	hist = append(hist, map[string]any{"type": "message", "role": "user", "content": "修复这个仓库里的 bug"})
+	for i := 0; i < 540; i++ {
+		id := fmt.Sprintf("call_h%d", i)
+		out := strings.Repeat("func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request) {\n\t// 处理请求 id=42 port 8080\n}\n", 40) +
+			fmt.Sprintf("2026-11-23 10:00:%02d INFO request_id=%d latency_ms=%d\n", i%60, 100000+i, i*7)
+		if i%100 == 7 {
+			out += "联系人 " + g2Phone + " 身份证 " + g2ID + "\n"
+		}
+		hist = append(hist,
+			map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "我先看一下文件 " + strings.Repeat("分析说明 ", 20)}}},
+			map[string]any{"type": "function_call", "call_id": id, "name": "shell", "arguments": `{"command":["sed","-n","1,200p","internal/pipeline/pipeline.go"]}`},
+			map[string]any{"type": "function_call_output", "call_id": id, "output": out},
+		)
+	}
+	hist = append(hist, map[string]any{"type": "message", "role": "user", "content": "继续"})
+	histBody, _ := json.Marshal(map[string]any{"model": "gpt-5", "input": hist})
+	postJSON(t, g.URL+"/responses", hdr, map[string]any{"model": "gpt-5", "input": hist}) // warm up
+	start = time.Now()
+	rh := postJSON(t, g.URL+"/responses", hdr, map[string]any{"model": "gpt-5", "input": hist})
+	histElapsed := time.Since(start)
+	reqs = fake.ChatRequests()
+	histUp := string(oaiEncode(reqs[len(reqs)-1]))
+	rep.Check("~2 MB 代码/日志历史在 mask 模式下脱敏耗时可控（< 400ms，修复前本机约 0.7s），其中的手机号、身份证全部打码",
+		rh.Status == 200 && histElapsed < 400*time.Millisecond && !strings.Contains(histUp, g2Phone) && !strings.Contains(histUp, g2ID) &&
+			strings.Count(histUp, "{{PHONE_") >= 6,
+		"status=%d body=%dKB elapsed=%s phone_left=%v id_left=%v phone_placeholders=%d", rh.Status, len(histBody)>>10, histElapsed.Round(time.Millisecond),
+		strings.Contains(histUp, g2Phone), strings.Contains(histUp, g2ID), strings.Count(histUp, "{{PHONE_"))
+
+	rep.Note("耗时（含 HTTP 往返与假上游）：Responses 多路工具图片 %s；Chat 内嵌 3 MB base64 %s；~2 MB 历史 %s。", respElapsed.Round(time.Millisecond), chatElapsed.Round(time.Millisecond), histElapsed.Round(time.Millisecond))
+}
+
+func oaiEncode(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
