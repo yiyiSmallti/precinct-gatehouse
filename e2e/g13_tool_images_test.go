@@ -94,7 +94,7 @@ func TestG13ToolImages(t *testing.T) {
 			}},
 			map[string]any{"type": "function_call_output", "call_id": "call_c", "output": string(jsonC)},
 			map[string]any{"type": "function_call_output", "call_id": "call_d", "output": "日志 D " + smallD + " 结束"},
-			map[string]any{"type": "function_call_output", "call_id": "call_e", "output": `[{"type":"image","url":"https://example.com/shot.png"}]`},
+			map[string]any{"type": "function_call_output", "call_id": "call_e", "output": `[{"type":"image","url":"https://example.com/shot.png"},{"type":"resource","resource":{"uri":"file:///report.txt","text":"important tool result"}}]`},
 			map[string]any{"type": "function_call_output", "call_id": "call_f", "output": map[string]any{
 				"type": "image", "mimeType": "image/png", "data": strings.TrimPrefix(smallD, "data:image/png;base64,"),
 			}},
@@ -135,7 +135,7 @@ func TestG13ToolImages(t *testing.T) {
 	}
 	rep.Check("tool 消息只含纯文本，无 base64",
 		toolOK && strings.HasPrefix(toolText["call_a"], "截图 A") && strings.Contains(toolText["call_b"], "image returned by tool") &&
-			toolText["call_c"] == "截图 C" && toolText["call_d"] == "日志 D [image] 结束" && strings.Contains(toolText["call_e"], "image returned by tool") &&
+			toolText["call_c"] == "截图 C" && toolText["call_d"] == "日志 D [image] 结束" && strings.Contains(toolText["call_e"], `"text":"important tool result"`) &&
 			strings.Contains(toolText["call_f"], "image returned by tool") && toolText["call_g"] == `{"ref":"shot-7","type":"image"}`,
 		"a=%q b=%q c=%q d=%q e=%q f=%q g=%q", toolText["call_a"], toolText["call_b"], toolText["call_c"], toolText["call_d"], toolText["call_e"], toolText["call_f"], toolText["call_g"])
 	rep.Check("tool 文本中的手机号仍被脱敏",
@@ -155,7 +155,7 @@ func TestG13ToolImages(t *testing.T) {
 			}
 		}
 	}
-	rep.Check("6 张图片原样进入 user 消息的 image_url 块（含 detail、JSON 字符串里的 `image`+`url`、MCP `data`+`mimeType`）；无法转换的图片对象保留为 JSON 文本",
+	rep.Check("6 张图片原样进入 user 消息的 image_url 块（含 detail、JSON 字符串里的 `image`+`url`、MCP `data`+`mimeType`）；无法转换的图片对象和未识别的内容块保留为 JSON 文本",
 		len(urls) == 6 && urls[0] == big && urls[1] == smallB && urls[2] == smallC && urls[3] == smallD &&
 			urls[4] == "https://example.com/shot.png" && urls[5] == smallD && detailB == "high",
 		"images=%d big_intact=%v detail_b=%q", len(urls), len(urls) > 0 && urls[0] == big, detailB)
