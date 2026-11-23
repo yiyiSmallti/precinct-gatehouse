@@ -363,13 +363,17 @@ func (cm *ContextCompressor) ScheduleStage2(job *stage2Job) {
 			cm.mu.Unlock()
 			return
 		}
-		cp.Stage2Status = "pending"
 	}
 	cm.inFlightSess[job.sessionRoot] = true
 	cm.mu.Unlock()
 
 	select {
 	case cm.jobCh <- job:
+		cm.mu.Lock()
+		if cp, ok := cm.checkpoints[job.checkpointID]; ok && cp.Stage < 2 && cp.Stage2Status != "running" && cp.Stage2Status != "ready" {
+			cp.Stage2Status = "pending"
+		}
+		cm.mu.Unlock()
 		cm.router.log.Info("context compress stage2 queued", "provider", cm.router.name, "id", shortID(job.checkpointID), "sess", shortID(job.sessionRoot), "src_est", job.sourceEstTokens)
 	default:
 		cm.mu.Lock()
@@ -544,8 +548,7 @@ func (cm *ContextCompressor) MaybeCompress(
 					res.CheckpointID = matchedCP.ID
 					res.Stage2Status = matchedCP.Stage2Status
 					res.CompressedTokens = effectiveTotal
-					if stage2Enabled(cfg) && (matchedCP.Stage2Status == "none" ||
-						(matchedCP.Stage2Status == "failed" && time.Since(matchedCP.Stage2FailedAt) >= stage2RetryCooldown)) {
+					if cm.shouldScheduleStage2(cfg, matchedCP, sessionRoot) {
 						res.PendingJob = &stage2Job{
 							checkpointID:      matchedCP.ID,
 							sessionRoot:       sessionRoot,
@@ -582,8 +585,7 @@ func (cm *ContextCompressor) MaybeCompress(
 			res.CheckpointID = matchedCP.ID
 			res.Stage2Status = matchedCP.Stage2Status
 			res.SkipReason = "stage2-in-progress"
-			if stage2Enabled(cfg) && (matchedCP.Stage2Status == "none" ||
-				(matchedCP.Stage2Status == "failed" && time.Since(matchedCP.Stage2FailedAt) >= stage2RetryCooldown)) {
+			if cm.shouldScheduleStage2(cfg, matchedCP, sessionRoot) {
 				res.PendingJob = &stage2Job{
 					checkpointID:      matchedCP.ID,
 					sessionRoot:       sessionRoot,
@@ -617,6 +619,30 @@ func (cm *ContextCompressor) MaybeCompress(
 		sysMsgs, toolsRaw, extraOpts, model, sysEst, toolsEst,
 		cfg, heavyMissThreshold, originTarget, confidential,
 		nil, nil, msgs[sysEnd:], sysEnd)
+}
+
+func (cm *ContextCompressor) shouldScheduleStage2(cfg ContextCompressConfig, cp *ContextCheckpoint, sessionRoot string) bool {
+	if !stage2Enabled(cfg) || cp == nil || cp.Stage == 2 {
+		return false
+	}
+	cm.mu.RLock()
+	busy := cm.inFlightSess[sessionRoot]
+	cm.mu.RUnlock()
+	if busy {
+		return false
+	}
+	if cp.Stage2Status == "none" || cp.Stage2Status == "pending" {
+		return true
+	}
+	return cp.Stage2Status == "failed" && time.Since(cp.Stage2FailedAt) >= stage2RetryCooldown
+}
+
+func (cm *ContextCompressor) resetPendingStage2Status(checkpointID string) {
+	cm.mu.Lock()
+	if cp, ok := cm.checkpoints[checkpointID]; ok && cp.Stage < 2 && (cp.Stage2Status == "pending" || cp.Stage2Status == "running") {
+		cp.Stage2Status = "none"
+	}
+	cm.mu.Unlock()
 }
 
 func (cm *ContextCompressor) compressAndRegister(
@@ -748,9 +774,6 @@ func (cm *ContextCompressor) compressAndRegister(
 		cp.Stage = 1
 		cp.Stage1Msgs = cloneRawMessages(stage1Hist)
 		cp.Hits = 1
-		if stage2Enabled(cfg) {
-			cp.Stage2Status = "pending"
-		}
 		cm.upsertCheckpoint(cp)
 		cm.totalStage1Hits.Add(1)
 		if rawAn.TotalEst > stage1TotalEst {
@@ -761,9 +784,9 @@ func (cm *ContextCompressor) compressAndRegister(
 		res.Compressed = true
 		res.Mode = "stage1"
 		res.CheckpointID = cpID
-		res.Stage2Status = cp.Stage2Status
 		res.CompressedTokens = stage1TotalEst
 		if stage2Enabled(cfg) {
+			res.Stage2Status = "pending"
 			res.PendingJob = &stage2Job{
 				checkpointID:      cpID,
 				sessionRoot:       sessionRoot,
@@ -790,7 +813,6 @@ func (cm *ContextCompressor) compressAndRegister(
 
 	if stage2Enabled(cfg) {
 		cp.Stage = 0
-		cp.Stage2Status = "pending"
 		cm.upsertCheckpoint(cp)
 
 		srcMsgs := histRaw
@@ -1378,6 +1400,7 @@ func extractErrorLines(mid string, maxLines int) []string {
 type parsedToolCall struct {
 	id         string
 	name       string
+	arguments  string
 	target     string
 	isMutation bool
 }
@@ -1404,6 +1427,7 @@ func extractToolCalls(rawMsg json.RawMessage) []parsedToolCall {
 		out = append(out, parsedToolCall{
 			id:         tc.ID,
 			name:       tc.Function.Name,
+			arguments:  tc.Function.Arguments,
 			target:     target,
 			isMutation: isMutationTool(tc.Function.Name, cmdText),
 		})
@@ -1498,10 +1522,10 @@ func (cm *ContextCompressor) stage2WorkerLoop(ctx context.Context) {
 	}
 }
 
-func (cm *ContextCompressor) applyRedactionFilter(ctx context.Context, rawTargetURL string, body []byte, confidential bool) ([]byte, error) {
+func (cm *ContextCompressor) applyRedactionFilter(ctx context.Context, rawTargetURL string, body []byte, confidential bool) ([]byte, bool, error) {
 	fn := cm.router.getWarmupFilter()
 	if fn == nil {
-		return body, nil
+		return body, false, nil
 	}
 	filterCtx := ctx
 	if confidential {
@@ -1509,7 +1533,11 @@ func (cm *ContextCompressor) applyRedactionFilter(ctx context.Context, rawTarget
 	} else if dataClassFromContext(ctx) == "" {
 		filterCtx = WithDataClass(ctx, "internal")
 	}
-	return fn(filterCtx, cm.router.name, rawTargetURL, body)
+	out, err := fn(filterCtx, cm.router.name, rawTargetURL, body)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, !bytes.Equal(out, body), nil
 }
 
 func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
@@ -1533,6 +1561,7 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 			select {
 			case <-ctx.Done():
 				t.Stop()
+				cm.resetPendingStage2Status(job.checkpointID)
 				return
 			case <-t.C:
 			}
@@ -1566,6 +1595,7 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 	cm.mu.Unlock()
 
 	var summaryText string
+	var redactedChanged bool
 	var usedBackend string
 	var err error
 
@@ -1574,19 +1604,20 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 		if job.confidential && (routerTarget != "local" || !config.IsLoopbackURL(sumURL)) {
 			err = errors.New("confidential checkpoint cannot use external summarizer")
 		} else {
-			summaryText, err = cm.callExternalSummarizer(ctx, cfg, job)
+			summaryText, redactedChanged, err = cm.callExternalSummarizer(ctx, cfg, job)
 		}
 	} else {
 		backend := cm.waitForIdleBackend(ctx, cfg, job.sourceEstTokens, job.confidential)
 		if backend == nil {
 			if ctx.Err() != nil {
+				cm.resetPendingStage2Status(job.checkpointID)
 				return
 			}
 			err = fmt.Errorf("no idle eligible backend for stage2 (src_est=%d)", job.sourceEstTokens)
 		} else {
 			bCfg := backend.config()
 			usedBackend = bCfg.ID
-			summaryText, err = cm.callClusterSummarizer(ctx, cfg, job, backend)
+			summaryText, redactedChanged, err = cm.callClusterSummarizer(ctx, cfg, job, backend)
 		}
 	}
 
@@ -1609,6 +1640,11 @@ func (cm *ContextCompressor) runStage2Job(ctx context.Context, job *stage2Job) {
 	}
 
 	summaryText = strings.TrimSpace(summaryText)
+	if redactedChanged && routerTarget == "local" && normalizeOriginTarget(job.originTarget) == "local" {
+		if restoreFn := cm.router.getWarmupRestore(); restoreFn != nil {
+			summaryText = restoreFn(cm.router.name, summaryText)
+		}
+	}
 	if utf8.RuneCountInString(summaryText) > maxSummaryRunes {
 		rs := []rune(summaryText)
 		summaryText = string(rs[:maxSummaryRunes]) + "\n[摘要已截断至最大配额]"
@@ -1717,7 +1753,7 @@ func buildStage2Prompt(prevConstraints string) string {
 	return sb.String()
 }
 
-func (cm *ContextCompressor) callClusterSummarizer(parentCtx context.Context, cfg ContextCompressConfig, job *stage2Job, backend *BackendState) (string, error) {
+func (cm *ContextCompressor) callClusterSummarizer(parentCtx context.Context, cfg ContextCompressConfig, job *stage2Job, backend *BackendState) (string, bool, error) {
 	bCfg, bTarget := backend.snapshot()
 	msgs := make([]json.RawMessage, 0, len(job.sysMsgs)+len(job.sourceHistoryMsgs)+1)
 	msgs = append(msgs, job.sysMsgs...)
@@ -1728,7 +1764,7 @@ func (cm *ContextCompressor) callClusterSummarizer(parentCtx context.Context, cf
 		"content": buildStage2Prompt(job.prevConstraints),
 	})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	msgs = append(msgs, promptMsg)
 
@@ -1738,7 +1774,7 @@ func (cm *ContextCompressor) callClusterSummarizer(parentCtx context.Context, cf
 	}
 	avail := bCfg.MaxContextTokens - job.sourceEstTokens - 2048
 	if avail < 1024 {
-		return "", fmt.Errorf("insufficient context headroom on %s (avail=%d)", bCfg.ID, avail)
+		return "", false, fmt.Errorf("insufficient context headroom on %s (avail=%d)", bCfg.ID, avail)
 	}
 	if maxTok > avail {
 		maxTok = avail
@@ -1759,26 +1795,29 @@ func (cm *ContextCompressor) callClusterSummarizer(parentCtx context.Context, cf
 		payload["tools"] = job.tools
 	}
 	for k, v := range job.extraOpts {
+		if k == "response_format" {
+			continue
+		}
 		payload[k] = v
 	}
 
 	body, err := marshalNoEscapeHTML(payload)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	ctx, cancel := context.WithTimeout(parentCtx, time.Duration(cfg.Stage2TimeoutSec)*time.Second)
 	defer cancel()
 
-	body, err = cm.applyRedactionFilter(ctx, bCfg.URL, body, job.confidential)
+	body, redactedChanged, err := cm.applyRedactionFilter(ctx, bCfg.URL, body, job.confidential)
 	if err != nil {
-		return "", fmt.Errorf("blocked by redaction policy: %w", err)
+		return "", false, fmt.Errorf("blocked by redaction policy: %w", err)
 	}
 
 	targetURL := backendChatCompletionsURL(bTarget, bCfg.URL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", redactedChanged, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "dsv41-smart-router-compressor/1.0")
@@ -1798,26 +1837,65 @@ func (cm *ContextCompressor) callClusterSummarizer(parentCtx context.Context, cf
 	backend.activeReqs.Add(-1)
 
 	if err != nil {
-		return "", err
+		return "", redactedChanged, err
 	}
 	if status < 200 || status >= 300 {
-		return "", fmt.Errorf("HTTP %d: %s", status, truncateUTF8(string(respBody), 240))
+		return "", redactedChanged, fmt.Errorf("HTTP %d: %s", status, truncateUTF8(string(respBody), 240))
 	}
-	return extractAssistantContentFromResponse(respBody)
+	sumText, err := extractAssistantContentFromResponse(respBody)
+	return sumText, redactedChanged, err
 }
 
-func (cm *ContextCompressor) callExternalSummarizer(parentCtx context.Context, cfg ContextCompressConfig, job *stage2Job) (string, error) {
+func (cm *ContextCompressor) callExternalSummarizer(parentCtx context.Context, cfg ContextCompressConfig, job *stage2Job) (string, bool, error) {
 	var transcript strings.Builder
+	toolNameByID := make(map[string]string)
 	for _, rm := range job.sourceHistoryMsgs {
 		pm := parseHistoryMsg(rm)
-		if pm.text == "" {
+		var tcs []parsedToolCall
+		if pm.role == "assistant" {
+			tcs = extractToolCalls(rm)
+			for _, tc := range tcs {
+				if tc.id != "" && tc.name != "" {
+					toolNameByID[tc.id] = tc.name
+				}
+			}
+		}
+		if pm.text == "" && len(tcs) == 0 {
 			continue
 		}
-		transcript.WriteString("[")
-		transcript.WriteString(pm.role)
-		transcript.WriteString("]\n")
-		transcript.WriteString(pm.text)
-		transcript.WriteString("\n\n")
+		if pm.role == "tool" {
+			tName := toolNameByID[pm.toolCallID]
+			if tName != "" && pm.toolCallID != "" {
+				fmt.Fprintf(&transcript, "[tool %s (%s)]\n", tName, pm.toolCallID)
+			} else if pm.toolCallID != "" {
+				fmt.Fprintf(&transcript, "[tool (%s)]\n", pm.toolCallID)
+			} else {
+				transcript.WriteString("[tool]\n")
+			}
+		} else {
+			transcript.WriteString("[")
+			transcript.WriteString(pm.role)
+			transcript.WriteString("]\n")
+		}
+		if pm.text != "" {
+			transcript.WriteString(pm.text)
+			transcript.WriteString("\n")
+		}
+		for _, tc := range tcs {
+			args := strings.TrimSpace(tc.arguments)
+			if utf8.RuneCountInString(args) > 2000 {
+				args = smartTruncateText(args, 2000, 0.65, 0.25, 4, "[工具参数过长已截断]")
+			}
+			if args == "" {
+				args = "{}"
+			}
+			if tc.id != "" {
+				fmt.Fprintf(&transcript, "tool_call %s(%s): %s\n", tc.name, tc.id, args)
+			} else {
+				fmt.Fprintf(&transcript, "tool_call %s: %s\n", tc.name, args)
+			}
+		}
+		transcript.WriteString("\n")
 	}
 
 	model := cfg.SummarizerModel
@@ -1836,15 +1914,15 @@ func (cm *ContextCompressor) callExternalSummarizer(parentCtx context.Context, c
 	}
 	body, err := marshalNoEscapeHTML(payload)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	ctx, cancel := context.WithTimeout(parentCtx, time.Duration(cfg.Stage2TimeoutSec)*time.Second)
 	defer cancel()
 
-	body, err = cm.applyRedactionFilter(ctx, cfg.SummarizerURL, body, job.confidential)
+	body, redactedChanged, err := cm.applyRedactionFilter(ctx, cfg.SummarizerURL, body, job.confidential)
 	if err != nil {
-		return "", fmt.Errorf("blocked by redaction policy: %w", err)
+		return "", false, fmt.Errorf("blocked by redaction policy: %w", err)
 	}
 
 	targetURL := strings.TrimRight(cfg.SummarizerURL, "/")
@@ -1853,7 +1931,7 @@ func (cm *ContextCompressor) callExternalSummarizer(parentCtx context.Context, c
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", redactedChanged, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -1870,14 +1948,15 @@ func (cm *ContextCompressor) callExternalSummarizer(parentCtx context.Context, c
 
 	resp, err := cm.router.transport.RoundTrip(req)
 	if err != nil {
-		return "", err
+		return "", redactedChanged, err
 	}
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	_ = resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateUTF8(string(respBody), 240))
+		return "", redactedChanged, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateUTF8(string(respBody), 240))
 	}
-	return extractAssistantContentFromResponse(respBody)
+	sumText, err := extractAssistantContentFromResponse(respBody)
+	return sumText, redactedChanged, err
 }
 
 func (cm *ContextCompressor) prewarmStage2Checkpoint(parentCtx context.Context, job *stage2Job, injected []json.RawMessage) (int, int) {
@@ -1933,7 +2012,7 @@ func (cm *ContextCompressor) prewarmStage2Checkpoint(parentCtx context.Context, 
 	ctx, cancel := context.WithTimeout(parentCtx, 90*time.Second)
 	defer cancel()
 
-	body, err = cm.applyRedactionFilter(ctx, bCfg.URL, body, job.confidential)
+	body, _, err = cm.applyRedactionFilter(ctx, bCfg.URL, body, job.confidential)
 	if err != nil {
 		return 0, 0
 	}

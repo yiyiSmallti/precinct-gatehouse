@@ -164,23 +164,28 @@ type ProviderStatus struct {
 
 type WarmupFilterFunc func(ctx context.Context, provider, backendURL string, payload []byte) ([]byte, error)
 
-type Router struct {
-	name                  string
-	defaultDB             string
-	log                   *slog.Logger
-	transport             *http.Transport
-	starters              *StarterCache
-	compressor            *ContextCompressor
-	sseKeepaliveInitDelay atomic.Int64 // nanoseconds; 0 defaults to 20s
+// WarmupRestoreFunc restores redacted placeholders in Stage 2 summaries before local checkpoint freezing.
+type WarmupRestoreFunc func(provider, text string) string
 
-	cfgMu        sync.RWMutex
-	cfg          RouterConfig
-	target       string
-	apiKey       string
-	resolveKeyFn func(ref string) (string, error)
-	warmupFilter WarmupFilterFunc
-	backends     []*BackendState
-	byID         map[string]*BackendState
+type Router struct {
+	name                         string
+	defaultDB                    string
+	log                          *slog.Logger
+	transport                    *http.Transport
+	starters                     *StarterCache
+	compressor                   *ContextCompressor
+	sseKeepaliveInitDelay        atomic.Int64 // nanoseconds; 0 defaults to 20s
+	sseKeepaliveIntervalOverride atomic.Int64 // nanoseconds; 0 uses sseKeepaliveInterval(sec)
+
+	cfgMu         sync.RWMutex
+	cfg           RouterConfig
+	target        string
+	apiKey        string
+	resolveKeyFn  func(ref string) (string, error)
+	warmupFilter  WarmupFilterFunc
+	warmupRestore WarmupRestoreFunc
+	backends      []*BackendState
+	byID          map[string]*BackendState
 
 	mu         sync.RWMutex
 	prefixes   map[string]*PrefixEntry
@@ -270,6 +275,12 @@ func sseKeepaliveInterval(sec int) time.Duration {
 	return time.Duration(sec) * time.Second
 }
 
+func (r *Router) SetSSEKeepaliveInitDelay(d time.Duration) {
+	if r != nil {
+		r.sseKeepaliveInitDelay.Store(int64(d))
+	}
+}
+
 func (r *Router) getSSEKeepaliveInitDelay() time.Duration {
 	if r != nil {
 		if ns := r.sseKeepaliveInitDelay.Load(); ns > 0 {
@@ -277,6 +288,18 @@ func (r *Router) getSSEKeepaliveInitDelay() time.Duration {
 		}
 	}
 	return 20 * time.Second
+}
+
+func (r *Router) getSSEKeepaliveInterval(sec int) time.Duration {
+	if sec < 0 {
+		return 0
+	}
+	if r != nil {
+		if ns := r.sseKeepaliveIntervalOverride.Load(); ns > 0 {
+			return time.Duration(ns)
+		}
+	}
+	return sseKeepaliveInterval(sec)
 }
 
 func zhAnchorEnabled(c RouterConfig) bool {
@@ -479,6 +502,25 @@ func (r *Router) getWarmupFilter() WarmupFilterFunc {
 	}
 	r.cfgMu.RLock()
 	fn := r.warmupFilter
+	r.cfgMu.RUnlock()
+	return fn
+}
+
+func (r *Router) setWarmupRestore(fn WarmupRestoreFunc) {
+	if r == nil {
+		return
+	}
+	r.cfgMu.Lock()
+	r.warmupRestore = fn
+	r.cfgMu.Unlock()
+}
+
+func (r *Router) getWarmupRestore() WarmupRestoreFunc {
+	if r == nil {
+		return nil
+	}
+	r.cfgMu.RLock()
+	fn := r.warmupRestore
 	r.cfgMu.RUnlock()
 	return fn
 }

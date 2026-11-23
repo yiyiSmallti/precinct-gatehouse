@@ -295,6 +295,21 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		}
 		return oai.Encode(obj), nil
 	})
+	hub.SetWarmupRestore(func(providerName, text string) string {
+		if !strings.Contains(text, "{{") {
+			return text
+		}
+		snap := liveMgr.Current()
+		if snap == nil || snap.Redactor == nil || snap.Redactor.Vault == nil {
+			return text
+		}
+		bucket := snap.Redactor.Vault.BucketWithTTL("tiered-warmup:"+providerName, snap.Redactor.VaultTTL())
+		if bucket.Len() == 0 {
+			return text
+		}
+		restored, _ := redact.RestoreText(text, bucket, nil)
+		return restored
+	})
 	hub.Activate(liveMgr.Current().Cfg)
 	watchCtx, cancelWatch := context.WithCancel(context.Background())
 	s.closers = append(s.closers, cancelWatch)

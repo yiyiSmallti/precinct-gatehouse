@@ -931,6 +931,7 @@ func TestTieredKeepaliveStreamPreservesBackendFailover(t *testing.T) {
 	defer b1.Close()
 
 	var b2Down atomic.Bool
+	var b2DelayAfterHeaders atomic.Int64
 	b2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/get_server_info" {
 			if b2Down.Load() {
@@ -948,6 +949,12 @@ func TestTieredKeepaliveStreamPreservesBackendFailover(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		if d := time.Duration(b2DelayAfterHeaders.Load()); d > 0 {
+			time.Sleep(d)
+		}
 		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"from-b2\"}}]}\n\n"))
 		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n"))
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
@@ -979,9 +986,10 @@ func TestTieredKeepaliveStreamPreservesBackendFailover(t *testing.T) {
 	r, _ := hub.Router("p")
 	r.sseKeepaliveInitDelay.Store(int64(15 * time.Millisecond))
 
-	// 1. Slow b1 503 after keepalive starts must fail over to b2 seamlessly.
+	// 1. Slow b1 503 after keepalive starts must fail over to b2 seamlessly and update RouteMeta.
 	b1Mode.Store(0)
-	req1, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	meta1 := &RouteMeta{}
+	req1, _ := http.NewRequestWithContext(WithRouteMeta(context.Background(), meta1), http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
 	req1.Header.Set("Content-Type", "application/json")
 	resp1, err := tr.RoundTrip(req1)
 	if err != nil {
@@ -993,10 +1001,14 @@ func TestTieredKeepaliveStreamPreservesBackendFailover(t *testing.T) {
 	if !strings.HasPrefix(body1, ": keepalive\n\n") || !strings.Contains(body1, `"content":"from-b2"`) {
 		t.Fatalf("expected keepalive + failover content from b2 on 503, got %q", body1)
 	}
+	if gotB, _ := meta1.Get(); gotB != "b2" {
+		t.Fatalf("expected RouteMeta backend updated to winning backend b2, got %q", gotB)
+	}
 
 	// 2. Slow b1 400 context-length error after keepalive starts must fail over to higher-tier b2.
 	b1Mode.Store(1)
-	req2, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"ctx"}]}`)))
+	meta2 := &RouteMeta{}
+	req2, _ := http.NewRequestWithContext(WithRouteMeta(context.Background(), meta2), http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"ctx"}]}`)))
 	req2.Header.Set("Content-Type", "application/json")
 	resp2, err := tr.RoundTrip(req2)
 	if err != nil {
@@ -1008,6 +1020,29 @@ func TestTieredKeepaliveStreamPreservesBackendFailover(t *testing.T) {
 	if !strings.HasPrefix(body2, ": keepalive\n\n") || !strings.Contains(body2, `"content":"from-b2"`) {
 		t.Fatalf("expected keepalive + failover content from b2 on 400 context-length, got %q", body2)
 	}
+	if gotB, _ := meta2.Get(); gotB != "b2" {
+		t.Fatalf("expected RouteMeta backend updated to b2 on ctx failover, got %q", gotB)
+	}
+
+	// 3. Keepalives continue after 200 headers flush while waiting for the first upstream body chunk.
+	r.sseKeepaliveIntervalOverride.Store(int64(20 * time.Millisecond))
+	b2DelayAfterHeaders.Store(int64(90 * time.Millisecond))
+	b1Mode.Store(0)
+	reqPostHdr, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"posthdr"}]}`)))
+	reqPostHdr.Header.Set("Content-Type", "application/json")
+	respPostHdr, err := tr.RoundTrip(reqPostHdr)
+	if err != nil {
+		t.Fatalf("RoundTrip post-headers keepalive: %v", err)
+	}
+	postHdrBytes, _ := io.ReadAll(respPostHdr.Body)
+	respPostHdr.Body.Close()
+	postHdrBody := string(postHdrBytes)
+	if strings.Count(postHdrBody, ": keepalive\n\n") < 4 || !strings.Contains(postHdrBody, `"content":"from-b2"`) {
+		t.Fatalf("expected >=4 keepalive comments continuing after 200 headers until first chunk, got count=%d body=%q",
+			strings.Count(postHdrBody, ": keepalive\n\n"), postHdrBody)
+	}
+	b2DelayAfterHeaders.Store(0)
+	r.sseKeepaliveIntervalOverride.Store(0)
 
 	// 3. Post-keepalive HTTP 500 error body must NOT be embedded in SSE error chunk.
 	b1Mode.Store(2)

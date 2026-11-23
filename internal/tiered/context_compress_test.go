@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 )
 
 func boolPtr(v bool) *bool {
@@ -736,3 +738,299 @@ func TestShadowModeDoesNotCompressUpstream(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestContextCompressCodexFindingsRegression(t *testing.T) {
+	// 1 & 3: Orphaned pending Stage 2 retry + response_format excluded from cluster summarizer while kept in prewarm.
+	var mu sync.Mutex
+	var clusterSumBodies []string
+	var prewarmBodies []string
+
+	clusterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		s := string(raw)
+		if r.Header.Get("User-Agent") == "dsv41-smart-router-prewarm/1.0" {
+			mu.Lock()
+			prewarmBodies = append(prewarmBodies, s)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"pw","choices":[{"index":0,"message":{"role":"assistant","content":"."},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"prompt_tokens_details":{"cached_tokens":180}}}`))
+			return
+		}
+		if strings.Contains(s, "【服务端上下文压缩指令】") {
+			mu.Lock()
+			clusterSumBodies = append(clusterSumBodies, s)
+			mu.Unlock()
+			summary := "## 1. 用户目标\n- NO RESPONSE FORMAT LEAK.\n\n## 2. 已落地的事实变更\n- Applied cluster summary cleanly with tool metadata." + strings.Repeat(" ok", 10)
+			b, _ := json.Marshal(map[string]any{
+				"id":      "csum",
+				"choices": []map[string]any{{"index": 0, "message": map[string]string{"role": "assistant", "content": summary}, "finish_reason": "stop"}},
+			})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(b)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"live","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer clusterSrv.Close()
+
+	ccCluster := ContextCompressConfig{
+		Enabled:                true,
+		Stage2Enabled:          boolPtr(true),
+		Stage2Prewarm:          boolPtr(true),
+		Stage2MaxSummaryTokens: 256,
+		TriggerTokens:          1400,
+		Stage1TargetTokens:     600,
+		KeepRecentGroups:       2,
+		KeepRecentMinTokens:    20,
+		KeepRecentMaxTokens:    160,
+		AssistantMaxChars:      120,
+		UserPasteMaxChars:      120,
+	}
+	rCluster := testCompressRouter(t, clusterSrv.URL, filepath.Join(t.TempDir(), "cp.json"), ccCluster)
+	rCluster.ensureLoops()
+	normCluster := rCluster.compressor.getCfg()
+
+	turns := []map[string]any{
+		{"role": "user", "content": "Rule: respond carefully."},
+		{"role": "assistant", "content": strings.Repeat("Verbose cluster analysis text block. ", 90)},
+		{"role": "user", "content": strings.Repeat("Detailed context block beta. ", 80)},
+		{"role": "assistant", "content": "Ok."},
+		{"role": "user", "content": "Next?"},
+	}
+	msgsWithSys := append([]map[string]any{{"role": "system", "content": "Sys."}}, turns...)
+	reqObj := map[string]any{
+		"model":           "m1",
+		"response_format": map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": "strict_out"}},
+		"messages":        msgsWithSys,
+	}
+	bodyCluster1, _ := marshalNoEscapeHTML(reqObj)
+	anC1, _ := rCluster.analyzeChatBody(bodyCluster1)
+
+	// Abort before calling ScheduleStage2 -> stored checkpoint must stay none, NOT permanently stuck pending.
+	resC1 := rCluster.compressor.MaybeCompress(bodyCluster1, anC1, nil, normCluster, 24000, "local", false)
+	if !resC1.Compressed || resC1.PendingJob == nil {
+		t.Fatalf("expected stage1 + PendingJob, got mode=%s skip=%s pending=%v", resC1.Mode, resC1.SkipReason, resC1.PendingJob != nil)
+	}
+	rCluster.compressor.mu.RLock()
+	storedStatus1 := rCluster.compressor.checkpoints[resC1.CheckpointID].Stage2Status
+	rCluster.compressor.mu.RUnlock()
+	if storedStatus1 != "none" {
+		t.Fatalf("expected unscheduled checkpoint to remain none before ScheduleStage2, got %q", storedStatus1)
+	}
+
+	// Next live hit (same prefix + new user turn) recreates PendingJob even if checkpoint status were orphaned "pending".
+	turns2 := append(append([]map[string]any{}, turns...),
+		map[string]any{"role": "assistant", "content": "Reply."},
+		map[string]any{"role": "user", "content": "Follow up."},
+	)
+	reqObj2 := map[string]any{
+		"model":           "m1",
+		"response_format": reqObj["response_format"],
+		"messages":        append([]map[string]any{{"role": "system", "content": "Sys."}}, turns2...),
+	}
+	bodyCluster2, _ := marshalNoEscapeHTML(reqObj2)
+	anC2, _ := rCluster.analyzeChatBody(bodyCluster2)
+
+	rCluster.compressor.mu.Lock()
+	rCluster.compressor.checkpoints[resC1.CheckpointID].Stage2Status = "pending"
+	rCluster.compressor.mu.Unlock()
+
+	resC2 := rCluster.compressor.MaybeCompress(bodyCluster2, anC2, nil, normCluster, 24000, "local", false)
+	if resC2.PendingJob == nil {
+		t.Fatalf("expected orphaned pending checkpoint with no in-flight session job to recreate PendingJob")
+	}
+	rCluster.compressor.ScheduleStage2(resC2.PendingJob)
+
+	deadline := time.Now().Add(4 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) {
+		if list := rCluster.compressor.List(); len(list) == 1 && list[0].Stage == 2 && list[0].Stage2Status == "ready" {
+			ready = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !ready {
+		t.Fatalf("expected rescheduled checkpoint to reach Stage 2 ready, got %+v", rCluster.compressor.List())
+	}
+
+	mu.Lock()
+	gotSum := append([]string(nil), clusterSumBodies...)
+	gotPW := append([]string(nil), prewarmBodies...)
+	mu.Unlock()
+	if len(gotSum) != 1 || strings.Contains(gotSum[0], `"response_format"`) {
+		t.Fatalf("expected cluster summarizer to omit response_format, got %v", gotSum)
+	}
+	if len(gotPW) != 1 || !strings.Contains(gotPW[0], `"response_format"`) {
+		t.Fatalf("expected prewarm request to keep response_format, got %v", gotPW)
+	}
+
+	// 2 & 4: External summarizer includes null-content tool_calls+args, and local checkpoint restores redaction placeholders while external target keeps them masked.
+	var extSumMu sync.Mutex
+	var extSumPayloads []string
+	extSumSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		reqStr := string(raw)
+		extSumMu.Lock()
+		extSumPayloads = append(extSumPayloads, reqStr)
+		extSumMu.Unlock()
+
+		placeholder := ""
+		if idx := strings.Index(reqStr, "{{"); idx >= 0 {
+			if end := strings.Index(reqStr[idx:], "}}"); end > 2 {
+				placeholder = reqStr[idx : idx+end+2]
+			}
+		}
+		summary := fmt.Sprintf(
+			"## 1. 用户目标\n- Project tag: %s\n\n## 2. 已落地的事实变更\n- Executed edit_file on `/srv/critical_patch.go` cleanly."+"\n\n## 3. 待办\n- Verify restore isolation.",
+			placeholder,
+		)
+		b, _ := json.Marshal(map[string]any{
+			"id":      "xsum",
+			"choices": []map[string]any{{"index": 0, "message": map[string]string{"role": "assistant", "content": summary}, "finish_reason": "stop"}},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(b)
+	}))
+	defer extSumSrv.Close()
+
+	redEng, err := redact.New(config.Redaction{Terms: []string{"SECRET_PROJECT_ALPHA"}}, nil, nil)
+	if err != nil {
+		t.Fatalf("redact.New: %v", err)
+	}
+	userKey := []byte("0123456789abcdef0123456789abcdef")
+
+	toolTurns := []map[string]any{
+		{"role": "user", "content": "Inspect SECRET_PROJECT_ALPHA repository now."},
+		{"role": "assistant", "content": nil, "tool_calls": []map[string]any{
+			{"id": "call_edit_1", "type": "function", "function": map[string]any{"name": "edit_file", "arguments": `{"path":"/srv/critical_patch.go","line":42}`}},
+		}},
+		{"role": "tool", "tool_call_id": "call_edit_1", "content": "Successfully wrote patch."},
+		{"role": "assistant", "content": strings.Repeat("Detailed implementation audit note for external summarizer. ", 85)},
+		{"role": "user", "content": strings.Repeat("Additional context text for threshold crossing. ", 80)},
+		{"role": "assistant", "content": "Done."},
+		{"role": "user", "content": "Next turn."},
+	}
+	toolBody := makeCompTestBody("System.", toolTurns)
+
+	wireRedaction := func(r *Router, provName string) {
+		r.setWarmupFilter(func(ctx context.Context, _ string, _ string, payload []byte) ([]byte, error) {
+			obj, derr := oai.Decode(payload)
+			if derr != nil {
+				return nil, derr
+			}
+			rr, rerr := redEng.Apply(ctx, obj, redact.ModeMask, userKey, "tiered-warmup:"+provName)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if !rr.Changed {
+				return payload, nil
+			}
+			return oai.Encode(obj), nil
+		})
+		r.setWarmupRestore(func(_ string, text string) string {
+			bucket := redEng.Vault.BucketWithTTL("tiered-warmup:"+provName, redEng.VaultTTL())
+			out, _ := redact.RestoreText(text, bucket, nil)
+			return out
+		})
+	}
+
+	ccExtSum := ccCluster
+	ccExtSum.SummarizerURL = extSumSrv.URL
+	rLocal := testCompressRouter(t, clusterSrv.URL, filepath.Join(t.TempDir(), "cp-local.json"), ccExtSum)
+	wireRedaction(rLocal, "p-local")
+	rLocal.ensureLoops()
+
+	anL, _ := rLocal.analyzeChatBody(toolBody)
+	resL1 := rLocal.compressor.MaybeCompress(toolBody, anL, nil, rLocal.compressor.getCfg(), 24000, "local", false)
+	if !resL1.Compressed || resL1.PendingJob == nil {
+		t.Fatalf("expected local stage1 + job, got %s/%s", resL1.Mode, resL1.SkipReason)
+	}
+	rLocal.compressor.ScheduleStage2(resL1.PendingJob)
+
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if list := rLocal.compressor.List(); len(list) == 1 && list[0].Stage2Status == "ready" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	extSumMu.Lock()
+	if len(extSumPayloads) != 1 {
+		extSumMu.Unlock()
+		t.Fatalf("expected 1 external summarizer request, got %d", len(extSumPayloads))
+	}
+	firstSumReq := extSumPayloads[0]
+	extSumMu.Unlock()
+
+	if !strings.Contains(firstSumReq, "tool_call edit_file(call_edit_1)") || !strings.Contains(firstSumReq, `/srv/critical_patch.go`) || !strings.Contains(firstSumReq, "[tool edit_file (call_edit_1)]") {
+		t.Fatalf("expected external summarizer transcript to include tool_calls name/id/args and tool result header, got:\n%s", firstSumReq)
+	}
+	if strings.Contains(firstSumReq, "SECRET_PROJECT_ALPHA") || !strings.Contains(firstSumReq, "{{") {
+		t.Fatalf("expected external summarizer payload redacted with placeholder, got:\n%s", firstSumReq)
+	}
+
+	followBody := makeCompTestBody("System.", append(append([]map[string]any{}, toolTurns...),
+		map[string]any{"role": "assistant", "content": "Ack."},
+		map[string]any{"role": "user", "content": "Continue."},
+	))
+	anLF, _ := rLocal.analyzeChatBody(followBody)
+	resLF := rLocal.compressor.MaybeCompress(followBody, anLF, nil, rLocal.compressor.getCfg(), 24000, "local", false)
+	if !resLF.Compressed || resLF.Mode != "stage2" {
+		t.Fatalf("expected stage2 hit on local router, got mode=%s skip=%s", resLF.Mode, resLF.SkipReason)
+	}
+	if !strings.Contains(string(resLF.Body), "SECRET_PROJECT_ALPHA") || strings.Contains(string(resLF.Body), "{{") {
+		t.Fatalf("expected local Stage 2 checkpoint to restore original SECRET_PROJECT_ALPHA without leaving placeholders, got:\n%s", string(resLF.Body))
+	}
+
+	// Verify external router/origin does NOT restore masked placeholder back into Stage 2 SummaryText.
+	cfgExt := RouterConfig{
+		Mode:               "active",
+		HeavyMissThreshold: 24000,
+		HealthIntervalSec:  60,
+		ZhThinkAnchor:      boolPtr(false),
+		StarterCache:       &config.TieredStarterCache{Enabled: false},
+		ContextCompress:    &ccExtSum,
+		Backends: []BackendConfig{
+			{ID: "b1", URL: clusterSrv.URL, Tier: 1, MaxContextTokens: 200000, MaxSafeInput: 180000, PromoteAt: 100000, SpeedScore: 100},
+		},
+	}
+	rExt, err := newRouterWithTarget("p-ext", "external", "", cfgExt, filepath.Join(t.TempDir(), "cp-ext.json"), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("newRouterWithTarget external: %v", err)
+	}
+	t.Cleanup(rExt.close)
+	for _, b := range rExt.getBackends() {
+		b.healthy.Store(true)
+	}
+	rExt.compressor.deferAfterLiveDelay.Store(-1)
+	wireRedaction(rExt, "p-ext")
+	rExt.ensureLoops()
+
+	resE1 := rExt.compressor.MaybeCompress(toolBody, anL, nil, rExt.compressor.getCfg(), 24000, "external", false)
+	if !resE1.Compressed || resE1.PendingJob == nil {
+		t.Fatalf("expected external stage1 + job, got %s/%s", resE1.Mode, resE1.SkipReason)
+	}
+	rExt.compressor.ScheduleStage2(resE1.PendingJob)
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if list := rExt.compressor.List(); len(list) == 1 && list[0].Stage2Status == "ready" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	resEF := rExt.compressor.MaybeCompress(followBody, anLF, nil, rExt.compressor.getCfg(), 24000, "external", false)
+	if !resEF.Compressed || resEF.Mode != "stage2" {
+		t.Fatalf("expected external stage2 hit, got %s/%s", resEF.Mode, resEF.SkipReason)
+	}
+	if strings.Contains(string(resEF.Body), "SECRET_PROJECT_ALPHA") || !strings.Contains(string(resEF.Body), "{{") {
+		t.Fatalf("expected external Stage 2 checkpoint to keep placeholder masked (not restore local secret), got:\n%s", string(resEF.Body))
+	}
+}

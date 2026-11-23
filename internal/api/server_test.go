@@ -1075,3 +1075,127 @@ routing_groups:
 	}
 	t.Fatalf("canceled late response body was not closed")
 }
+
+func TestTieredKeepaliveFailoverRequestLogBackend(t *testing.T) {
+	dir := t.TempDir()
+	tb1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		time.Sleep(45 * time.Millisecond)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`unavailable`))
+	}))
+	defer tb1.Close()
+
+	tb2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"from-tb2\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer tb2.Close()
+
+	cfgRaw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: ptiered
+    target: local
+    models: [m1]
+    tiered:
+      mode: active
+      sse_keepalive_sec: 1
+      health_interval_sec: 1
+      starter_cache:
+        enabled: false
+      backends:
+        - id: tb1
+          url: %s
+          tier: 1
+          max_context_tokens: 32000
+          max_safe_input: 16000
+          promote_at: 16000
+          speed_score: 100
+        - id: tb2
+          url: %s
+          tier: 2
+          max_context_tokens: 64000
+          max_safe_input: 32000
+          promote_at: 32000
+          speed_score: 50
+default_group: main
+routing_groups:
+  main:
+    type: order
+    members: [ptiered/m1]
+`, dir, tb1.URL, tb2.URL)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(cfgRaw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	rt, ok := srv.Tiered.Router("ptiered")
+	if !ok {
+		t.Fatal("missing tiered router ptiered")
+	}
+	rt.SetSSEKeepaliveInitDelay(15 * time.Millisecond)
+
+	// Wait for health probe to mark both backends healthy so tb1 gets tried first cleanly.
+	deadline := time.Now().Add(4 * time.Second)
+	bothHealthy := false
+	for time.Now().Before(deadline) {
+		st := rt.Status()
+		if len(st.Backends) == 2 && st.Backends[0].Healthy && st.Backends[1].Healthy {
+			bothHealthy = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !bothHealthy {
+		t.Fatalf("backends did not become healthy in time: %+v", rt.Status().Backends)
+	}
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"ptiered/m1","stream":true,"messages":[{"role":"user","content":"failover"}]}`)))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"content":"from-tb2"`) || !strings.Contains(rec.Body.String(), ": keepalive\n\n") {
+		t.Fatalf("expected keepalive + failover chunk from tb2, got code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	var routeBackend string
+	if err := srv.DB.QueryRow(`SELECT route_backend FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&routeBackend); err != nil {
+		t.Fatalf("query request_log failed: %v", err)
+	}
+	if routeBackend != "tb2" {
+		t.Fatalf("expected request_log route_backend to record winning backend tb2, got %q", routeBackend)
+	}
+}
