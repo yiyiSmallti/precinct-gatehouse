@@ -89,7 +89,10 @@ type Provider struct {
 type TieredConfig struct {
 	Mode               string              `yaml:"mode,omitempty" json:"mode,omitempty"` // shadow | active
 	HeavyMissThreshold int                 `yaml:"heavy_miss_threshold,omitempty" json:"heavy_miss_threshold,omitempty"`
+	HeavyStickySec     int                 `yaml:"heavy_sticky_sec,omitempty" json:"heavy_sticky_sec,omitempty"`
+	SSEKeepaliveSec    int                 `yaml:"sse_keepalive_sec,omitempty" json:"sse_keepalive_sec,omitempty"`
 	HealthIntervalSec  int                 `yaml:"health_interval_sec,omitempty" json:"health_interval_sec,omitempty"`
+	HealthMaxTimeouts  int                 `yaml:"health_max_timeouts,omitempty" json:"health_max_timeouts,omitempty"`
 	ZhThinkAnchor      *bool               `yaml:"zh_think_anchor,omitempty" json:"zh_think_anchor,omitempty"`
 	Backends           []TieredBackend     `yaml:"backends,omitempty" json:"backends,omitempty"`
 	StarterCache       *TieredStarterCache `yaml:"starter_cache,omitempty" json:"starter_cache,omitempty"`

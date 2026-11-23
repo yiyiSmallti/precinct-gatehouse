@@ -113,14 +113,37 @@ func TestStarterObserveAndLCPShrink(t *testing.T) {
 		t.Fatalf("LCP lost static prefix")
 	}
 
+	// Regression: observing a 3rd request whose existing prefix is a strict prefix of incoming must not shrink again.
+	e.NeedsWarm = false
+	req3, _ := json.Marshal(map[string]any{
+		"model": "DeepSeek-V4.1-Flash-1017",
+		"messages": []map[string]any{
+			{"role": "system", "content": staticPart + "\nWorking directory: /workspace/project-gamma\nGit branch: release"},
+			{"role": "user", "content": "check status"},
+		},
+		"tools": []map[string]any{
+			{"type": "function", "function": map[string]any{"name": "Bash", "description": "run bash"}},
+			{"type": "function", "function": map[string]any{"name": "Read", "description": "read file"}},
+		},
+	})
+	t3 := extractStarterTemplate(req3, "claude-code/1.0", 512, 100000)
+	r.starters.Observe(t3)
+	txtAfter3 := extractMessagePlainText(e.SystemMsgs[0])
+	if txtAfter3 != txt {
+		t.Fatalf("LCP shrank repeatedly on 3rd observation! len %d -> %d", len(txt), len(txtAfter3))
+	}
+	if e.NeedsWarm {
+		t.Fatalf("expected NeedsWarm to remain false when existing is already a prefix of incoming")
+	}
+
 	r.starters.saveToDisk()
 	r2, err := newRouter("test", cfg, persist, nil, nil)
 	if err != nil {
 		t.Fatalf("reload newRouter: %v", err)
 	}
 	re := r2.starters.entries[t1.FamilyHash]
-	if re == nil || !re.NeedsWarm || re.Hits != 2 {
-		t.Fatalf("expected persisted entry reloaded with NeedsWarm=true, got %+v", re)
+	if re == nil || !re.NeedsWarm || re.Hits != 3 {
+		t.Fatalf("expected persisted entry reloaded with NeedsWarm=true hits=3, got %+v", re)
 	}
 }
 

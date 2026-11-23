@@ -20,6 +20,32 @@ import (
 // Cooldown is how long a failed model is skipped by order groups.
 const Cooldown = 30 * time.Second
 
+type ctxKey int
+
+const compressHdrCtxKey ctxKey = 1
+
+type compressHeaders struct {
+	noCompress      string
+	contextCompress string
+}
+
+// WithCompressHeaders annotates ctx with client context-compression control headers
+// so Provider.Chat forwards them upstream.
+func WithCompressHeaders(ctx context.Context, noCompress, contextCompress string) context.Context {
+	if noCompress == "" && contextCompress == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, compressHdrCtxKey, compressHeaders{
+		noCompress:      noCompress,
+		contextCompress: contextCompress,
+	})
+}
+
+func compressHeadersFromContext(ctx context.Context) (string, string) {
+	v, _ := ctx.Value(compressHdrCtxKey).(compressHeaders)
+	return v.noCompress, v.contextCompress
+}
+
 // Registry holds every configured provider.
 type Registry struct {
 	byName map[string]*Provider
@@ -28,16 +54,17 @@ type Registry struct {
 
 // Provider is one upstream.
 type Provider struct {
-	Name         string
-	BaseURL      string
-	Target       string
-	Models       []string
-	Pricing      map[string]config.Pricing
-	SystemPrompt string
-	ExtraBody    map[string]any
-	key          string
-	client       *http.Client
-	plug         func(ctx context.Context, body []byte) (*http.Response, error)
+	Name            string
+	BaseURL         string
+	Target          string
+	Models          []string
+	Pricing         map[string]config.Pricing
+	SystemPrompt    string
+	ExtraBody       map[string]any
+	SSEKeepaliveSec int
+	key             string
+	client          *http.Client
+	plug            func(ctx context.Context, body []byte) (*http.Response, error)
 }
 
 // SetPlugin routes a provider's calls to a provider plugin.
@@ -63,9 +90,13 @@ func NewRegistry(cfg *config.Config, resolve func(ref string) (string, error)) (
 		if baseURL == "" && pc.Tiered != nil {
 			baseURL = "http://tiered.invalid/v1"
 		}
+		sseKeepaliveSec := 0
+		if pc.Tiered != nil {
+			sseKeepaliveSec = pc.Tiered.SSEKeepaliveSec
+		}
 		r.byName[pc.Name] = &Provider{
 			Name: pc.Name, BaseURL: baseURL, Target: pc.Target, Models: pc.Models, Pricing: pc.Pricing,
-			SystemPrompt: pc.SystemPrompt, ExtraBody: pc.ExtraBody, key: key,
+			SystemPrompt: pc.SystemPrompt, ExtraBody: pc.ExtraBody, SSEKeepaliveSec: sseKeepaliveSec, key: key,
 			client: &http.Client{
 				Timeout: pc.Timeout.D(300 * time.Second),
 				// never follow redirects: a redirect could replay the request
@@ -155,6 +186,14 @@ func (p *Provider) Chat(ctx context.Context, body []byte) (*http.Response, error
 	req.Header.Set("Content-Type", "application/json")
 	if p.key != "" {
 		req.Header.Set("Authorization", "Bearer "+p.key)
+	}
+	if noComp, compCtrl := compressHeadersFromContext(ctx); noComp != "" || compCtrl != "" {
+		if noComp != "" {
+			req.Header.Set("X-No-Compress", noComp)
+		}
+		if compCtrl != "" {
+			req.Header.Set("X-Context-Compress", compCtrl)
+		}
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {

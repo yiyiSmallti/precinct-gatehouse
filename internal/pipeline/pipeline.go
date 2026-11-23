@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
@@ -54,16 +55,51 @@ const (
 
 // Pipeline holds the shared components.
 type Pipeline struct {
-	Live    *live.Manager
-	Tokens  *token.Issuer
-	Keys    *keys.Store
-	Limiter *limit.Limiter
-	Meter   *meter.Meter
-	Audit   audit.Sink
-	UserKey []byte // personal mode: the single local user's placeholder key; org mode: derivation key
-	Log     *slog.Logger
-	Policy  *policy.Resolver // org mode only
-	Hooks   []Hook           // OnRequest/OnResponse plugins, in config order
+	Live                  *live.Manager
+	Tokens                *token.Issuer
+	Keys                  *keys.Store
+	Limiter               *limit.Limiter
+	Meter                 *meter.Meter
+	Audit                 audit.Sink
+	UserKey               []byte // personal mode: the single local user's placeholder key; org mode: derivation key
+	Log                   *slog.Logger
+	Policy                *policy.Resolver // org mode only
+	Hooks                 []Hook           // OnRequest/OnResponse plugins, in config order
+	SSEKeepaliveInitDelay time.Duration    // delay before Gatehouse sends SSE keepalive during long prefill (0 = 20s, <0 disables)
+	SSEKeepaliveInterval  time.Duration    // interval between SSE keepalives (0 = 15s, <0 disables)
+}
+
+func (p *Pipeline) keepaliveInitDelay() time.Duration {
+	if p.SSEKeepaliveInitDelay < 0 {
+		return 0
+	}
+	if p.SSEKeepaliveInitDelay == 0 {
+		return 20 * time.Second
+	}
+	return p.SSEKeepaliveInitDelay
+}
+
+func (p *Pipeline) keepaliveInterval() time.Duration {
+	if p.SSEKeepaliveInterval < 0 {
+		return 0
+	}
+	if p.SSEKeepaliveInterval == 0 {
+		return 15 * time.Second
+	}
+	return p.SSEKeepaliveInterval
+}
+
+func (p *Pipeline) keepaliveIntervalFor(prov *provider.Provider) time.Duration {
+	if prov != nil && prov.SSEKeepaliveSec < 0 {
+		return 0
+	}
+	if p.SSEKeepaliveInterval < 0 {
+		return 0
+	}
+	if prov != nil && prov.SSEKeepaliveSec > 0 && p.SSEKeepaliveInterval == 0 {
+		return time.Duration(prov.SSEKeepaliveSec) * time.Second
+	}
+	return p.keepaliveInterval()
 }
 
 type principal struct {
@@ -75,25 +111,26 @@ type principal struct {
 }
 
 type reqState struct {
-	id           string
-	start        time.Time
-	snap         *live.Snapshot
-	protocol     string
-	decode       func([]byte) (oai.Object, error)
-	principal    principal
-	claims       token.Claims
-	org          *policy.Context // org mode
-	rec          audit.Record
-	w            http.ResponseWriter
-	written      bool
-	ttft         time.Duration
-	release      func(status int)
-	admitted     bool
-	errorCode    string
-	clientStream bool
-	cachedTokens int
-	routeBackend string
-	routeReason  string
+	id            string
+	start         time.Time
+	snap          *live.Snapshot
+	protocol      string
+	decode        func([]byte) (oai.Object, error)
+	principal     principal
+	claims        token.Claims
+	org           *policy.Context // org mode
+	rec           audit.Record
+	w             http.ResponseWriter
+	written       bool
+	keepaliveOnly bool
+	ttft          time.Duration
+	release       func(status int)
+	admitted      bool
+	errorCode     string
+	clientStream  bool
+	cachedTokens  int
+	routeBackend  string
+	routeReason   string
 }
 
 // ServeHTTP handles POST /v1/chat/completions.
@@ -121,6 +158,19 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 		st.rec.Error = oe.Code + ": " + oe.Message
 		if !st.written {
 			oai.WriteError(w, oe)
+		} else if st.keepaliveOnly {
+			errBody := oai.Encode(map[string]any{
+				"error": map[string]any{
+					"message": oe.Message,
+					"type":    "upstream_error",
+					"code":    oe.Code,
+				},
+			})
+			fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", errBody)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			st.keepaliveOnly = false
 		}
 	}
 	if st.release != nil {
@@ -513,8 +563,10 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			}
 			return rerr
 		}
-		h.Set("X-Gatehouse-Model", ascii(ref))
-		h.Set("X-Gatehouse-Redaction", redactionHeader(res.Report))
+		if !st.written {
+			h.Set("X-Gatehouse-Model", ascii(ref))
+			h.Set("X-Gatehouse-Redaction", redactionHeader(res.Report))
+		}
 
 		upStream := clientStream && prov.Target == "local" && (mode == redact.ModeOff || mode == redact.ModeAudit)
 		if upStream {
@@ -524,7 +576,9 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			delete(out, "stream_options")
 		}
 		callStart := time.Now()
-		resp, err := prov.Chat(tiered.WithDataClass(ctx, dataClass), oai.Encode(out))
+		routeMeta := &tiered.RouteMeta{}
+		reqCtx := provider.WithCompressHeaders(tiered.WithRouteMeta(tiered.WithDataClass(ctx, dataClass), routeMeta), r.Header.Get("X-No-Compress"), r.Header.Get("X-Context-Compress"))
+		resp, err := p.callProviderWithKeepalive(reqCtx, st, prov, oai.Encode(out), clientStream, upStream)
 		if err != nil {
 			var ue *provider.UpstreamError
 			if !errors.As(err, &ue) {
@@ -545,6 +599,9 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 				// no upstream response (e.g. the client went away)
 				return oai.Errorf(http.StatusBadGateway, "upstream_unavailable", "%s: %s", ref, ue.Error())
 			}
+			if st.written {
+				return oai.Errorf(statusOf(ue), "upstream_error", "%s", ue.Error())
+			}
 			// a client error from the provider is returned as is
 			copyRouterHeaders(st, ue.Header)
 			st.rec.Status = ue.Status
@@ -557,6 +614,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 		}
 		st.snap.Reg.MarkOK(ref)
 		copyRouterHeaders(st, resp.Header)
+		applyRouteMeta(st, routeMeta)
 		st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: resp.StatusCode})
 		var usage oai.Usage
 		if upStream {
@@ -565,6 +623,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			usage, err = p.relayBuffered(st, resp, vaultKey, clientStream, clientUsage)
 		}
 		resp.Body.Close()
+		applyRouteMeta(st, routeMeta)
 		if err != nil {
 			status := http.StatusBadGateway
 			var oe *oai.Error
@@ -662,7 +721,9 @@ func (p *Pipeline) relayBuffered(st *reqState, resp *http.Response, vaultKey str
 		body := oai.Encode(o)
 		go p.runResponseHooks(p.hookCtx(st, st.rec.DataClass), body, http.StatusOK)
 	}
+	alreadyWritten := st.written
 	st.written = true
+	st.keepaliveOnly = false
 	st.ttft = time.Since(st.start)
 	if !clientStream {
 		st.w.Header().Set("Content-Type", "application/json")
@@ -670,9 +731,11 @@ func (p *Pipeline) relayBuffered(st *reqState, resp *http.Response, vaultKey str
 		st.w.Write(oai.Encode(o))
 		return usage, nil
 	}
-	st.w.Header().Set("Content-Type", "text/event-stream")
-	st.w.Header().Set("Cache-Control", "no-cache")
-	st.w.WriteHeader(http.StatusOK)
+	if !alreadyWritten {
+		st.w.Header().Set("Content-Type", "text/event-stream")
+		st.w.Header().Set("Cache-Control", "no-cache")
+		st.w.WriteHeader(http.StatusOK)
+	}
 	for _, ev := range toChunks(o, clientUsage) {
 		fmt.Fprintf(st.w, "data: %s\n\n", ev)
 	}
@@ -728,13 +791,17 @@ func toChunks(o oai.Object, withUsage bool) [][]byte {
 // relayStream passes an SSE stream through, reading usage from the final
 // chunk. The usage-only chunk is dropped unless the client asked for it.
 func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bool) (oai.Usage, error) {
-	st.w.Header().Set("Content-Type", "text/event-stream")
-	st.w.Header().Set("Cache-Control", "no-cache")
-	st.w.WriteHeader(http.StatusOK)
-	st.written = true
+	if !st.written {
+		st.w.Header().Set("Content-Type", "text/event-stream")
+		st.w.Header().Set("Cache-Control", "no-cache")
+		st.w.WriteHeader(http.StatusOK)
+		st.written = true
+	}
+	st.keepaliveOnly = false
 	fl, _ := st.w.(http.Flusher)
 	var usage oai.Usage
 	done := false // saw [DONE] or a finish_reason
+	sawStreamErr := false
 	br := bufio.NewReaderSize(resp.Body, 64<<10)
 	var event bytes.Buffer
 	for {
@@ -742,7 +809,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		if len(line) > 0 {
 			event.Write(line)
 			if len(bytes.TrimSpace(line)) == 0 {
-				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done) && st.ttft == 0 {
+				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done, &sawStreamErr) && st.ttft == 0 {
 					st.ttft = time.Since(st.start)
 				}
 				event.Reset()
@@ -753,7 +820,7 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 		}
 		if err != nil {
 			if event.Len() > 0 {
-				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done) && st.ttft == 0 {
+				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done, &sawStreamErr) && st.ttft == 0 {
 					st.ttft = time.Since(st.start)
 				}
 			}
@@ -761,6 +828,9 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 				fl.Flush()
 			}
 			if errors.Is(err, io.EOF) {
+				if sawStreamErr {
+					return usage, oai.Errorf(http.StatusBadGateway, "upstream_error", "upstream stream error")
+				}
 				if done {
 					return usage, nil
 				}
@@ -772,7 +842,8 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 	}
 }
 
-func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool) bool {
+func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool, sawStreamErr *bool) bool {
+	hasContent := false
 	for _, l := range bytes.Split(ev, []byte("\n")) {
 		data, ok := bytes.CutPrefix(bytes.TrimSpace(l), []byte("data:"))
 		if !ok {
@@ -790,6 +861,11 @@ func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *o
 		if err != nil {
 			continue
 		}
+		if errVal, hasErr := o["error"]; hasErr && errVal != nil {
+			*sawStreamErr = true
+			*done = true
+			continue
+		}
 		if ch, _ := o["choices"].([]any); len(ch) > 0 {
 			for _, c := range ch {
 				if cm, _ := c.(map[string]any); cm != nil && cm["finish_reason"] != nil {
@@ -803,9 +879,10 @@ func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *o
 				return false
 			}
 		}
+		hasContent = true
 	}
 	w.Write(ev)
-	return true
+	return hasContent
 }
 
 func injectSystemPrompt(req oai.Object, prompt string) {
@@ -883,12 +960,15 @@ func copyRouterHeaders(st *reqState, hdr http.Header) {
 	if len(hdr) == 0 {
 		return
 	}
-	for k, vs := range hdr {
-		if len(vs) == 0 {
-			continue
-		}
-		if strings.HasPrefix(strings.ToLower(k), "x-router-") {
-			st.w.Header().Set(k, vs[0])
+	if !st.written {
+		for k, vs := range hdr {
+			if len(vs) == 0 {
+				continue
+			}
+			lk := strings.ToLower(k)
+			if strings.HasPrefix(lk, "x-router-") || strings.HasPrefix(lk, "x-context-") {
+				st.w.Header().Set(k, vs[0])
+			}
 		}
 	}
 	if b := hdr.Get("X-Router-Backend"); b != "" {
@@ -896,5 +976,104 @@ func copyRouterHeaders(st *reqState, hdr http.Header) {
 	}
 	if rs := hdr.Get("X-Router-Reason"); rs != "" {
 		st.routeReason = rs
+	}
+}
+
+func applyRouteMeta(st *reqState, m *tiered.RouteMeta) {
+	if m == nil {
+		return
+	}
+	if b, r := m.Get(); b != "" {
+		st.routeBackend = b
+		st.routeReason = r
+	}
+}
+
+type chatCallRes struct {
+	resp *http.Response
+	err  error
+}
+
+func (p *Pipeline) callProviderWithKeepalive(ctx context.Context, st *reqState, prov *provider.Provider, body []byte, clientStream, upStream bool) (*http.Response, error) {
+	initDelay := p.keepaliveInitDelay()
+	keepaliveEvery := p.keepaliveIntervalFor(prov)
+	if !clientStream || initDelay <= 0 || keepaliveEvery <= 0 {
+		return prov.Chat(ctx, body)
+	}
+	// Let active tiered routers emit keepalives first at initDelay (with X-Router-* headers);
+	// Pipeline still acts as a safety net for non-tiered upstreams or buffered streaming masks.
+	firstWait := initDelay
+	if st.written {
+		firstWait = keepaliveEvery
+	} else if upStream {
+		firstWait += initDelay / 10
+	}
+	var callMu sync.Mutex
+	canceled := false
+	ch := make(chan chatCallRes, 1)
+	go func() {
+		r, e := prov.Chat(ctx, body)
+		callMu.Lock()
+		if canceled {
+			callMu.Unlock()
+			if r != nil && r.Body != nil {
+				_ = r.Body.Close()
+			}
+			return
+		}
+		ch <- chatCallRes{resp: r, err: e}
+		callMu.Unlock()
+	}()
+
+	timer := time.NewTimer(firstWait)
+	defer timer.Stop()
+	var tk *time.Ticker
+	var tickC <-chan time.Time
+	fl, _ := st.w.(http.Flusher)
+
+	for {
+		select {
+		case res := <-ch:
+			if tk != nil {
+				tk.Stop()
+			}
+			return res.resp, res.err
+		case <-ctx.Done():
+			if tk != nil {
+				tk.Stop()
+			}
+			callMu.Lock()
+			canceled = true
+			var late *http.Response
+			select {
+			case res := <-ch:
+				late = res.resp
+			default:
+			}
+			callMu.Unlock()
+			if late != nil && late.Body != nil {
+				_ = late.Body.Close()
+			}
+			return nil, &provider.UpstreamError{Err: ctx.Err()}
+		case <-timer.C:
+			if !st.written {
+				st.w.Header().Set("Content-Type", "text/event-stream")
+				st.w.Header().Set("Cache-Control", "no-cache")
+				st.w.WriteHeader(http.StatusOK)
+				st.written = true
+				st.keepaliveOnly = true
+			}
+			_, _ = io.WriteString(st.w, ": keepalive\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+			tk = time.NewTicker(keepaliveEvery)
+			tickC = tk.C
+		case <-tickC:
+			_, _ = io.WriteString(st.w, ": keepalive\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+		}
 	}
 }

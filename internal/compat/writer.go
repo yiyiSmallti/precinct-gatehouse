@@ -32,6 +32,7 @@ type Writer struct {
 	sseBuf    bytes.Buffer
 	sawDone   bool
 	sawFinish bool
+	sawError  bool
 	finished  bool
 }
 
@@ -93,6 +94,11 @@ func (cw *Writer) Write(p []byte) (int, error) {
 
 func (cw *Writer) processLine(line string) {
 	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, ":") {
+		_, _ = cw.w.Write([]byte(trimmed + "\n\n"))
+		cw.Flush()
+		return
+	}
 	if !strings.HasPrefix(trimmed, "data:") {
 		return
 	}
@@ -109,6 +115,10 @@ func (cw *Writer) processLine(line string) {
 	}
 	chunk, err := oai.Decode([]byte(payload))
 	if err != nil {
+		return
+	}
+	if chunk["error"] != nil {
+		cw.sawError = true
 		return
 	}
 	if ch, _ := chunk["choices"].([]any); len(ch) > 0 {
@@ -149,7 +159,7 @@ func (cw *Writer) Finish() {
 			cw.processLine(strings.TrimRight(cw.sseBuf.String(), "\r"))
 			cw.sseBuf.Reset()
 		}
-		cw.tr.EndStream(cw.w, cw.sawDone || cw.sawFinish)
+		cw.tr.EndStream(cw.w, !cw.sawError && (cw.sawDone || cw.sawFinish))
 		cw.Flush()
 		return
 	}

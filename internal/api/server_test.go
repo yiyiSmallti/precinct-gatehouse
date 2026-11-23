@@ -747,3 +747,572 @@ providers:
 			plainTokens, toolTokens, toolTokens-plainTokens)
 	}
 }
+
+func TestContextHeadersPassThroughAndKeepaliveTTFT(t *testing.T) {
+	dir := t.TempDir()
+	var sawNoComp, sawCompCtrl atomic.Value
+	var sendKeepaliveThenChunk atomic.Bool
+	sendKeepaliveThenChunk.Store(true)
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		sawNoComp.Store(r.Header.Get("X-No-Compress"))
+		sawCompCtrl.Store(r.Header.Get("X-Context-Compress"))
+		w.Header().Set("X-Router-Backend", "b1")
+		w.Header().Set("X-Router-Reason", "tier1-len(50)")
+		w.Header().Set("X-Context-Compressed", "stage1")
+		w.Header().Set("X-Context-Original-Tokens", "620000")
+		w.Header().Set("X-Context-Compressed-Tokens", "180000")
+		w.Header().Set("X-Context-Saved-Tokens", "440000")
+		w.Header().Set("X-Context-Checkpoint-Id", "cp123456")
+		w.Header().Set("X-Context-Stage2-Status", "ready")
+
+		if sendKeepaliveThenChunk.Load() {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fl, _ := w.(http.Flusher)
+			_, _ = w.Write([]byte(": keepalive\n\n"))
+			if fl != nil {
+				fl.Flush()
+			}
+			time.Sleep(60 * time.Millisecond)
+			_, _ = w.Write([]byte("data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"pong\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":1,\"total_tokens\":21}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+
+		// Slow failure after Gatehouse Pipeline keepalive headers
+		time.Sleep(55 * time.Millisecond)
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`bad gateway after delay`))
+	}))
+	defer up.Close()
+
+	cfgRaw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    base_url: %s/v1
+    target: local
+    models: [m1]
+`, dir, up.URL)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(cfgRaw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. SSE chat completions with : keepalive comment before first data chunk.
+	req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"ping"}]}`)))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-No-Compress", "1")
+	req.Header.Set("X-Context-Compress", "off")
+	rec := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("chat stream status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-Context-Compressed") != "stage1" || rec.Header().Get("X-Context-Saved-Tokens") != "440000" {
+		t.Fatalf("expected X-Context-* headers passed through, got %v", rec.Header())
+	}
+	if gotNo, _ := sawNoComp.Load().(string); gotNo != "1" {
+		t.Fatalf("expected X-No-Compress=1 forwarded upstream, got %q", gotNo)
+	}
+	if gotCtrl, _ := sawCompCtrl.Load().(string); gotCtrl != "off" {
+		t.Fatalf("expected X-Context-Compress=off forwarded upstream, got %q", gotCtrl)
+	}
+	if !strings.Contains(rec.Body.String(), ": keepalive\n\n") || !strings.Contains(rec.Body.String(), `"content":"pong"`) {
+		t.Fatalf("expected keepalive + pong chunk in stream body, got %q", rec.Body.String())
+	}
+	var gotStatus int
+	var gotTTFT int64
+	if err := srv.DB.QueryRow(`SELECT status, ttft_ms FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&gotStatus, &gotTTFT); err != nil {
+		t.Fatalf("query request_log failed: %v", err)
+	}
+	if gotStatus != http.StatusOK || gotTTFT < 45 {
+		t.Fatalf("expected status=200 and TTFTMS >= 45ms (must ignore leading : keepalive), got status=%d ttft=%dms", gotStatus, gotTTFT)
+	}
+
+	// 2. Anthropic /v1/messages SSE compat preserves : keepalive comments too.
+	antReq, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/messages", bytes.NewReader([]byte(`{"model":"p/m1","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"ping"}]}`)))
+	antReq.Header.Set("x-api-key", tok)
+	antReq.Header.Set("Content-Type", "application/json")
+	antRec := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(antRec, antReq)
+	if antRec.Code != http.StatusOK {
+		t.Fatalf("anthropic stream status=%d body=%s", antRec.Code, antRec.Body.String())
+	}
+	if !strings.Contains(antRec.Body.String(), ": keepalive\n\n") || !strings.Contains(antRec.Body.String(), `"pong"`) {
+		t.Fatalf("expected keepalive + translated content_block_delta, got %q", antRec.Body.String())
+	}
+
+	// 3. Pipeline keepalive safety net fires on delayed failure and logs status 502.
+	sendKeepaliveThenChunk.Store(false)
+	srv.Pipeline.SSEKeepaliveInitDelay = 20 * time.Millisecond
+	srv.Pipeline.SSEKeepaliveInterval = 15 * time.Millisecond
+	slowReq, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"slow err"}]}`)))
+	slowReq.Header.Set("Authorization", "Bearer "+tok)
+	slowReq.Header.Set("Content-Type", "application/json")
+	slowRec := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(slowRec, slowReq)
+	if !strings.Contains(slowRec.Body.String(), ": keepalive\n\n") || !strings.Contains(slowRec.Body.String(), `"upstream_error"`) {
+		t.Fatalf("expected Pipeline keepalive + upstream_error SSE event, got %q", slowRec.Body.String())
+	}
+	var slowStatus int
+	if err := srv.DB.QueryRow(`SELECT status FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&slowStatus); err != nil {
+		t.Fatalf("query request_log 2 failed: %v", err)
+	}
+	if slowStatus != http.StatusBadGateway {
+		t.Fatalf("expected latest request_log status 502 after post-keepalive failure, got %d", slowStatus)
+	}
+}
+
+type closeSpyBody struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (b *closeSpyBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
+func TestKeepaliveCodexFindingsRegression(t *testing.T) {
+	dir := t.TempDir()
+	var mode atomic.Int32 // 0 = sse-error-chunk, 1 = post-keepalive-500, 2 = slow-500-for-disabled
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		switch mode.Load() {
+		case 0:
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("data: {\"error\":{\"message\":\"SECRET_PROMPT_ECHO\"}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 1:
+			time.Sleep(45 * time.Millisecond)
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("SECRET_PROMPT_ECHO"))
+		case 2:
+			time.Sleep(45 * time.Millisecond)
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("SECRET_PROMPT_ECHO"))
+		}
+	}))
+	defer up.Close()
+
+	cfgRaw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    base_url: %s/v1
+    target: local
+    models: [m1]
+  - name: pdisabled
+    target: local
+    models: [m2]
+    tiered:
+      mode: active
+      sse_keepalive_sec: -1
+      health_interval_sec: 60
+      starter_cache:
+        enabled: false
+      backends:
+        - id: b1
+          url: %s
+          tier: 1
+          max_context_tokens: 32000
+          max_safe_input: 16000
+          promote_at: 16000
+          speed_score: 100
+default_group: main
+routing_groups:
+  main:
+    type: order
+    members: [p/m1]
+`, dir, up.URL, up.URL)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(cfgRaw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv.Pipeline.SSEKeepaliveInitDelay = 15 * time.Millisecond
+	srv.Pipeline.SSEKeepaliveInterval = 15 * time.Millisecond
+
+	// 1. SSE error event containing sensitive text must forward SSE to client,
+	//    log status=502, and NEVER record SECRET_PROMPT_ECHO into audit logs.
+	mode.Store(0)
+	req1, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req1.Header.Set("Authorization", "Bearer "+tok)
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec1, req1)
+	if !strings.Contains(rec1.Body.String(), "SECRET_PROMPT_ECHO") {
+		t.Fatalf("expected client to still receive upstream SSE error event, got %q", rec1.Body.String())
+	}
+
+	// 2. Post-keepalive HTTP 500 error body on regular provider must not leak to audit.
+	mode.Store(1)
+	req2, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req2.Header.Set("Authorization", "Bearer "+tok)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec2, req2)
+	if !strings.Contains(rec2.Body.String(), ": keepalive\n\n") || !strings.Contains(rec2.Body.String(), `"upstream_error"`) {
+		t.Fatalf("expected keepalive + upstream_error, got %q", rec2.Body.String())
+	}
+
+	// 3. Tiered provider with sse_keepalive_sec=-1 disables Pipeline keepalive wrapper too.
+	mode.Store(2)
+	req3, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"pdisabled/m2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req3.Header.Set("Authorization", "Bearer "+tok)
+	req3.Header.Set("Content-Type", "application/json")
+	rec3 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusBadGateway || strings.Contains(rec3.Body.String(), ": keepalive") {
+		t.Fatalf("expected 502 JSON with no keepalive when sse_keepalive_sec=-1, got code=%d body=%q", rec3.Code, rec3.Body.String())
+	}
+
+	// Verify audit files exist on disk, record upstream_error, and NEVER contain SECRET_PROMPT_ECHO.
+	var auditBytes strings.Builder
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr == nil && !info.IsDir() && strings.HasSuffix(path, ".jsonl") {
+			b, err := os.ReadFile(path)
+			if err == nil {
+				auditBytes.Write(b)
+			}
+		}
+		return nil
+	})
+	auditStr := auditBytes.String()
+	if !strings.Contains(auditStr, "upstream_error") {
+		t.Fatalf("expected audit log to contain upstream_error records, got %q", auditStr)
+	}
+	if strings.Contains(auditStr, "SECRET_PROMPT_ECHO") {
+		t.Fatalf("audit log leaked upstream error body: %s", auditStr)
+	}
+
+	// 4. Cancel racing with prov.Chat return must close late response body (tested under -race).
+	srv.Pipeline.SSEKeepaliveInitDelay = 200 * time.Millisecond
+	var bodiesMu sync.Mutex
+	var bodies []*closeSpyBody
+	srv.Live.Current().Reg.SetPlugin("p", func(ctx context.Context, body []byte) (*http.Response, error) {
+		time.Sleep(10 * time.Millisecond)
+		sb := &closeSpyBody{Reader: strings.NewReader(`{"id":"c1"}`)}
+		bodiesMu.Lock()
+		bodies = append(bodies, sb)
+		bodiesMu.Unlock()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       sb,
+		}, nil
+	})
+	for i := 0; i < 15; i++ {
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		r, _ := http.NewRequestWithContext(cctx, http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"race"}]}`)))
+		r.Header.Set("Authorization", "Bearer "+tok)
+		r.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(rec, r)
+		cancel()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		allClosed := true
+		bodiesMu.Lock()
+		for _, b := range bodies {
+			if !b.closed.Load() {
+				allClosed = false
+				break
+			}
+		}
+		bodiesMu.Unlock()
+		if allClosed {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("canceled late response body was not closed")
+}
+
+func TestTieredKeepaliveFailoverRequestLogBackend(t *testing.T) {
+	dir := t.TempDir()
+	tb1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		time.Sleep(45 * time.Millisecond)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`unavailable`))
+	}))
+	defer tb1.Close()
+
+	tb2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"from-tb2\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer tb2.Close()
+
+	cfgRaw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: ptiered
+    target: local
+    models: [m1]
+    tiered:
+      mode: active
+      sse_keepalive_sec: 1
+      health_interval_sec: 1
+      starter_cache:
+        enabled: false
+      backends:
+        - id: tb1
+          url: %s
+          tier: 1
+          max_context_tokens: 32000
+          max_safe_input: 16000
+          promote_at: 16000
+          speed_score: 100
+        - id: tb2
+          url: %s
+          tier: 2
+          max_context_tokens: 64000
+          max_safe_input: 32000
+          promote_at: 32000
+          speed_score: 50
+default_group: main
+routing_groups:
+  main:
+    type: order
+    members: [ptiered/m1]
+`, dir, tb1.URL, tb2.URL)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(cfgRaw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	rt, ok := srv.Tiered.Router("ptiered")
+	if !ok {
+		t.Fatal("missing tiered router ptiered")
+	}
+	rt.SetSSEKeepaliveInitDelay(15 * time.Millisecond)
+
+	// Wait for health probe to mark both backends healthy so tb1 gets tried first cleanly.
+	deadline := time.Now().Add(4 * time.Second)
+	bothHealthy := false
+	for time.Now().Before(deadline) {
+		st := rt.Status()
+		if len(st.Backends) == 2 && st.Backends[0].Healthy && st.Backends[1].Healthy {
+			bothHealthy = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !bothHealthy {
+		t.Fatalf("backends did not become healthy in time: %+v", rt.Status().Backends)
+	}
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"ptiered/m1","stream":true,"messages":[{"role":"user","content":"failover"}]}`)))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"content":"from-tb2"`) || !strings.Contains(rec.Body.String(), ": keepalive\n\n") {
+		t.Fatalf("expected keepalive + failover chunk from tb2, got code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	var routeBackend string
+	if err := srv.DB.QueryRow(`SELECT route_backend FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&routeBackend); err != nil {
+		t.Fatalf("query request_log failed: %v", err)
+	}
+	if routeBackend != "tb2" {
+		t.Fatalf("expected request_log route_backend to record winning backend tb2, got %q", routeBackend)
+	}
+}
+
+func TestPipelineKeepalivePreservesCandidateFailover(t *testing.T) {
+	dir := t.TempDir()
+	var p1Fail, p2Fail atomic.Bool
+	p1Fail.Store(true)
+
+	p1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if p1Fail.Load() {
+			time.Sleep(40 * time.Millisecond)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`p1 overloaded`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"from-p1\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer p1.Close()
+
+	p2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if p2Fail.Load() {
+			time.Sleep(40 * time.Millisecond)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`p2 overloaded`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"2\",\"object\":\"chat.completion.chunk\",\"model\":\"m2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"from-p2\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"2\",\"object\":\"chat.completion.chunk\",\"model\":\"m2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer p2.Close()
+
+	cfgRaw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p1
+    base_url: %s/v1
+    target: local
+    models: [m1]
+  - name: p2
+    base_url: %s/v1
+    target: local
+    models: [m2]
+default_group: main
+routing_groups:
+  main:
+    type: order
+    members: [p1/m1, p2/m2]
+`, dir, p1.URL, p2.URL)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(cfgRaw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	srv.Pipeline.SSEKeepaliveInitDelay = 15 * time.Millisecond
+	srv.Pipeline.SSEKeepaliveInterval = 15 * time.Millisecond
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Candidate 1 fails with 503 after keepalive delay -> fails over to Candidate 2 and marks Candidate 1 failed.
+	req1, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"main","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req1.Header.Set("Authorization", "Bearer "+tok)
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK || !strings.Contains(rec1.Body.String(), ": keepalive\n\n") || !strings.Contains(rec1.Body.String(), `"content":"from-p2"`) {
+		t.Fatalf("expected keepalive + failover stream from p2, got code=%d body=%q", rec1.Code, rec1.Body.String())
+	}
+	if srv.Live.Current().Reg.Healthy("p1/m1") {
+		t.Fatalf("expected failed candidate p1/m1 to be marked unhealthy for cooldown")
+	}
+	var gotStatus int
+	var gotModel string
+	if err := srv.DB.QueryRow(`SELECT status, model FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&gotStatus, &gotModel); err != nil {
+		t.Fatalf("query request_log 1 failed: %v", err)
+	}
+	if gotStatus != http.StatusOK || gotModel != "p2/m2" {
+		t.Fatalf("expected request_log status=200 model=p2/m2, got status=%d model=%q", gotStatus, gotModel)
+	}
+
+	// 2. When all candidates fail after keepalives start -> emits terminal SSE error + [DONE] and logs status 502.
+	p2Fail.Store(true)
+	req2, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"main","stream":true,"messages":[{"role":"user","content":"hi2"}]}`)))
+	req2.Header.Set("Authorization", "Bearer "+tok)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec2, req2)
+	body2 := rec2.Body.String()
+	if !strings.Contains(body2, ": keepalive\n\n") || !strings.Contains(body2, `"upstream_error"`) || !strings.Contains(body2, "data: [DONE]\n\n") {
+		t.Fatalf("expected keepalive + terminal SSE error + [DONE], got %q", body2)
+	}
+	if err := srv.DB.QueryRow(`SELECT status FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&gotStatus); err != nil {
+		t.Fatalf("query request_log 2 failed: %v", err)
+	}
+	if gotStatus != http.StatusBadGateway {
+		t.Fatalf("expected request_log status=502 when all candidates fail, got %d", gotStatus)
+	}
+}

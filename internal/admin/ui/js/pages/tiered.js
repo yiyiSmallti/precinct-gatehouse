@@ -201,6 +201,22 @@ export function renderTiered(container, ctx) {
       dataset: { fieldPath: `${fpBase}.tiered.health_interval_sec` },
       onInput: (e) => { draft.health_interval_sec = Number(e.target.value || 0); },
     });
+    const stickyIn = el('input', {
+      className: 'input num mono',
+      type: 'number',
+      value: String(draft.heavy_sticky_sec ?? 12),
+      placeholder: '12 (-1 关闭)',
+      dataset: { fieldPath: `${fpBase}.tiered.heavy_sticky_sec` },
+      onInput: (e) => { draft.heavy_sticky_sec = Number(e.target.value || 0); },
+    });
+    const keepaliveSSEIn = el('input', {
+      className: 'input num mono',
+      type: 'number',
+      value: String(draft.sse_keepalive_sec ?? 15),
+      placeholder: '15 (-1 关闭)',
+      dataset: { fieldPath: `${fpBase}.tiered.sse_keepalive_sec` },
+      onInput: (e) => { draft.sse_keepalive_sec = Number(e.target.value || 0); },
+    });
 
     const minTokIn = el('input', {
       className: 'input num mono',
@@ -414,6 +430,14 @@ export function renderTiered(container, ctx) {
         el('div', { className: 'field' },
           el('label', { className: 'field-label' }, '健康探测间隔 (秒)'),
           healthIn
+        ),
+        el('div', { className: 'field' },
+          el('label', { className: 'field-label' }, '重算写入黏性窗口 (秒，-1 关闭)'),
+          stickyIn
+        ),
+        el('div', { className: 'field' },
+          el('label', { className: 'field-label' }, '长 Prefill SSE 保活 (秒，-1 关闭)'),
+          keepaliveSSEIn
         )
       ),
       el('div', { className: 'sublist-item', style: { gap: '10px' } },

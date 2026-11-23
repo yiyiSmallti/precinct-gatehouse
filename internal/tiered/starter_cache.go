@@ -514,8 +514,11 @@ func commonPrefixClean(a, b string) string {
 	for i < n && a[i] == b[i] {
 		i++
 	}
-	if i == len(a) && i == len(b) {
+	if i == len(a) {
 		return a
+	}
+	if i == len(b) {
+		return b
 	}
 	for i > 0 && i < len(a) && !utf8.RuneStart(a[i]) {
 		i--
@@ -568,6 +571,9 @@ func shrinkSystemMessages(existing, incoming []json.RawMessage) ([]json.RawMessa
 	}
 	if len(out) == 0 {
 		return nil, false, false
+	}
+	if systemMsgsEqual(existing, out) {
+		return existing, false, true
 	}
 	return out, true, true
 }
