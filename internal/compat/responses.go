@@ -446,18 +446,18 @@ func splitToolOutput(v any) (string, []any) {
 		// Codex sends a content array JSON-encoded into the string.
 		t := strings.TrimSpace(ov)
 		if (strings.HasPrefix(t, "[") || strings.HasPrefix(t, "{")) &&
-			strings.Contains(t, "image") {
-			// Only an output that carries an image is read as content parts;
-			// any other JSON result stays verbatim.
+			(strings.Contains(t, "image") || strings.Contains(t, "input_file")) {
+			// Only an output that carries an image or a file is read as
+			// content parts; any other JSON result stays verbatim.
 			if parsed, err := oai.DecodeValue([]byte(t)); err == nil {
-				if text, images, ok := splitContentParts(parsed); ok && len(images) > 0 {
+				if text, images, ok, files := splitContentParts(parsed); ok && (len(images) > 0 || files) {
 					return text, images
 				}
 			}
 		}
 		return extractInlineImages(ov)
 	default:
-		if text, images, ok := splitContentParts(ov); ok {
+		if text, images, ok, _ := splitContentParts(ov); ok {
 			return text, images
 		}
 		return extractInlineImages(string(oai.Encode(ov)))
@@ -466,8 +466,8 @@ func splitToolOutput(v any) (string, []any) {
 
 // splitContentParts reads v as one content part or an array of them. ok is
 // false when v holds no recognised part, so that an ordinary JSON result is
-// kept as text instead of being dropped.
-func splitContentParts(v any) (text string, images []any, ok bool) {
+// kept as text instead of being dropped; files reports an input_file part.
+func splitContentParts(v any) (text string, images []any, ok, files bool) {
 	var parts []any
 	switch t := v.(type) {
 	case []any:
@@ -475,7 +475,7 @@ func splitContentParts(v any) (text string, images []any, ok bool) {
 	case map[string]any:
 		parts = []any{t}
 	default:
-		return "", nil, false
+		return "", nil, false, false
 	}
 	var texts []string
 	// keepRaw keeps a part this adapter does not convert as text, so that
@@ -506,7 +506,7 @@ func splitContentParts(v any) (text string, images []any, ok bool) {
 			}
 			images = append(images, imgs...)
 		case "input_file":
-			ok = true
+			ok, files = true, true
 			fp := inputFilePart(p)
 			if oai.Str(fp, "type") == "image_url" {
 				images = append(images, fp)
@@ -524,7 +524,7 @@ func splitContentParts(v any) (text string, images []any, ok bool) {
 			keepRaw(p)
 		}
 	}
-	return strings.Join(texts, "\n"), images, ok
+	return strings.Join(texts, "\n"), images, ok, files
 }
 
 // extractInlineImages moves large `data:image/...;base64,` URIs out of s into
@@ -549,6 +549,7 @@ func extractInlineImages(s string) (string, []any) {
 
 type openRespTool struct {
 	custom      bool
+	announced   bool // output_item.added was sent
 	outputIndex int
 	itemID      string
 	callID      string
@@ -789,6 +790,9 @@ func (t *ResponsesTranslator) closeOpenTools(w http.ResponseWriter) {
 		if st == nil {
 			continue
 		}
+		if !st.announced {
+			t.announceCall(w, st)
+		}
 		text := st.args.String()
 		if st.custom {
 			input := customToolInput(text)
@@ -878,14 +882,31 @@ func (t *ResponsesTranslator) startFunctionCall(w http.ResponseWriter, tcIdx int
 	if t.openTools == nil {
 		t.openTools = map[int]*openRespTool{}
 	}
-	st.custom = t.CustomTools[name]
 	t.openTools[tcIdx] = st
 	t.openToolOrder = append(t.openToolOrder, tcIdx)
+	if name != "" {
+		t.announceCall(w, st)
+	}
+	return st
+}
+
+// announceCall sends output_item.added once the call's name is known, since
+// the name decides between function_call and custom_tool_call. Arguments
+// that arrived before it are sent as one delta.
+func (t *ResponsesTranslator) announceCall(w http.ResponseWriter, st *openRespTool) {
+	st.announced = true
+	st.custom = t.CustomTools[st.name]
 	t.emitEvent(w, "response.output_item.added", map[string]any{
 		"output_index": st.outputIndex,
-		"item":         t.callItem(st.itemID, callID, name, "", "in_progress"),
+		"item":         t.callItem(st.itemID, st.callID, st.name, "", "in_progress"),
 	})
-	return st
+	if !st.custom && st.args.Len() > 0 {
+		t.emitEvent(w, "response.function_call_arguments.delta", map[string]any{
+			"item_id":      st.itemID,
+			"output_index": st.outputIndex,
+			"delta":        st.args.String(),
+		})
+	}
 }
 
 func (t *ResponsesTranslator) OnChunk(w http.ResponseWriter, chunk oai.Object) {
@@ -956,11 +977,26 @@ func (t *ResponsesTranslator) OnChunk(w http.ResponseWriter, chunk oai.Object) {
 					st.name = name
 				}
 			}
+			if !st.announced && st.name != "" {
+				t.announceCall(w, st)
+				// announceCall flushed the buffered arguments
+				if args != "" {
+					st.args.WriteString(args)
+					if !st.custom {
+						t.emitEvent(w, "response.function_call_arguments.delta", map[string]any{
+							"item_id":      st.itemID,
+							"output_index": st.outputIndex,
+							"delta":        args,
+						})
+					}
+				}
+				continue
+			}
 			if args != "" {
 				st.args.WriteString(args)
-				if st.custom {
-					// a custom tool's input is unwrapped from the arguments
-					// JSON once they are complete
+				if !st.announced || st.custom {
+					// held until the name is known; a custom tool's input
+					// is unwrapped once the arguments are complete
 					continue
 				}
 				t.emitEvent(w, "response.function_call_arguments.delta", map[string]any{

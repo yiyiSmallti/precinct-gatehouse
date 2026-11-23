@@ -248,6 +248,13 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 				{"index": 0, "function": map[string]any{"arguments": toolArgsStr[:mid]}},
 				{"index": 0, "function": map[string]any{"arguments": toolArgsStr[mid:]}},
 			}
+			if strings.Contains(user, "#late-name") {
+				// the id and some arguments arrive before the name
+				chunks = []map[string]any{
+					{"index": 0, "id": "call_1", "type": "function", "function": map[string]any{"arguments": toolArgsStr[:mid]}},
+					{"index": 0, "function": map[string]any{"name": toolName, "arguments": toolArgsStr[mid:]}},
+				}
+			}
 			for _, tc := range chunks {
 				b, _ := json.Marshal(map[string]any{"id": "c1", "object": "chat.completion.chunk", "model": model,
 					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{tc}}}}})

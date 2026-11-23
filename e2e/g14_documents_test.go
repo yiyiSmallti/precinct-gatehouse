@@ -192,7 +192,7 @@ func TestG14Documents(t *testing.T) {
 			map[string]any{"type": "function_call_output", "call_id": "call_r", "output": []any{
 				map[string]any{"type": "input_file", "filename": "tool.pdf", "file_data": "data:application/pdf;base64," + pdfB64},
 			}},
-			map[string]any{"type": "custom_tool_call_output", "call_id": "call_p", "output": "Done!"},
+			map[string]any{"type": "custom_tool_call_output", "call_id": "call_p", "output": `[{"type":"input_file","filename":"patch.pdf","file_data":"data:application/pdf;base64,` + pdfB64 + `"}]`},
 			map[string]any{"type": "local_shell_call_output", "call_id": "call_s", "output": "README.md"},
 			map[string]any{"type": "item_reference", "id": "msg_old"},
 			map[string]any{"type": "message", "role": "user", "content": "继续"},
@@ -228,9 +228,9 @@ func TestG14Documents(t *testing.T) {
 	}
 	toolR1, _ := msgsR[3].(map[string]any)["content"].(string)
 	toolR2, _ := msgsR[4].(map[string]any)["content"].(string)
-	rep.Check("compaction 摘要保留为文本；input_file（消息与工具输出）解析为文本且无原始 base64；custom_tool_call_output 成为 tool 消息",
+	rep.Check("compaction 摘要保留为文本；input_file（消息与工具输出）解析为文本且无原始 base64；JSON 字符串形式的 input_file 工具输出也转为文本",
 		strings.Contains(comp, "之前讨论了季度报告") && strings.Contains(userRText.String(), g14DocxText) &&
-			strings.Contains(toolR1, g14PDFText) && toolR2 == "Done!" && !strings.Contains(rawR, docx[:200]) && !strings.Contains(rawR, pdfB64[:120]),
+			strings.Contains(toolR1, g14PDFText) && strings.Contains(toolR2, "[文档：patch.pdf]") && strings.Contains(toolR2, g14PDFText) && !strings.Contains(rawR, docx[:200]) && !strings.Contains(rawR, pdfB64[:120]),
 		"compaction=%q user=%.80q tool_read=%.60q tool_patch=%q", comp, userRText.String(), toolR1, toolR2)
 	var fnTool map[string]any
 	upTools, _ := upR["tools"].([]any)
@@ -283,6 +283,45 @@ func TestG14Documents(t *testing.T) {
 		rS.Status == 200 && inputDone == "改一下 README" && doneItem["type"] == "custom_tool_call" &&
 			strings.Contains(joined, "response.custom_tool_call_input.delta") && !strings.Contains(joined, "function_call_arguments"),
 		"status=%d input=%q item_type=%v", rS.Status, inputDone, doneItem["type"])
+
+	// the name arrives after the id and part of the arguments
+	lateReq := map[string]any{
+		"model": "gpt-5", "input": "改一下 #late-name", "stream": true,
+		"tools": []any{map[string]any{"type": "custom", "name": "apply_patch"}},
+	}
+	lateEvents := func(r Response) (types []string, input string, joined string) {
+		var names []string
+		for _, ev := range parseSSE(r.Raw) {
+			names = append(names, ev.Event)
+			it, _ := ev.Data["item"].(map[string]any)
+			if ev.Event == "response.output_item.added" || ev.Event == "response.output_item.done" {
+				if it["call_id"] != nil {
+					types = append(types, fmt.Sprint(it["type"]))
+				}
+			}
+			if ev.Event == "response.custom_tool_call_input.done" {
+				input = fmt.Sprint(ev.Data["input"])
+			}
+		}
+		return types, input, strings.Join(names, " ")
+	}
+	rL := postJSON(t, g.URL+"/responses", oaiHdr, lateReq)
+	lTypes, lInput, lJoined := lateEvents(rL)
+	lateReq["tools"] = []any{map[string]any{"type": "function", "name": "apply_patch", "parameters": map[string]any{"type": "object"}}}
+	rLF := postJSON(t, g.URL+"/responses", oaiHdr, lateReq)
+	fTypes, _, fJoined := lateEvents(rLF)
+	var fArgs string
+	for _, ev := range parseSSE(rLF.Raw) {
+		if ev.Event == "response.function_call_arguments.delta" {
+			fArgs += fmt.Sprint(ev.Data["delta"])
+		}
+	}
+	rep.Check("流式：工具名晚于 id 和部分参数到达时，仍按名称分类（custom 与 function 各自事件完整一致）",
+		rL.Status == 200 && strings.Join(lTypes, ",") == "custom_tool_call,custom_tool_call" && lInput == "改一下 #late-name" &&
+			!strings.Contains(lJoined, "function_call_arguments") &&
+			strings.Join(fTypes, ",") == "function_call,function_call" && fArgs == `{"input":"改一下 #late-name"}` &&
+			!strings.Contains(fJoined, "custom_tool_call_input"),
+		"custom_items=%v custom_input=%q function_items=%v function_args=%q", lTypes, lInput, fTypes, fArgs)
 
 	// --- binary tool output guard (all protocols) ---
 	garbage := string(g14Rand(9, 24<<10))                                                                   // invalid UTF-8 → U+FFFD after JSON
