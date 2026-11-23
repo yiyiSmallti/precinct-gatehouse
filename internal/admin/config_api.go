@@ -20,15 +20,19 @@ import (
 
 var validHistoryRe = regexp.MustCompile(`^config-[0-9.-]+\.yaml$`)
 
-func (s *Server) providerHasKey(p config.Provider) bool {
-	if p.KeyRef == "" {
+func (s *Server) keyRefExists(ref string) bool {
+	if ref == "" {
 		return false
 	}
-	if name, ok := strings.CutPrefix(p.KeyRef, "db:"); ok {
+	if name, ok := strings.CutPrefix(ref, "db:"); ok {
 		v, err := getSetting(s.deps.DB, "provider_key:"+name)
 		return err == nil && v != ""
 	}
 	return true
+}
+
+func (s *Server) providerHasKey(p config.Provider) bool {
+	return s.keyRefExists(p.KeyRef)
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, _ *http.Request, _ string) {
@@ -36,6 +40,11 @@ func (s *Server) getConfig(w http.ResponseWriter, _ *http.Request, _ string) {
 	raw := st.Snapshot.Cfg.RawCopy()
 	for i := range raw.Providers {
 		raw.Providers[i].HasKey = s.providerHasKey(raw.Providers[i])
+		if raw.Providers[i].Tiered != nil && raw.Providers[i].Tiered.ContextCompress != nil {
+			cc := raw.Providers[i].Tiered.ContextCompress
+			cc.HasSummarizerKey = cc.SummarizerAPIKey != "" || s.keyRefExists(cc.SummarizerKeyRef)
+			cc.SummarizerAPIKey = ""
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":          st.Version,
@@ -55,12 +64,27 @@ func applySectionToRaw(raw *config.Config, section string, data json.RawMessage)
 	}
 	switch section {
 	case "providers":
+		prevInlineKeys := map[string]string{}
+		for _, prev := range raw.Providers {
+			if prev.Tiered != nil && prev.Tiered.ContextCompress != nil && prev.Tiered.ContextCompress.SummarizerAPIKey != "" {
+				prevInlineKeys[prev.Name] = prev.Tiered.ContextCompress.SummarizerAPIKey
+			}
+		}
 		var provs []config.Provider
 		if err := json.Unmarshal(data, &provs); err != nil {
 			return err
 		}
 		for i := range provs {
 			provs[i].HasKey = false
+			if provs[i].Tiered != nil && provs[i].Tiered.ContextCompress != nil {
+				cc := provs[i].Tiered.ContextCompress
+				cc.HasSummarizerKey = false
+				if cc.SummarizerAPIKey == "" && cc.SummarizerKeyRef == "" {
+					if prevKey, ok := prevInlineKeys[provs[i].Name]; ok {
+						cc.SummarizerAPIKey = prevKey
+					}
+				}
+			}
 		}
 		raw.Providers = provs
 	case "routing":

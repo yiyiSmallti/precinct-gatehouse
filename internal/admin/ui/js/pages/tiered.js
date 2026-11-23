@@ -49,6 +49,7 @@ export function renderTiered(container, ctx) {
   let destroyed = false;
   let statusData = null;
   let startersMap = {};
+  let checkpointsMap = {};
   let selectedProvider = '';
   let warmingAll = false;
   let reqSeq = 0;
@@ -62,6 +63,7 @@ export function renderTiered(container, ctx) {
     warmingAll,
     statusData,
     starters: startersMap[selectedProvider] || [],
+    checkpoints: checkpointsMap[selectedProvider] || null,
     draft: (store.getSection('providers') || []).map((p) => ({ n: p.name, t: p.tiered })),
   });
 
@@ -83,6 +85,19 @@ export function renderTiered(container, ctx) {
         } catch {
           if (destroyed || seq !== reqSeq) return;
           if (!startersMap[selectedProvider]) startersMap[selectedProvider] = [];
+        }
+        try {
+          const cpRes = await api.tieredCheckpoints(selectedProvider);
+          if (destroyed || seq !== reqSeq) return;
+          checkpointsMap[selectedProvider] = {
+            items: cpRes?.checkpoints || [],
+            summary: cpRes?.summary || {},
+          };
+        } catch {
+          if (destroyed || seq !== reqSeq) return;
+          if (!checkpointsMap[selectedProvider]) {
+            checkpointsMap[selectedProvider] = { items: [], summary: {} };
+          }
         }
       }
       const key = buildRenderKey();
@@ -173,7 +188,24 @@ export function renderTiered(container, ctx) {
       },
     });
     const draft = clone(origTiered);
+    const hadCC = Boolean(draft.context_compress);
     if (!draft.starter_cache) draft.starter_cache = { enabled: true, canonicalize_tools: true };
+    if (!draft.context_compress) {
+      draft.context_compress = {
+        enabled: false,
+        stage2_enabled: true,
+      };
+    }
+    const ccDraft = draft.context_compress;
+    if (ccDraft.stage2_enabled === undefined) ccDraft.stage2_enabled = true;
+    const isCCCustomized = () => hadCC
+      || Boolean(ccDraft.enabled)
+      || ccDraft.stage2_enabled === false
+      || Boolean(String(ccDraft.summarizer_url || '').trim())
+      || Boolean(String(ccDraft.summarizer_model || '').trim())
+      || Boolean(String(ccDraft.summarizer_key_ref || '').trim())
+      || Number(ccDraft.trigger_tokens || 0) > 0
+      || Number(ccDraft.stage1_target_tokens || 0) > 0;
     if (!Array.isArray(draft.backends) || !draft.backends.length) draft.backends = [defaultBackend(1)];
 
     let baseURLVal = provObj.base_url || '';
@@ -246,6 +278,46 @@ export function renderTiered(container, ctx) {
       placeholder: '默认 <data_dir>/tiered-<provider>-starters.json',
       dataset: { fieldPath: `${fpBase}.tiered.starter_cache.persist_path` },
       onInput: (e) => { draft.starter_cache.persist_path = e.target.value; },
+    });
+    const ccTrigIn = el('input', {
+      className: 'input input-sm num mono',
+      type: 'number',
+      value: ccDraft.trigger_tokens ? String(ccDraft.trigger_tokens) : '',
+      placeholder: '500000',
+      dataset: { fieldPath: `${fpBase}.tiered.context_compress.trigger_tokens` },
+      onInput: (e) => { ccDraft.trigger_tokens = Number(e.target.value || 0); },
+    });
+    const ccTargetIn = el('input', {
+      className: 'input input-sm num mono',
+      type: 'number',
+      value: ccDraft.stage1_target_tokens ? String(ccDraft.stage1_target_tokens) : '',
+      placeholder: '180000',
+      dataset: { fieldPath: `${fpBase}.tiered.context_compress.stage1_target_tokens` },
+      onInput: (e) => { ccDraft.stage1_target_tokens = Number(e.target.value || 0); },
+    });
+    const ccUrlIn = el('input', {
+      className: 'input input-sm mono',
+      type: 'text',
+      value: ccDraft.summarizer_url || '',
+      placeholder: '留空则复用健康后端 (需外发则填 http(s)://...)',
+      dataset: { fieldPath: `${fpBase}.tiered.context_compress.summarizer_url` },
+      onInput: (e) => { ccDraft.summarizer_url = e.target.value; },
+    });
+    const ccModelIn = el('input', {
+      className: 'input input-sm mono',
+      type: 'text',
+      value: ccDraft.summarizer_model || '',
+      placeholder: '默认沿用原请求 model',
+      dataset: { fieldPath: `${fpBase}.tiered.context_compress.summarizer_model` },
+      onInput: (e) => { ccDraft.summarizer_model = e.target.value; },
+    });
+    const ccKeyRefIn = el('input', {
+      className: 'input input-sm mono',
+      type: 'text',
+      value: ccDraft.summarizer_key_ref || '',
+      placeholder: 'env:SUMMARIZER_API_KEY (可选)',
+      dataset: { fieldPath: `${fpBase}.tiered.context_compress.summarizer_key_ref` },
+      onInput: (e) => { ccDraft.summarizer_key_ref = e.target.value; },
     });
 
     const backendsBox = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } });
@@ -399,6 +471,20 @@ export function renderTiered(container, ctx) {
       if (!String(draft.starter_cache.persist_path || '').trim()) {
         delete draft.starter_cache.persist_path;
       }
+      if (!isCCCustomized()) {
+        delete draft.context_compress;
+      } else {
+        const trimCC = (k) => {
+          const v = String(ccDraft[k] || '').trim();
+          if (v) ccDraft[k] = v;
+          else delete ccDraft[k];
+        };
+        trimCC('summarizer_url');
+        trimCC('summarizer_model');
+        trimCC('summarizer_key_ref');
+        if (!(Number(ccDraft.trigger_tokens) > 0)) delete ccDraft.trigger_tokens;
+        if (!(Number(ccDraft.stage1_target_tokens) > 0)) delete ccDraft.stage1_target_tokens;
+      }
       closeDrawer();
       stageProviderTiered(provName, draft, trimmedBase);
     };
@@ -484,6 +570,45 @@ export function renderTiered(container, ctx) {
         el('label', { className: 'field-label' }, 'Starter 持久化路径'),
         persistIn
       ),
+      el('div', { className: 'sublist-item', style: { gap: '10px' } },
+        el('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+          el('div', null,
+            el('div', { style: { fontWeight: 500, fontSize: '13px' } }, '两阶段上下文压缩 (context_compress.enabled)'),
+            el('div', { className: 'muted', style: { fontSize: '12px' } }, '超出阈值时自动冻结 Checkpoint 并执行 Stage 1/2 压缩')
+          ),
+          createSwitch({
+            checked: Boolean(ccDraft.enabled),
+            label: '两阶段压缩',
+            onChange: (v) => { ccDraft.enabled = v; },
+          })
+        ),
+        el('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+          el('div', null,
+            el('div', { style: { fontWeight: 500, fontSize: '13px' } }, 'Stage 2 异步摘要与预热 (stage2_enabled)'),
+            el('div', { className: 'muted', style: { fontSize: '12px' } }, '空闲时异步生成结构化摘要并预热 KV 缓存')
+          ),
+          createSwitch({
+            checked: ccDraft.stage2_enabled !== false,
+            label: 'Stage 2 摘要',
+            onChange: (v) => { ccDraft.stage2_enabled = v; },
+          })
+        ),
+        el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' } },
+          el('div', { className: 'field' }, el('label', { className: 'field-label' }, '触发阈值 Tokens'), ccTrigIn),
+          el('div', { className: 'field' }, el('label', { className: 'field-label' }, 'Stage 1 目标 Tokens'), ccTargetIn)
+        ),
+        el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' } },
+          el('div', { className: 'field' }, el('label', { className: 'field-label' }, 'Summarizer URL (可选)'), ccUrlIn),
+          el('div', { className: 'field' }, el('label', { className: 'field-label' }, 'Summarizer Model (可选)'), ccModelIn)
+        ),
+        el('div', { className: 'field' },
+          el('label', { className: 'field-label' }, 'Summarizer Key Ref (可选)'),
+          ccKeyRefIn,
+          ccDraft.has_summarizer_key
+            ? el('div', { className: 'muted', style: { fontSize: '11px', marginTop: '4px' } }, '当前已保存内联密钥；留空保存将继续保留现有密钥')
+            : null
+        )
+      ),
       el('div', { className: 'field' },
         el('label', { className: 'field-label' }, 'Tier 后端节点矩阵'),
         backendsBox
@@ -543,9 +668,12 @@ export function renderTiered(container, ctx) {
     const backends = st.backends || [];
     const shadow = st.shadow || {};
     const scStats = st.starter_cache || {};
+    const ccStats = st.context_compress || {};
     const recent = st.recent_routes || [];
     const mismatches = shadow.mismatches || [];
     const starters = startersMap[st.provider] || [];
+    const cpData = checkpointsMap[st.provider] || { items: [], summary: {} };
+    const checkpoints = cpData.items || [];
 
     const healthyCount = backends.filter((b) => b.healthy).length;
     const totalRouted = backends.reduce((sum, b) => sum + Number(b.total_routed || 0), 0);
@@ -753,7 +881,14 @@ export function renderTiered(container, ctx) {
         kvItem('中文思考锚点注入', st.zh_think_anchor ? '已开启' : '关闭'),
         kvItem('最小观察门槛', `${fmtCompact(scStats.min_tokens || 1500)} tokens / ${fmtNum(scStats.min_hits || 2)} hits`, true),
         kvItem('后台保活周期 / 最近预热', `${scStats.keepalive_sec || 240}s / ${scStats.last_warm_at || '暂无'}`),
-        kvItem('预热命中 / 失败统计', `${fmtNum(scStats.total_warm_hits || 0)} hit / ${fmtNum(scStats.total_warm_fails || 0)} fail`, true)
+        kvItem('预热命中 / 失败统计', `${fmtNum(scStats.total_warm_hits || 0)} hit / ${fmtNum(scStats.total_warm_fails || 0)} fail`, true),
+        kvItem(
+          '两阶段上下文压缩',
+          ccStats.enabled
+            ? `已开启 (触发 ${fmtCompact(ccStats.trigger_tokens || 0)}t / CP ${fmtNum(ccStats.checkpoints_total ?? checkpoints.length)} / S1 ${fmtNum(ccStats.total_stage1_hits || 0)} · S2 ${fmtNum(ccStats.total_stage2_hits || 0)} hit)`
+            : '未启用',
+          true
+        )
       )
     );
 
@@ -844,7 +979,13 @@ export function renderTiered(container, ctx) {
                 el('tr', null,
                   el('td', { className: 'num mono muted nowrap' }, r.time || '-'),
                   el('td', { className: 'nowrap' }, el('span', { className: 'pill mono' }, r.backend || '-')),
-                  el('td', { className: 'mono', style: { fontSize: '12px' } }, r.reason || '-'),
+                  el('td', { className: 'mono', style: { fontSize: '12px' } },
+                    r.reason || '-',
+                    r.compress_mode && r.compress_mode !== 'none'
+                      ? el('span', { className: 'pill pill-brass', style: { marginLeft: '6px' } },
+                        r.orig_est ? `${r.compress_mode} · ${fmtCompact(r.orig_est)}` : r.compress_mode)
+                      : null
+                  ),
                   el('td', { className: 'td-right num mono nowrap' },
                     `${fmtCompact(r.total_est)} / ${fmtCompact(r.cached_est)} / ${fmtCompact(r.miss_est)}`
                   ),
@@ -1006,9 +1147,120 @@ export function renderTiered(container, ctx) {
         : el('div', { className: 'sheet-body muted' }, '尚未观察到满足最小 Token 阈值的重复 Starter 提示词前缀。')
     );
 
+    const checkpointsSheet = el('section', { className: 'sheet' },
+      el('div', { className: 'sheet-head' },
+        el('div', { className: 'sheet-title-group' },
+          el('h3', { className: 'sheet-title' }, '上下文压缩 Checkpoints'),
+          el('p', { className: 'sheet-sub' },
+            `${checkpoints.length} 个冻结 Checkpoint · 触发阈值 ${fmtCompact(ccStats.trigger_tokens || 0)} · 已累计节省 ${fmtCompact(ccStats.total_saved_tokens || 0)} tokens`
+          )
+        ),
+        checkpoints.length
+          ? el('div', { className: 'sheet-actions' },
+            el('button', {
+              type: 'button',
+              className: 'btn btn-danger btn-sm',
+              onClick: async () => {
+                const ok = await confirmModal({
+                  title: '清空 Checkpoints',
+                  message: `确定清空 ${st.provider} 的全部 ${checkpoints.length} 个压缩 Checkpoint？后续长对话将重新执行 Stage 1 冻结。`,
+                  confirmText: '确认清空',
+                  danger: true,
+                });
+                if (!ok) return;
+                try {
+                  await api.tieredClearCheckpoints(st.provider);
+                  toast('已清空全部 Checkpoints', 'ok');
+                  await load(false);
+                } catch (e) {
+                  toast(`清空失败: ${e.message}`, 'err');
+                }
+              },
+            }, '清空全部')
+          )
+          : null
+      ),
+      checkpoints.length
+        ? el('div', { className: 'table-wrap' },
+          el('table', { className: 'data-table compact' },
+            el('thead', null,
+              el('tr', null,
+                el('th', null, 'ID / 代际'),
+                el('th', null, '摘要预览 / 归档范围'),
+                el('th', { className: 'th-right' }, '原 → S1 / 摘要'),
+                el('th', null, 'Stage 2 状态'),
+                el('th', { className: 'th-right' }, '命中 / 预热'),
+                el('th', null, '作用域'),
+                el('th', { className: 'th-right' }, '操作')
+              )
+            ),
+            el('tbody', null,
+              ...checkpoints.map((cp) =>
+                el('tr', null,
+                  el('td', { className: 'nowrap' },
+                    el('div', { className: 'mono', style: { fontWeight: 500, fontSize: '12px' }, title: cp.id }, cp.id.slice(0, 12)),
+                    el('div', { style: { display: 'flex', gap: '4px', alignItems: 'center', marginTop: '2px' } },
+                      el('span', { className: 'pill mono' }, `G${cp.generation} · S${cp.stage}`),
+                      cp.confidential ? el('span', { className: 'pill pill-brass' }, '机密') : null
+                    )
+                  ),
+                  el('td', { style: { maxWidth: '280px' } },
+                    el('div', {
+                      className: 'muted',
+                      style: { fontSize: '12px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                      title: cp.summary_preview || '',
+                    }, cp.summary_preview || (cp.confidential ? '(机密会话：仅内存摘要，已脱敏隐藏)' : '(尚未生成 Stage 2 摘要)')),
+                    el('div', { className: 'muted mono', style: { fontSize: '11px' } }, `${fmtNum(cp.archived_msg_count || 0)} msgs · cut@${cp.cut_msg_idx || 0}`)
+                  ),
+                  el('td', { className: 'td-right num mono nowrap' },
+                    el('div', null, `${fmtCompact(cp.original_tokens)} → ${fmtCompact(cp.stage1_tokens)}`),
+                    cp.summary_tokens ? el('div', { className: 'muted', style: { fontSize: '11px' } }, `摘要 ${fmtCompact(cp.summary_tokens)}`) : null
+                  ),
+                  el('td', { className: 'nowrap' },
+                    el('span', {
+                      className: `pill ${cp.stage2_status === 'ready' ? 'pill-ok' : cp.stage2_status === 'failed' ? 'pill-err' : ''}`,
+                      title: cp.stage2_err || '',
+                    }, cp.stage2_status || 'none'),
+                    cp.stage2_backend ? el('div', { className: 'muted mono', style: { fontSize: '11px', marginTop: '2px' } }, `${cp.stage2_backend}${cp.stage2_ms ? ` · ${cp.stage2_ms}ms` : ''}`) : null
+                  ),
+                  el('td', { className: 'td-right num mono nowrap' },
+                    el('div', null, `${fmtNum(cp.hits || 0)} hit`),
+                    cp.prewarm_cached ? el('div', { className: 'muted', style: { fontSize: '11px' } }, `PW ${fmtCompact(cp.prewarm_cached)}`) : null
+                  ),
+                  el('td', { className: 'mono muted nowrap' }, cp.origin_target || 'local'),
+                  el('td', { className: 'td-right nowrap' },
+                    el('button', {
+                      type: 'button',
+                      className: 'btn btn-danger btn-sm',
+                      onClick: async () => {
+                        const ok = await confirmModal({
+                          title: '删除 Checkpoint',
+                          message: `确定删除 Checkpoint ${cp.id.slice(0, 12)}？删除后该前缀下次超阈将重新构建。`,
+                          confirmText: '确认删除',
+                          danger: true,
+                        });
+                        if (!ok) return;
+                        try {
+                          await api.tieredDeleteCheckpoint(st.provider, cp.id);
+                          toast('已删除 Checkpoint', 'ok');
+                          await load(false);
+                        } catch (e) {
+                          toast(`删除失败: ${e.message}`, 'err');
+                        }
+                      },
+                    }, '删除')
+                  )
+                )
+              )
+            )
+          )
+        )
+        : el('div', { className: 'sheet-body muted' }, '暂无冻结 Checkpoint；开启 context_compress 且上下文超过触发阈值后将自动建立并可异步升级 Stage 2 摘要。')
+    );
+
     root.append(toolbar, kpiGrid, backendsSheet, splitBand);
     if (shadowSheet) root.appendChild(shadowSheet);
-    root.append(recentSheet, startersSheet);
+    root.append(recentSheet, checkpointsSheet, startersSheet);
   };
 
   load(false);

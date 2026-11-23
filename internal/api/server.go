@@ -261,7 +261,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 			}
 		}
 	}
-	hub.SetWarmupFilter(func(ctx context.Context, providerName, _ string, payload []byte) ([]byte, error) {
+	hub.SetWarmupFilter(func(ctx context.Context, providerName, backendURL string, payload []byte) ([]byte, error) {
 		snap := liveMgr.Current()
 		if snap == nil || snap.Redactor == nil {
 			return payload, nil
@@ -271,7 +271,14 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		if p != nil && p.Target != "" {
 			target = p.Target
 		}
-		mode := snap.Redactor.Mode(target, "internal")
+		if backendURL != "" && !config.IsLoopbackURL(backendURL) {
+			target = "external"
+		}
+		dc := tiered.DataClassFromContext(ctx)
+		if dc == "" {
+			dc = "internal"
+		}
+		mode := snap.Redactor.Mode(target, dc)
 		if mode == redact.ModeOff {
 			return payload, nil
 		}

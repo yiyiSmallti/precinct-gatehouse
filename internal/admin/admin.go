@@ -116,6 +116,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /admin/api/tiered/{provider}/starters/{hash}", s.guard(s.deleteTieredStarter))
 	s.mux.HandleFunc("POST /admin/api/tiered/{provider}/starters/warm", s.guard(s.warmTieredStarters))
 	s.mux.HandleFunc("POST /admin/api/tiered/{provider}/shadow/reset", s.guard(s.resetTieredShadow))
+	s.mux.HandleFunc("GET /admin/api/tiered/{provider}/checkpoints", s.guard(s.getTieredCheckpoints))
+	s.mux.HandleFunc("DELETE /admin/api/tiered/{provider}/checkpoints", s.guard(s.deleteTieredCheckpoints))
+	s.mux.HandleFunc("DELETE /admin/api/tiered/{provider}/checkpoints/{id}", s.guard(s.deleteTieredCheckpoint))
 }
 
 func (s *Server) sessionTTL() time.Duration {

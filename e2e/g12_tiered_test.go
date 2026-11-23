@@ -501,4 +501,111 @@ routing_groups:
 		starterHash != "" && sPin == 200 && pinnedVal && sWarmAct == 200 && warmOK,
 		"starters=%d(%s) pin=(%d,%s) warm=(%d,%s)",
 		len(stArr), rawSt, sPin, rawPin, sWarmAct, rawWarmAct)
+
+	// 11. Hot-enable two-stage context compression -> Stage 1, bypass header, Stage 2 promotion, and checkpoint Admin API DELETE
+	sumSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		summary := "## 1. 用户目标、硬约束与最新纠偏\n- E2E_HARD_RULE: preserve API contract.\n\n## 2. 已落地的事实变更\n- Checked `/srv/e2e.go`.\n\n## 3. 未完成待办\n- Finalize step 11.\n\n## 4. 关键结论\n- Compression active.\n\n## 5. 核心实体索引\n- `g12_tiered_test.go`: verification."
+		respBody, _ := json.Marshal(map[string]any{
+			"id": "sum-e2e",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]string{"role": "assistant", "content": summary},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]int{"prompt_tokens": 120, "completion_tokens": 60, "total_tokens": 180},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(respBody)
+	}))
+	defer sumSrv.Close()
+
+	_, cfgMap2, _ := doAdm(http.MethodGet, "/admin/api/config", nil)
+	baseHash2, _ := cfgMap2["hash"].(string)
+	cfgObj2, _ := cfgMap2["raw"].(map[string]any)
+	provsList2, _ := cfgObj2["providers"].([]any)
+	dsCfg2, _ := provsList2[0].(map[string]any)
+	dsTiered2, _ := dsCfg2["tiered"].(map[string]any)
+	dsTiered2["context_compress"] = map[string]any{
+		"enabled":                   true,
+		"trigger_tokens":            600,
+		"stage1_target_tokens":      250,
+		"keep_recent_groups":        2,
+		"keep_recent_min_tokens":    20,
+		"keep_recent_max_tokens":    120,
+		"tool_max_chars":            120,
+		"stale_read_max_chars":      80,
+		"assistant_max_chars":       140,
+		"user_paste_max_chars":      140,
+		"stage2_enabled":            true,
+		"stage2_max_summary_tokens": 256,
+		"summarizer_url":            sumSrv.URL,
+	}
+	sPutCC, _, rawPutCC := doAdm(http.MethodPut, "/admin/api/config/sections/providers", map[string]any{
+		"base_hash": baseHash2,
+		"data":      provsList2,
+	})
+
+	compTurns := []map[string]any{
+		{"role": "user", "content": "E2E_HARD_RULE: preserve API contract forever."},
+		{"role": "assistant", "content": strings.Repeat("Verbose step one analysis paragraph. ", 45)},
+		{"role": "user", "content": strings.Repeat("Detailed spec clause beta. ", 45)},
+		{"role": "assistant", "content": strings.Repeat("Verbose step two analysis output. ", 45)},
+		{"role": "user", "content": "Recent follow up question."},
+		{"role": "assistant", "content": "Short recent answer."},
+		{"role": "user", "content": "Final recent check."},
+	}
+	compReq1 := map[string]any{
+		"model":    "ds/deepseek-v3",
+		"messages": compTurns,
+	}
+	rComp1 := g.Chat(t, tok, compReq1, nil)
+	cpID1 := rComp1.Header.Get("X-Context-Checkpoint-Id")
+
+	rNoComp := g.Chat(t, tok, compReq1, map[string]string{"X-No-Compress": "1"})
+
+	// Poll /admin/api/tiered/ds/checkpoints until Stage 2 finishes (live defer delay is 1.5s)
+	cpFullID := ""
+	stage2Ready := false
+	cpDeadline := time.Now().Add(7 * time.Second)
+	var lastCPsRaw string
+	for time.Now().Before(cpDeadline) {
+		_, cpMap, rawCP := doAdm(http.MethodGet, "/admin/api/tiered/ds/checkpoints", nil)
+		lastCPsRaw = rawCP
+		if arr, _ := cpMap["checkpoints"].([]any); len(arr) > 0 {
+			if c0, _ := arr[0].(map[string]any); c0 != nil {
+				cpFullID = fmt.Sprint(c0["id"])
+				if fmt.Sprint(c0["stage2_status"]) == "ready" {
+					stage2Ready = true
+					break
+				}
+			}
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	compTurns2 := append(append([]map[string]any{}, compTurns...),
+		map[string]any{"role": "assistant", "content": "Done."},
+		map[string]any{"role": "user", "content": "Next turn after Stage 2."},
+	)
+	rComp2 := g.Chat(t, tok, map[string]any{
+		"model":    "ds/deepseek-v3",
+		"messages": compTurns2,
+	}, nil)
+
+	sDelCP, _, rawDelCP := doAdm(http.MethodDelete, "/admin/api/tiered/ds/checkpoints/"+cpFullID, nil)
+	_, cpAfterDelMap, rawCPAfterDel := doAdm(http.MethodGet, "/admin/api/tiered/ds/checkpoints", nil)
+	remainingCPs, _ := cpAfterDelMap["checkpoints"].([]any)
+
+	rep.Check("11. 两阶段上下文压缩生效 (Stage1 -> X-No-Compress 绕过 -> Stage2 摘要升级 -> Checkpoint API 删除)",
+		sPutCC == 200 &&
+			rComp1.Status == 200 && rComp1.Header.Get("X-Context-Compressed") == "stage1" && cpID1 != "" &&
+			rNoComp.Status == 200 && rNoComp.Header.Get("X-Context-Compressed") == "0" &&
+			stage2Ready && cpFullID != "" &&
+			rComp2.Status == 200 && rComp2.Header.Get("X-Context-Compressed") == "stage2" &&
+			sDelCP == 200 && len(remainingCPs) == 0,
+		"put=(%d,%s) r1=(%d,mode=%q,cp=%q) bypass=%q stage2=%v(%s) r2=(%d,mode=%q) del=(%d,%s) after=%s",
+		sPutCC, rawPutCC, rComp1.Status, rComp1.Header.Get("X-Context-Compressed"), cpID1,
+		rNoComp.Header.Get("X-Context-Compressed"), stage2Ready, lastCPsRaw,
+		rComp2.Status, rComp2.Header.Get("X-Context-Compressed"), sDelCP, rawDelCP, rawCPAfterDel)
 }

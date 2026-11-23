@@ -92,6 +92,8 @@ type RouteLogEntry struct {
 	Time         string `json:"time"`
 	Backend      string `json:"backend"`
 	Reason       string `json:"reason"`
+	CompressMode string `json:"compress_mode,omitempty"`
+	OrigEst      int    `json:"orig_est,omitempty"`
 	TotalEst     int    `json:"total_est"`
 	CachedEst    int    `json:"cached_est"`
 	MissEst      int    `json:"miss_est"`
@@ -157,6 +159,7 @@ type ProviderStatus struct {
 	RecentRoutes       []RouteLogEntry `json:"recent_routes"`
 	Shadow             ShadowStats     `json:"shadow"`
 	StarterCache       map[string]any  `json:"starter_cache"`
+	ContextCompress    map[string]any  `json:"context_compress"`
 }
 
 type WarmupFilterFunc func(ctx context.Context, provider, backendURL string, payload []byte) ([]byte, error)
@@ -167,12 +170,14 @@ type Router struct {
 	log                   *slog.Logger
 	transport             *http.Transport
 	starters              *StarterCache
+	compressor            *ContextCompressor
 	sseKeepaliveInitDelay atomic.Int64 // nanoseconds; 0 defaults to 20s
 
 	cfgMu        sync.RWMutex
 	cfg          RouterConfig
 	target       string
 	apiKey       string
+	resolveKeyFn func(ref string) (string, error)
 	warmupFilter WarmupFilterFunc
 	backends     []*BackendState
 	byID         map[string]*BackendState
@@ -191,7 +196,21 @@ type Router struct {
 	shadowMismatches []ShadowMismatch
 
 	loopMu     sync.Mutex
+	loopCtx    context.Context
 	loopCancel context.CancelFunc
+}
+
+func defaultCompressPersistPath(starterPersist string) string {
+	if starterPersist == "" {
+		return ""
+	}
+	if strings.HasSuffix(starterPersist, "-starters.json") {
+		return strings.TrimSuffix(starterPersist, "-starters.json") + "-checkpoints.json"
+	}
+	if strings.HasSuffix(starterPersist, ".json") {
+		return strings.TrimSuffix(starterPersist, ".json") + "-checkpoints.json"
+	}
+	return starterPersist + "-checkpoints.json"
 }
 
 func normalizeRouterConfig(cfg RouterConfig, defaultPersist string) RouterConfig {
@@ -218,6 +237,16 @@ func normalizeRouterConfig(cfg RouterConfig, defaultPersist string) RouterConfig
 		applyStarterDefaults(&sc, defaultPersist)
 	}
 	cfg.StarterCache = &sc
+
+	cpPersist := defaultCompressPersistPath(defaultPersist)
+	var cc ContextCompressConfig
+	if cfg.ContextCompress == nil {
+		cc = defaultContextCompressConfig(cpPersist)
+	} else {
+		cc = *cfg.ContextCompress
+		applyContextCompressDefaults(&cc, cpPersist)
+	}
+	cfg.ContextCompress = &cc
 	return cfg
 }
 
@@ -311,6 +340,8 @@ func newRouterWithTarget(name, target, apiKey string, cfg RouterConfig, defaultP
 	}
 	r.starters = newStarterCache(*norm.StarterCache, r)
 	r.starters.enforceTarget(target)
+	r.compressor = newContextCompressor(*norm.ContextCompress, r)
+	r.compressor.enforceTarget(target)
 	if err := r.rebuildBackends(norm.Backends); err != nil {
 		return nil, err
 	}
@@ -374,9 +405,40 @@ func (r *Router) apply(target, apiKey string, cfg RouterConfig) error {
 	}
 	r.starters.applyConfig(*norm.StarterCache)
 	r.starters.enforceTarget(target)
+	r.compressor.applyConfig(*norm.ContextCompress)
+	r.compressor.enforceTarget(target)
 	r.ensureLoops()
-	r.starters.syncWarmLoop(r.loopContext(), norm.Mode == "active" && norm.StarterCache.Enabled)
+	loopCtx := r.loopContext()
+	r.starters.syncWarmLoop(loopCtx, norm.Mode == "active" && norm.StarterCache.Enabled)
+	r.compressor.syncLoop(loopCtx, norm.Mode == "active" && norm.ContextCompress.Enabled)
 	return nil
+}
+
+func (r *Router) setKeyResolver(fn func(ref string) (string, error)) {
+	if r == nil {
+		return
+	}
+	r.cfgMu.Lock()
+	r.resolveKeyFn = fn
+	r.cfgMu.Unlock()
+}
+
+func (r *Router) resolveSecret(ref string) string {
+	if r == nil || ref == "" {
+		return ""
+	}
+	r.cfgMu.RLock()
+	fn := r.resolveKeyFn
+	r.cfgMu.RUnlock()
+	if fn == nil {
+		return ""
+	}
+	v, err := fn(ref)
+	if err != nil {
+		r.log.Warn("tiered key resolve failed", "provider", r.name, "err", err)
+		return ""
+	}
+	return v
 }
 
 func (r *Router) getTarget() string {
@@ -424,13 +486,12 @@ func (r *Router) getWarmupFilter() WarmupFilterFunc {
 func (r *Router) loopContext() context.Context {
 	r.loopMu.Lock()
 	defer r.loopMu.Unlock()
-	if r.loopCancel == nil {
+	if r.loopCtx == nil {
 		ctx, cancel := context.WithCancel(context.Background())
+		r.loopCtx = ctx
 		r.loopCancel = cancel
-		return ctx
 	}
-	// background loops manage their own child cancel via start; return non-nil ctx only on ensureLoops.
-	return context.Background()
+	return r.loopCtx
 }
 
 func (r *Router) ensureLoops() {
@@ -440,11 +501,14 @@ func (r *Router) ensureLoops() {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	r.loopCtx = ctx
 	r.loopCancel = cancel
 	r.loopMu.Unlock()
 
 	r.startBackgroundLoops(ctx)
-	r.starters.syncWarmLoop(ctx, r.getConfig().Mode == "active" && r.getConfig().StarterCache.Enabled)
+	cfg := r.getConfig()
+	r.starters.syncWarmLoop(ctx, cfg.Mode == "active" && cfg.StarterCache.Enabled)
+	r.compressor.syncLoop(ctx, cfg.Mode == "active" && cfg.ContextCompress.Enabled)
 }
 
 func (r *Router) close() {
@@ -453,9 +517,12 @@ func (r *Router) close() {
 		r.loopCancel()
 		r.loopCancel = nil
 	}
+	r.loopCtx = nil
 	r.loopMu.Unlock()
 	r.starters.syncWarmLoop(context.Background(), false)
+	r.compressor.syncLoop(context.Background(), false)
 	r.starters.saveToDisk()
+	r.compressor.saveToDisk()
 }
 
 func (r *Router) getConfig() RouterConfig {
@@ -1345,6 +1412,7 @@ func (r *Router) Status() ProviderStatus {
 		RecentRoutes:       recent,
 		Shadow:             shadow,
 		StarterCache:       r.starters.Summary(),
+		ContextCompress:    r.compressor.Summary(),
 	}
 }
 
@@ -1365,4 +1433,16 @@ func (r *Router) WarmStarter(hash string, force bool) ([]WarmResult, error) {
 		return nil, ErrShadowMode
 	}
 	return r.starters.Warm(hash, force), nil
+}
+
+func (r *Router) Checkpoints() ([]CheckpointView, map[string]any) {
+	return r.compressor.List(), r.compressor.Summary()
+}
+
+func (r *Router) DeleteCheckpoint(id string) (string, error) {
+	return r.compressor.Delete(id)
+}
+
+func (r *Router) ClearCheckpoints() int {
+	return r.compressor.Clear()
 }
