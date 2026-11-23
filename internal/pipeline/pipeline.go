@@ -560,7 +560,8 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			delete(out, "stream_options")
 		}
 		callStart := time.Now()
-		reqCtx := provider.WithCompressHeaders(tiered.WithDataClass(ctx, dataClass), r.Header.Get("X-No-Compress"), r.Header.Get("X-Context-Compress"))
+		routeMeta := &tiered.RouteMeta{}
+		reqCtx := provider.WithCompressHeaders(tiered.WithRouteMeta(tiered.WithDataClass(ctx, dataClass), routeMeta), r.Header.Get("X-No-Compress"), r.Header.Get("X-Context-Compress"))
 		resp, err := p.callProviderWithKeepalive(reqCtx, st, prov, oai.Encode(out), clientStream, upStream)
 		if err != nil {
 			var ue *provider.UpstreamError
@@ -602,6 +603,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 		}
 		st.snap.Reg.MarkOK(ref)
 		copyRouterHeaders(st, resp.Header)
+		applyRouteMeta(st, routeMeta)
 		st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: resp.StatusCode})
 		var usage oai.Usage
 		if upStream {
@@ -610,6 +612,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			usage, err = p.relayBuffered(st, resp, vaultKey, clientStream, clientUsage)
 		}
 		resp.Body.Close()
+		applyRouteMeta(st, routeMeta)
 		if err != nil {
 			status := http.StatusBadGateway
 			var oe *oai.Error
@@ -960,6 +963,16 @@ func copyRouterHeaders(st *reqState, hdr http.Header) {
 	}
 	if rs := hdr.Get("X-Router-Reason"); rs != "" {
 		st.routeReason = rs
+	}
+}
+
+func applyRouteMeta(st *reqState, m *tiered.RouteMeta) {
+	if m == nil {
+		return
+	}
+	if b, r := m.Get(); b != "" {
+		st.routeBackend = b
+		st.routeReason = r
 	}
 }
 

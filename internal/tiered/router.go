@@ -162,12 +162,13 @@ type ProviderStatus struct {
 type WarmupFilterFunc func(ctx context.Context, provider, backendURL string, payload []byte) ([]byte, error)
 
 type Router struct {
-	name                  string
-	defaultDB             string
-	log                   *slog.Logger
-	transport             *http.Transport
-	starters              *StarterCache
-	sseKeepaliveInitDelay atomic.Int64 // nanoseconds; 0 defaults to 20s
+	name                         string
+	defaultDB                    string
+	log                          *slog.Logger
+	transport                    *http.Transport
+	starters                     *StarterCache
+	sseKeepaliveInitDelay        atomic.Int64 // nanoseconds; 0 defaults to 20s
+	sseKeepaliveIntervalOverride atomic.Int64 // nanoseconds; 0 uses sseKeepaliveInterval(sec)
 
 	cfgMu        sync.RWMutex
 	cfg          RouterConfig
@@ -241,6 +242,12 @@ func sseKeepaliveInterval(sec int) time.Duration {
 	return time.Duration(sec) * time.Second
 }
 
+func (r *Router) SetSSEKeepaliveInitDelay(d time.Duration) {
+	if r != nil {
+		r.sseKeepaliveInitDelay.Store(int64(d))
+	}
+}
+
 func (r *Router) getSSEKeepaliveInitDelay() time.Duration {
 	if r != nil {
 		if ns := r.sseKeepaliveInitDelay.Load(); ns > 0 {
@@ -248,6 +255,18 @@ func (r *Router) getSSEKeepaliveInitDelay() time.Duration {
 		}
 	}
 	return 20 * time.Second
+}
+
+func (r *Router) getSSEKeepaliveInterval(sec int) time.Duration {
+	if sec < 0 {
+		return 0
+	}
+	if r != nil {
+		if ns := r.sseKeepaliveIntervalOverride.Load(); ns > 0 {
+			return time.Duration(ns)
+		}
+	}
+	return sseKeepaliveInterval(sec)
 }
 
 func zhAnchorEnabled(c RouterConfig) bool {

@@ -23,7 +23,50 @@ import (
 
 type ctxKey int
 
-const dataClassCtxKey ctxKey = 1
+const (
+	dataClassCtxKey ctxKey = 1
+	routeMetaCtxKey ctxKey = 2
+)
+
+// RouteMeta records the final backend and routing reason across keepalive failovers.
+type RouteMeta struct {
+	mu      sync.RWMutex
+	backend string
+	reason  string
+}
+
+func (m *RouteMeta) Set(backend, reason string) {
+	if m == nil || backend == "" {
+		return
+	}
+	m.mu.Lock()
+	m.backend = backend
+	m.reason = reason
+	m.mu.Unlock()
+}
+
+func (m *RouteMeta) Get() (string, string) {
+	if m == nil {
+		return "", ""
+	}
+	m.mu.RLock()
+	b, r := m.backend, m.reason
+	m.mu.RUnlock()
+	return b, r
+}
+
+// WithRouteMeta attaches a mutable RouteMeta holder to ctx for Pipeline logging.
+func WithRouteMeta(ctx context.Context, m *RouteMeta) context.Context {
+	if m == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, routeMetaCtxKey, m)
+}
+
+func routeMetaFromContext(ctx context.Context) *RouteMeta {
+	v, _ := ctx.Value(routeMetaCtxKey).(*RouteMeta)
+	return v
+}
 
 // WithDataClass annotates ctx with the request data classification so starter
 // prefix capture can exclude confidential prompts.
@@ -447,9 +490,11 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 	keepaliveEvery := sseKeepaliveInterval(t.plan.cfg.SSEKeepaliveSec)
 	initDelay := 20 * time.Second
 	if r != nil {
+		keepaliveEvery = r.getSSEKeepaliveInterval(t.plan.cfg.SSEKeepaliveSec)
 		initDelay = r.getSSEKeepaliveInitDelay()
 	}
 	exclude := make(map[string]bool)
+	routeMeta := routeMetaFromContext(req.Context())
 	logger := t.hub.log
 	if r != nil {
 		logger = r.log
@@ -478,6 +523,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 				backend.activeHeavy.Add(1)
 				backend.heavyRouted.Add(1)
 			}
+			attemptCtx, attemptCancel := context.WithCancel(req.Context())
 			releaseHeavy := func() {
 				if backend != nil && isHeavy && heavyReleased.CompareAndSwap(false, true) {
 					backend.activeHeavy.Add(-1)
@@ -488,12 +534,13 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 				if backend != nil && activeReleased.CompareAndSwap(false, true) {
 					backend.activeReqs.Add(-1)
 				}
+				attemptCancel()
 			}
 
 			isHighestTier := bCfg.Tier >= highestTier
 			attemptBody, clampedMaxOut := clampMaxTokensForBackend(sendBody, an.TotalEst, an.MaxOutTokens, bCfg.MaxContextTokens, isHighestTier)
 
-			outReq, rerr := http.NewRequestWithContext(req.Context(), req.Method, targetChatURL(targetURL, req.URL), bytes.NewReader(attemptBody))
+			outReq, rerr := http.NewRequestWithContext(attemptCtx, req.Method, targetChatURL(targetURL, req.URL), bytes.NewReader(attemptBody))
 			if rerr != nil {
 				releaseActive()
 				exclude[bCfg.ID] = true
@@ -541,6 +588,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 				clampedMaxOut: clampedMaxOut,
 				attemptBody:   attemptBody,
 				outReq:        outReq,
+				cancel:        attemptCancel,
 				releaseHeavy:  releaseHeavy,
 				releaseActive: releaseActive,
 				finishActive:  finishActive,
@@ -566,7 +614,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 		var resp *http.Response
 		var rerr error
 		if isStreamRequest(cur.attemptBody) && keepaliveEvery > 0 {
-			call := t.startRTCall(cur.outReq)
+			call := t.startRTCall(cur.outReq, cur.cancel)
 			timer := time.NewTimer(initDelay)
 			select {
 			case res := <-call.ch:
@@ -578,6 +626,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 				cur.releaseActive()
 				return nil, req.Context().Err()
 			case <-timer.C:
+				routeMeta.Set(cur.bCfg.ID, cur.reason)
 				return t.startKeepaliveStream(&keepaliveFailoverState{
 					req:            req,
 					logger:         logger,
@@ -588,6 +637,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 					maxAttempts:    maxAttempts,
 					resolved:       resolved,
 					exclude:        exclude,
+					routeMeta:      routeMeta,
 					keepaliveEvery: keepaliveEvery,
 					canRetry:       func() bool { return attemptIdx < maxAttempts },
 					nextAttempt:    nextAttempt,
@@ -621,6 +671,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 			resp.Body = io.NopCloser(bytes.NewReader(errBody))
 			resp.ContentLength = int64(len(errBody))
 			setRouterHeaders(resp.Header, cur.bCfg.ID, cur.reason, an, toolsReordered, cur.clampedMaxOut, zhAnchored)
+			routeMeta.Set(cur.bCfg.ID, cur.reason)
 			return resp, nil
 		}
 
@@ -634,6 +685,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 		}
 
 		setRouterHeaders(resp.Header, cur.bCfg.ID, cur.reason, an, toolsReordered, cur.clampedMaxOut, zhAnchored)
+		routeMeta.Set(cur.bCfg.ID, cur.reason)
 		resp.Body = &trackedBody{
 			inner:        resp.Body,
 			releaseHeavy: cur.releaseHeavy,
@@ -699,6 +751,9 @@ func (t *hubTransport) roundTripShadow(req *http.Request, r *Router) (*http.Resp
 
 	actualID := resp.Header.Get("X-Router-Backend")
 	actualReason := resp.Header.Get("X-Router-Reason")
+	if actualID != "" {
+		routeMetaFromContext(req.Context()).Set(actualID, actualReason)
+	}
 	if predID != "" {
 		resp.Header.Set("X-Router-Shadow-Backend", predID)
 		resp.Header.Set("X-Router-Shadow-Reason", predReason)
@@ -800,11 +855,15 @@ type activeRTRes struct {
 type rtCall struct {
 	mu       sync.Mutex
 	canceled bool
+	cancel   context.CancelFunc
 	ch       chan activeRTRes
 }
 
-func (t *hubTransport) startRTCall(outReq *http.Request) *rtCall {
-	call := &rtCall{ch: make(chan activeRTRes, 1)}
+func (t *hubTransport) startRTCall(outReq *http.Request, cancel context.CancelFunc) *rtCall {
+	call := &rtCall{
+		cancel: cancel,
+		ch:     make(chan activeRTRes, 1),
+	}
 	go func() {
 		rr, ee := t.hub.transport.RoundTrip(outReq)
 		call.mu.Lock()
@@ -824,15 +883,24 @@ func (t *hubTransport) startRTCall(outReq *http.Request) *rtCall {
 func (c *rtCall) abort() {
 	c.mu.Lock()
 	c.canceled = true
+	cancel := c.cancel
 	var late activeRTRes
 	select {
 	case late = <-c.ch:
 	default:
 	}
 	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if late.resp != nil && late.resp.Body != nil {
 		_ = late.resp.Body.Close()
 	}
+}
+
+type bodyChunk struct {
+	data []byte
+	err  error
 }
 
 type activeAttempt struct {
@@ -841,6 +909,7 @@ type activeAttempt struct {
 	clampedMaxOut int
 	attemptBody   []byte
 	outReq        *http.Request
+	cancel        context.CancelFunc
 	releaseHeavy  func()
 	releaseActive func()
 	finishActive  func(completed bool, tail []byte, statusCode int)
@@ -856,6 +925,7 @@ type keepaliveFailoverState struct {
 	maxAttempts    int
 	resolved       []resolvedBackend
 	exclude        map[string]bool
+	routeMeta      *RouteMeta
 	keepaliveEvery time.Duration
 	canRetry       func() bool
 	nextAttempt    func() (*activeAttempt, bool, error)
@@ -958,7 +1028,8 @@ func (t *hubTransport) startKeepaliveStream(
 				}
 				if nxt != nil {
 					cur = nxt
-					curCall = t.startRTCall(cur.outReq)
+					st.routeMeta.Set(cur.bCfg.ID, cur.reason)
+					curCall = t.startRTCall(cur.outReq, cur.cancel)
 					return true
 				}
 			}
@@ -1050,34 +1121,95 @@ func (t *hubTransport) startKeepaliveStream(
 			break
 		}
 
-		buf := make([]byte, 32*1024)
-		var tail []byte
-		firstSeen := false
-		for {
-			n, rerr := winResp.Body.Read(buf)
-			if n > 0 {
-				if !firstSeen {
-					firstSeen = true
-					cur.releaseHeavy()
+		chunkCh := make(chan bodyChunk, 1)
+		stopRead := make(chan struct{})
+		var stopOnce sync.Once
+		stopReader := func() {
+			stopOnce.Do(func() { close(stopRead) })
+		}
+		go func() {
+			defer func() {
+				_ = winResp.Body.Close()
+				cur.cancel()
+				close(chunkCh)
+			}()
+			buf := make([]byte, 32*1024)
+			for {
+				n, rerr := winResp.Body.Read(buf)
+				var payload []byte
+				if n > 0 {
+					payload = append([]byte(nil), buf[:n]...)
 				}
-				tail = appendTail(tail, buf[:n])
-				if _, werr := pw.Write(buf[:n]); werr != nil {
-					_ = winResp.Body.Close()
-					cur.finishActive(false, tail, winResp.StatusCode)
-					_ = pw.CloseWithError(werr)
+				if n > 0 || rerr != nil {
+					select {
+					case chunkCh <- bodyChunk{data: payload, err: rerr}:
+					case <-stopRead:
+						return
+					}
+				}
+				if rerr != nil {
 					return
 				}
 			}
-			if rerr != nil {
-				_ = winResp.Body.Close()
-				completed := errors.Is(rerr, io.EOF)
-				cur.finishActive(completed, tail, winResp.StatusCode)
-				if completed {
+		}()
+
+		var tail []byte
+		firstSeen := false
+		for {
+			select {
+			case ch, ok := <-chunkCh:
+				if !ok {
+					cur.finishActive(true, tail, winResp.StatusCode)
 					_ = pw.Close()
-				} else {
-					_ = pw.CloseWithError(rerr)
+					return
 				}
+				if len(ch.data) > 0 {
+					if !firstSeen {
+						firstSeen = true
+						tk.Stop()
+						cur.releaseHeavy()
+					}
+					tail = appendTail(tail, ch.data)
+					if _, werr := pw.Write(ch.data); werr != nil {
+						stopReader()
+						cur.cancel()
+						cur.finishActive(false, tail, winResp.StatusCode)
+						_ = pw.CloseWithError(werr)
+						return
+					}
+				}
+				if ch.err != nil {
+					completed := errors.Is(ch.err, io.EOF)
+					cur.finishActive(completed, tail, winResp.StatusCode)
+					if completed {
+						_ = pw.Close()
+					} else {
+						_ = pw.CloseWithError(ch.err)
+					}
+					return
+				}
+			case <-cpr.closed:
+				stopReader()
+				cur.cancel()
+				cur.finishActive(false, tail, winResp.StatusCode)
+				_ = pw.Close()
 				return
+			case <-st.req.Context().Done():
+				stopReader()
+				cur.cancel()
+				cur.finishActive(false, tail, winResp.StatusCode)
+				_ = pw.CloseWithError(st.req.Context().Err())
+				return
+			case <-tk.C:
+				if !firstSeen {
+					if _, err := pw.Write([]byte(": keepalive\n\n")); err != nil {
+						stopReader()
+						cur.cancel()
+						cur.finishActive(false, tail, winResp.StatusCode)
+						_ = pw.Close()
+						return
+					}
+				}
 			}
 		}
 	}()
