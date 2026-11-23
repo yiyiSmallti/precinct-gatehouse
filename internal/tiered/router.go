@@ -80,10 +80,12 @@ type PrefixEntry struct {
 }
 
 type SessionEntry struct {
-	Tier        int
-	LastTokens  int
-	LastBackend string
-	UpdatedAt   time.Time
+	Tier              int
+	LastTokens        int
+	LastBackend       string
+	HeavyWriteBackend string
+	HeavyWriteAt      time.Time
+	UpdatedAt         time.Time
 }
 
 type RouteLogEntry struct {
@@ -145,6 +147,8 @@ type ProviderStatus struct {
 	Provider           string          `json:"provider"`
 	Mode               string          `json:"mode"`
 	HeavyMissThreshold int             `json:"heavy_miss_threshold"`
+	HeavyStickySec     int             `json:"heavy_sticky_sec"`
+	SSEKeepaliveSec    int             `json:"sse_keepalive_sec"`
 	HealthIntervalSec  int             `json:"health_interval_sec"`
 	ZhThinkAnchor      bool            `json:"zh_think_anchor"`
 	Backends           []BackendStatus `json:"backends"`
@@ -158,11 +162,12 @@ type ProviderStatus struct {
 type WarmupFilterFunc func(ctx context.Context, provider, backendURL string, payload []byte) ([]byte, error)
 
 type Router struct {
-	name      string
-	defaultDB string
-	log       *slog.Logger
-	transport *http.Transport
-	starters  *StarterCache
+	name                  string
+	defaultDB             string
+	log                   *slog.Logger
+	transport             *http.Transport
+	starters              *StarterCache
+	sseKeepaliveInitDelay atomic.Int64 // nanoseconds; 0 defaults to 20s
 
 	cfgMu        sync.RWMutex
 	cfg          RouterConfig
@@ -196,6 +201,12 @@ func normalizeRouterConfig(cfg RouterConfig, defaultPersist string) RouterConfig
 	if cfg.HeavyMissThreshold <= 0 {
 		cfg.HeavyMissThreshold = 24000
 	}
+	if cfg.HeavyStickySec == 0 {
+		cfg.HeavyStickySec = 12
+	}
+	if cfg.SSEKeepaliveSec == 0 {
+		cfg.SSEKeepaliveSec = 15
+	}
 	if cfg.HealthIntervalSec <= 0 {
 		cfg.HealthIntervalSec = 5
 	}
@@ -208,6 +219,35 @@ func normalizeRouterConfig(cfg RouterConfig, defaultPersist string) RouterConfig
 	}
 	cfg.StarterCache = &sc
 	return cfg
+}
+
+func heavyStickyDuration(cfg RouterConfig) time.Duration {
+	if cfg.HeavyStickySec < 0 {
+		return 0
+	}
+	if cfg.HeavyStickySec == 0 {
+		return 12 * time.Second
+	}
+	return time.Duration(cfg.HeavyStickySec) * time.Second
+}
+
+func sseKeepaliveInterval(sec int) time.Duration {
+	if sec < 0 {
+		return 0
+	}
+	if sec == 0 {
+		return 15 * time.Second
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func (r *Router) getSSEKeepaliveInitDelay() time.Duration {
+	if r != nil {
+		if ns := r.sseKeepaliveInitDelay.Load(); ns > 0 {
+			return time.Duration(ns)
+		}
+	}
+	return 20 * time.Second
 }
 
 func zhAnchorEnabled(c RouterConfig) bool {
@@ -312,7 +352,8 @@ func (r *Router) rebuildBackends(list []BackendConfig) error {
 	r.cfgMu.Unlock()
 
 	if len(toProbe) > 0 {
-		probeBackends(toProbe, r.getAPIKey(), &http.Client{Timeout: 4000 * time.Millisecond}, r.log, r.name)
+		cfg := r.getConfig()
+		probeBackends(toProbe, cfg.Mode, cfg.HealthMaxTimeouts, r.getAPIKey(), &http.Client{Timeout: 4000 * time.Millisecond}, r.log, r.name)
 	}
 	return nil
 }
@@ -469,7 +510,7 @@ func isTimeoutErr(err error) bool {
 	return strings.Contains(err.Error(), "Client.Timeout") || strings.Contains(err.Error(), "deadline exceeded")
 }
 
-func probeBackends(backends []*BackendState, apiKey string, client *http.Client, logger *slog.Logger, routerName string) {
+func probeBackends(backends []*BackendState, mode string, cfgMaxTimeouts int, apiKey string, client *http.Client, logger *slog.Logger, routerName string) {
 	var wg sync.WaitGroup
 	for _, b := range backends {
 		wg.Add(1)
@@ -488,16 +529,26 @@ func probeBackends(backends []*BackendState, apiKey string, client *http.Client,
 			}
 			if err != nil {
 				fails := b.healthFails.Add(1)
-				maxTimeouts := int32(2)
+				maxTimeouts := int32(3)
 				if b.activeHeavy.Load() > 0 {
-					maxTimeouts = 4
+					maxTimeouts = 24
+				} else if b.activeReqs.Load() > 0 {
+					maxTimeouts = 12
+				}
+				if (mode == "shadow" || bCfg.MaxContextTokens >= 524288) && maxTimeouts < 12 {
+					maxTimeouts = 12
+				}
+				if cfgMaxTimeouts > int(maxTimeouts) {
+					maxTimeouts = int32(cfgMaxTimeouts)
 				}
 				if !isTimeoutErr(err) || !prevHealthy || fails >= maxTimeouts {
 					b.healthy.Store(false)
 					b.lastHealthErr.Store(err.Error())
 					if prevHealthy {
-						logger.Warn("backend marked unhealthy", "provider", routerName, "backend", bCfg.ID, "fails", fails, "err", err)
+						logger.Warn("backend marked unhealthy", "provider", routerName, "backend", bCfg.ID, "fails", fails, "active", b.activeReqs.Load(), "heavy", b.activeHeavy.Load(), "err", err)
 					}
+				} else if fails == 4 || fails == 12 {
+					logger.Warn("backend transient probe timeout while busy", "provider", routerName, "backend", bCfg.ID, "fails", fails, "max", maxTimeouts, "active", b.activeReqs.Load(), "heavy", b.activeHeavy.Load())
 				}
 				return
 			}
@@ -537,7 +588,8 @@ func (r *Router) startBackgroundLoops(ctx context.Context) {
 				tk.Stop()
 				return
 			case <-tk.C:
-				probeBackends(r.getBackends(), r.getAPIKey(), client, r.log, r.name)
+				cfg := r.getConfig()
+				probeBackends(r.getBackends(), cfg.Mode, cfg.HealthMaxTimeouts, r.getAPIKey(), client, r.log, r.name)
 			}
 		}
 	}()
@@ -820,14 +872,15 @@ func (r *Router) selectBackend(an *RequestAnalysis, exclude map[string]bool) (*B
 		cfg, target := b.snapshot()
 		resolved[i] = resolvedBackend{cfg: cfg, target: target, state: b}
 	}
-	rb, reason, heavy := selectResolvedBackend(r, resolved, r.getConfig().HeavyMissThreshold, an, exclude)
+	cfg := r.getConfig()
+	rb, reason, heavy := selectResolvedBackend(r, resolved, cfg.HeavyMissThreshold, heavyStickyDuration(cfg), an, exclude)
 	if rb == nil {
 		return nil, reason, heavy
 	}
 	return rb.state, reason, heavy
 }
 
-func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh int, an *RequestAnalysis, exclude map[string]bool) (*resolvedBackend, string, bool) {
+func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh int, stickyDur time.Duration, an *RequestAnalysis, exclude map[string]bool) (*resolvedBackend, string, bool) {
 	if heavyThresh <= 0 {
 		heavyThresh = 24000
 	}
@@ -905,14 +958,28 @@ func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh in
 	}
 
 	var sessTier int
+	var heavyWriteBackend string
+	var heavyWriteAt time.Time
 	var hasSess bool
 	if r != nil {
 		r.mu.RLock()
 		if sess, ok := r.sessions[an.SessionKey]; ok {
 			sessTier = sess.Tier
+			heavyWriteBackend = sess.HeavyWriteBackend
+			heavyWriteAt = sess.HeavyWriteAt
 			hasSess = true
 		}
 		r.mu.RUnlock()
+	}
+
+	// Short-term stickiness after a heavy-miss write so async Mooncake L3 flush
+	// completes before the session migrates back to a lower-tier backend.
+	if hasSess && heavyWriteBackend != "" && stickyDur > 0 && time.Since(heavyWriteAt) < stickyDur {
+		for _, rb := range eligible {
+			if rb.cfg.ID == heavyWriteBackend && (rb.state == nil || rb.state.activeHeavy.Load() == 0) {
+				return rb, fmt.Sprintf("heavy-write-sticky(%s)", rb.cfg.ID), false
+			}
+		}
 	}
 
 	reason := fmt.Sprintf("tier%d-len(%d)", targetTier, an.TotalEst)
@@ -947,9 +1014,12 @@ func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh in
 	return eligible[len(eligible)-1], reason + "-failover", false
 }
 
-func (r *Router) recordCompletion(backends []resolvedBackend, an *RequestAnalysis, backendID string, backendTier int, isHeavyWriter bool, actualPrompt, actualCached int) {
+func (r *Router) recordCompletion(backends []resolvedBackend, an *RequestAnalysis, backendID string, backendTier int, isHeavyWriter, isStickyWrite bool, heavyMissThreshold int, actualPrompt, actualCached int) {
 	if r == nil || an == nil || len(an.Hashes) == 0 {
 		return
+	}
+	if heavyMissThreshold <= 0 {
+		heavyMissThreshold = 24000
 	}
 	var cfgs []BackendConfig
 	if len(backends) > 0 {
@@ -1014,14 +1084,26 @@ func (r *Router) recordCompletion(backends []resolvedBackend, an *RequestAnalysi
 			homeTier = prev.Tier
 		}
 	}
-	if !isHeavyWriter && backendTier > homeTier {
+	if !isHeavyWriter && !isStickyWrite && backendTier > homeTier {
 		homeTier = backendTier
 	}
+	var heavyWriteBackend string
+	var heavyWriteAt time.Time
+	if prev, ok := r.sessions[an.SessionKey]; ok {
+		heavyWriteBackend = prev.HeavyWriteBackend
+		heavyWriteAt = prev.HeavyWriteAt
+	}
+	if isHeavyWriter || (actualPrompt > 0 && actualPrompt-actualCached >= heavyMissThreshold) {
+		heavyWriteBackend = backendID
+		heavyWriteAt = now
+	}
 	r.sessions[an.SessionKey] = &SessionEntry{
-		Tier:        homeTier,
-		LastTokens:  total,
-		LastBackend: backendID,
-		UpdatedAt:   now,
+		Tier:              homeTier,
+		LastTokens:        total,
+		LastBackend:       backendID,
+		HeavyWriteBackend: heavyWriteBackend,
+		HeavyWriteAt:      heavyWriteAt,
+		UpdatedAt:         now,
 	}
 }
 
@@ -1253,6 +1335,8 @@ func (r *Router) Status() ProviderStatus {
 		Provider:           r.name,
 		Mode:               cfg.Mode,
 		HeavyMissThreshold: cfg.HeavyMissThreshold,
+		HeavyStickySec:     cfg.HeavyStickySec,
+		SSEKeepaliveSec:    cfg.SSEKeepaliveSec,
 		HealthIntervalSec:  cfg.HealthIntervalSec,
 		ZhThinkAnchor:      zhAnchorEnabled(cfg),
 		Backends:           bs,

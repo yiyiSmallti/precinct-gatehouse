@@ -20,6 +20,32 @@ import (
 // Cooldown is how long a failed model is skipped by order groups.
 const Cooldown = 30 * time.Second
 
+type ctxKey int
+
+const compressHdrCtxKey ctxKey = 1
+
+type compressHeaders struct {
+	noCompress      string
+	contextCompress string
+}
+
+// WithCompressHeaders annotates ctx with client context-compression control headers
+// so Provider.Chat forwards them upstream.
+func WithCompressHeaders(ctx context.Context, noCompress, contextCompress string) context.Context {
+	if noCompress == "" && contextCompress == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, compressHdrCtxKey, compressHeaders{
+		noCompress:      noCompress,
+		contextCompress: contextCompress,
+	})
+}
+
+func compressHeadersFromContext(ctx context.Context) (string, string) {
+	v, _ := ctx.Value(compressHdrCtxKey).(compressHeaders)
+	return v.noCompress, v.contextCompress
+}
+
 // Registry holds every configured provider.
 type Registry struct {
 	byName map[string]*Provider
@@ -155,6 +181,14 @@ func (p *Provider) Chat(ctx context.Context, body []byte) (*http.Response, error
 	req.Header.Set("Content-Type", "application/json")
 	if p.key != "" {
 		req.Header.Set("Authorization", "Bearer "+p.key)
+	}
+	if noComp, compCtrl := compressHeadersFromContext(ctx); noComp != "" || compCtrl != "" {
+		if noComp != "" {
+			req.Header.Set("X-No-Compress", noComp)
+		}
+		if compCtrl != "" {
+			req.Header.Set("X-Context-Compress", compCtrl)
+		}
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {

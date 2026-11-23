@@ -3,6 +3,8 @@ package tiered
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -441,6 +443,12 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 		return syntheticJSONResp(req, http.StatusServiceUnavailable, `{"error":{"message":"no healthy backend available","type":"tiered_unavailable"}}`), nil
 	}
 	highestTier := resolved[len(resolved)-1].cfg.Tier
+	stickyDur := heavyStickyDuration(t.plan.cfg)
+	keepaliveEvery := sseKeepaliveInterval(t.plan.cfg.SSEKeepaliveSec)
+	initDelay := 20 * time.Second
+	if r != nil {
+		initDelay = r.getSSEKeepaliveInitDelay()
+	}
 	exclude := make(map[string]bool)
 	logger := t.hub.log
 	if r != nil {
@@ -448,7 +456,10 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 	}
 
 	for attempt := 0; attempt < len(resolved); attempt++ {
-		rb, reason, isHeavy := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, an, exclude)
+		if cerr := req.Context().Err(); cerr != nil {
+			return nil, cerr
+		}
+		rb, reason, isHeavy := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, stickyDur, an, exclude)
 		if rb == nil {
 			if attempt > 0 {
 				break
@@ -462,6 +473,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 			backend.totalRouted.Add(1)
 		}
 		var heavyReleased atomic.Bool
+		var activeReleased atomic.Bool
 		if backend != nil && isHeavy {
 			backend.activeHeavy.Add(1)
 			backend.heavyRouted.Add(1)
@@ -473,7 +485,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 		}
 		releaseActive := func() {
 			releaseHeavy()
-			if backend != nil {
+			if backend != nil && activeReleased.CompareAndSwap(false, true) {
 				backend.activeReqs.Add(-1)
 			}
 		}
@@ -491,9 +503,73 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 		outReq.Header.Del("Transfer-Encoding")
 		outReq.ContentLength = int64(len(attemptBody))
 
-		resp, rerr := t.hub.transport.RoundTrip(outReq)
+		finishActive := func(completed bool, tail []byte, statusCode int) {
+			releaseActive()
+			actualPrompt, actualCached := extractUsageFromTail(tail)
+			if r != nil && completed && statusCode >= 200 && statusCode < 300 {
+				isStickyWrite := strings.HasPrefix(reason, "heavy-write-sticky(")
+				r.recordCompletion(resolved, an, bCfg.ID, bCfg.Tier, isHeavy, isStickyWrite, t.plan.cfg.HeavyMissThreshold, actualPrompt, actualCached)
+				if starterTmpl != nil {
+					r.starters.Observe(starterTmpl)
+				}
+			}
+			durMs := time.Since(start).Milliseconds()
+			logger.Info("tiered route", "provider", t.provider, "mode", "active", "backend", bCfg.ID, "reason", reason,
+				"est", an.TotalEst, "cached_est", an.CachedEst, "miss_est", an.MissEst,
+				"actual_prompt", actualPrompt, "actual_cached", actualCached, "status", statusCode, "ms", durMs)
+			if r != nil {
+				r.appendLog(RouteLogEntry{
+					Time:         time.Now().Format("15:04:05"),
+					Backend:      bCfg.ID,
+					Reason:       reason,
+					TotalEst:     an.TotalEst,
+					CachedEst:    an.CachedEst,
+					MissEst:      an.MissEst,
+					ActualPrompt: actualPrompt,
+					ActualCache:  actualCached,
+					Status:       statusCode,
+					DurationMs:   durMs,
+				})
+			}
+		}
+
+		var resp *http.Response
+		if isStreamRequest(attemptBody) && keepaliveEvery > 0 {
+			rtCh := make(chan activeRTRes, 1)
+			var aborted atomic.Bool
+			go func() {
+				rr, ee := t.hub.transport.RoundTrip(outReq)
+				if aborted.Load() {
+					if ee == nil && rr != nil && rr.Body != nil {
+						_ = rr.Body.Close()
+					}
+					return
+				}
+				rtCh <- activeRTRes{resp: rr, err: ee}
+			}()
+			timer := time.NewTimer(initDelay)
+			select {
+			case res := <-rtCh:
+				timer.Stop()
+				resp, rerr = res.resp, res.err
+			case <-req.Context().Done():
+				timer.Stop()
+				aborted.Store(true)
+				releaseActive()
+				return nil, req.Context().Err()
+			case <-timer.C:
+				return t.startKeepaliveStream(req, bCfg.ID, reason, an, toolsReordered, clampedMaxOut, zhAnchored, keepaliveEvery, releaseHeavy, releaseActive, finishActive, rtCh, &aborted), nil
+			}
+		} else {
+			resp, rerr = t.hub.transport.RoundTrip(outReq)
+		}
+
 		if rerr != nil {
 			releaseActive()
+			if req.Context().Err() != nil || errors.Is(rerr, context.Canceled) {
+				logger.Info("tiered request canceled by client, skipping failover", "provider", t.provider, "backend", bCfg.ID, "err", rerr)
+				return nil, rerr
+			}
 			logger.Warn("tiered backend roundtrip failed, failing over", "provider", t.provider, "attempt", attempt, "backend", bCfg.ID, "err", rerr)
 			exclude[bCfg.ID] = true
 			continue
@@ -533,32 +609,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 			inner:        resp.Body,
 			releaseHeavy: releaseHeavy,
 			onDone: func(completed bool, tail []byte) {
-				releaseActive()
-				actualPrompt, actualCached := extractUsageFromTail(tail)
-				if r != nil && completed && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					r.recordCompletion(resolved, an, bCfg.ID, bCfg.Tier, isHeavy, actualPrompt, actualCached)
-					if starterTmpl != nil {
-						r.starters.Observe(starterTmpl)
-					}
-				}
-				durMs := time.Since(start).Milliseconds()
-				logger.Info("tiered route", "provider", t.provider, "mode", "active", "backend", bCfg.ID, "reason", reason,
-					"est", an.TotalEst, "cached_est", an.CachedEst, "miss_est", an.MissEst,
-					"actual_prompt", actualPrompt, "actual_cached", actualCached, "status", resp.StatusCode, "ms", durMs)
-				if r != nil {
-					r.appendLog(RouteLogEntry{
-						Time:         time.Now().Format("15:04:05"),
-						Backend:      bCfg.ID,
-						Reason:       reason,
-						TotalEst:     an.TotalEst,
-						CachedEst:    an.CachedEst,
-						MissEst:      an.MissEst,
-						ActualPrompt: actualPrompt,
-						ActualCache:  actualCached,
-						Status:       resp.StatusCode,
-						DurationMs:   durMs,
-					})
-				}
+				finishActive(completed, tail, resp.StatusCode)
 			},
 		}
 		return resp, nil
@@ -599,7 +650,7 @@ func (t *hubTransport) roundTripShadow(req *http.Request, r *Router) (*http.Resp
 	resolved := t.plan.resolve(r)
 	var predID, predReason string
 	if ok {
-		if pb, pr, _ := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, an, nil); pb != nil {
+		if pb, pr, _ := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, heavyStickyDuration(t.plan.cfg), an, nil); pb != nil {
 			predID = pb.cfg.ID
 			predReason = pr
 		}
@@ -669,7 +720,8 @@ func (t *hubTransport) roundTripShadow(req *http.Request, r *Router) (*http.Resp
 			actualPrompt, actualCached := extractUsageFromTail(tail)
 			if r != nil && completed && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				if actualID != "" {
-					r.recordCompletion(resolved, an, actualID, actualTier, actualHeavy, actualPrompt, actualCached)
+					isStickyWrite := strings.HasPrefix(actualReason, "heavy-write-sticky(")
+					r.recordCompletion(resolved, an, actualID, actualTier, actualHeavy, isStickyWrite, t.plan.cfg.HeavyMissThreshold, actualPrompt, actualCached)
 				}
 				if starterTmpl != nil {
 					r.starters.Observe(starterTmpl)
@@ -711,6 +763,175 @@ func setRouterHeaders(h http.Header, backendID, reason string, an *RequestAnalys
 	}
 }
 
+type activeRTRes struct {
+	resp *http.Response
+	err  error
+}
+
+type cancelPipeReader struct {
+	*io.PipeReader
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *cancelPipeReader) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.PipeReader.Close()
+}
+
+func isStreamRequest(body []byte) bool {
+	if !bytes.Contains(body, []byte(`"stream"`)) {
+		return false
+	}
+	var hdr struct {
+		Stream bool `json:"stream"`
+	}
+	return json.Unmarshal(body, &hdr) == nil && hdr.Stream
+}
+
+func marshalSSEErrorChunk(msg string) []byte {
+	payload, _ := marshalNoEscapeHTML(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    "upstream_error",
+		},
+	})
+	var buf bytes.Buffer
+	buf.WriteString("data: ")
+	buf.Write(payload)
+	buf.WriteString("\n\ndata: [DONE]\n\n")
+	return buf.Bytes()
+}
+
+func appendTail(tail, chunk []byte) []byte {
+	if len(chunk) >= maxBodyTail {
+		return append(tail[:0], chunk[len(chunk)-maxBodyTail:]...)
+	}
+	tail = append(tail, chunk...)
+	if len(tail) > maxBodyTail {
+		return append([]byte(nil), tail[len(tail)-maxBodyTail:]...)
+	}
+	return tail
+}
+
+func (t *hubTransport) startKeepaliveStream(
+	req *http.Request,
+	backendID, reason string,
+	an *RequestAnalysis,
+	toolsReordered bool,
+	clampedMaxOut int,
+	zhAnchored bool,
+	keepaliveEvery time.Duration,
+	releaseHeavy func(),
+	releaseActive func(),
+	finishActive func(completed bool, tail []byte, statusCode int),
+	rtCh <-chan activeRTRes,
+	aborted *atomic.Bool,
+) *http.Response {
+	pr, pw := io.Pipe()
+	cpr := &cancelPipeReader{PipeReader: pr, closed: make(chan struct{})}
+	hdr := make(http.Header)
+	hdr.Set("Content-Type", "text/event-stream; charset=utf-8")
+	hdr.Set("Cache-Control", "no-cache")
+	hdr.Set("Connection", "keep-alive")
+	hdr.Set("X-Router-SSE-Keepalive", "1")
+	setRouterHeaders(hdr, backendID, reason, an, toolsReordered, clampedMaxOut, zhAnchored)
+
+	go func() {
+		if _, err := pw.Write([]byte(": keepalive\n\n")); err != nil {
+			aborted.Store(true)
+			releaseActive()
+			_ = pw.Close()
+			return
+		}
+		tk := time.NewTicker(keepaliveEvery)
+		defer tk.Stop()
+		var up activeRTRes
+	waitUp:
+		for {
+			select {
+			case up = <-rtCh:
+				break waitUp
+			case <-cpr.closed:
+				aborted.Store(true)
+				releaseActive()
+				_ = pw.Close()
+				return
+			case <-req.Context().Done():
+				aborted.Store(true)
+				releaseActive()
+				_ = pw.CloseWithError(req.Context().Err())
+				return
+			case <-tk.C:
+				if _, err := pw.Write([]byte(": keepalive\n\n")); err != nil {
+					aborted.Store(true)
+					releaseActive()
+					_ = pw.Close()
+					return
+				}
+			}
+		}
+
+		if up.err != nil {
+			finishActive(false, nil, http.StatusBadGateway)
+			_, _ = pw.Write(marshalSSEErrorChunk(up.err.Error()))
+			_ = pw.Close()
+			return
+		}
+		if up.resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(io.LimitReader(up.resp.Body, 64*1024))
+			_ = up.resp.Body.Close()
+			finishActive(false, nil, up.resp.StatusCode)
+			msg := fmt.Sprintf("HTTP %d: %s", up.resp.StatusCode, strings.TrimSpace(string(errBody)))
+			_, _ = pw.Write(marshalSSEErrorChunk(msg))
+			_ = pw.Close()
+			return
+		}
+
+		buf := make([]byte, 32*1024)
+		var tail []byte
+		firstSeen := false
+		for {
+			n, rerr := up.resp.Body.Read(buf)
+			if n > 0 {
+				if !firstSeen {
+					firstSeen = true
+					releaseHeavy()
+				}
+				tail = appendTail(tail, buf[:n])
+				if _, werr := pw.Write(buf[:n]); werr != nil {
+					_ = up.resp.Body.Close()
+					finishActive(false, tail, up.resp.StatusCode)
+					_ = pw.CloseWithError(werr)
+					return
+				}
+			}
+			if rerr != nil {
+				_ = up.resp.Body.Close()
+				completed := errors.Is(rerr, io.EOF)
+				finishActive(completed, tail, up.resp.StatusCode)
+				if completed {
+					_ = pw.Close()
+				} else {
+					_ = pw.CloseWithError(rerr)
+				}
+				return
+			}
+		}
+	}()
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     hdr,
+		Body:       cpr,
+		Request:    req,
+	}
+}
+
 const maxBodyTail = 16384
 
 type trackedBody struct {
@@ -734,14 +955,7 @@ func (tb *trackedBody) Read(p []byte) (int, error) {
 				tb.releaseHeavy()
 			}
 		}
-		if n >= maxBodyTail {
-			tb.tail = append(tb.tail[:0], p[n-maxBodyTail:n]...)
-		} else {
-			tb.tail = append(tb.tail, p[:n]...)
-			if len(tb.tail) > maxBodyTail {
-				tb.tail = append([]byte(nil), tb.tail[len(tb.tail)-maxBodyTail:]...)
-			}
-		}
+		tb.tail = appendTail(tb.tail, p[:n])
 		tb.mu.Unlock()
 	}
 	if err == io.EOF {
