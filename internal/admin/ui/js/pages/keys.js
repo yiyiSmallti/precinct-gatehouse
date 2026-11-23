@@ -34,6 +34,82 @@ function meterRow(label, used, limit) {
   );
 }
 
+const TOKEN_PRESETS = [
+  { value: 0, label: '不限' },
+  { value: 100_000, label: '10 万' },
+  { value: 1_000_000, label: '100 万' },
+  { value: 10_000_000, label: '1000 万' },
+  { value: 100_000_000, label: '1 亿' },
+];
+
+function fmtTokens(n) {
+  const v = Number(n || 0);
+  if (v >= 1e8) return `${+(v / 1e8).toFixed(2)} 亿`;
+  if (v >= 1e4) return `${+(v / 1e4).toFixed(1)} 万`;
+  return fmtNum(v);
+}
+
+// Option-style quota picker: preset chips plus a custom amount, so nobody has
+// to type raw token counts for the common cases.
+function quotaPicker(label, hint, initial) {
+  let value = Math.max(0, Number(initial || 0));
+  const custom = el('input', {
+    className: 'input num input-sm',
+    type: 'number',
+    min: 0,
+    step: 1000,
+    placeholder: '自定义数量',
+    value: TOKEN_PRESETS.some((p) => p.value === value) ? '' : String(value),
+    style: { width: '140px' },
+  });
+  const chips = el('div', { className: 'quota-presets' });
+  const paint = () => {
+    clear(chips);
+    TOKEN_PRESETS.forEach((p) => {
+      chips.appendChild(el('button', {
+        type: 'button',
+        className: 'btn btn-sm',
+        'aria-pressed': p.value === value ? 'true' : 'false',
+        onClick: () => {
+          value = p.value;
+          custom.value = '';
+          paint();
+        },
+      }, p.label));
+    });
+    chips.appendChild(custom);
+  };
+  custom.addEventListener('input', () => {
+    const n = Math.trunc(Number(custom.value));
+    value = Number.isFinite(n) && n > 0 ? n : 0;
+    paint();
+    custom.focus();
+  });
+  paint();
+  return {
+    node: el('div', { className: 'field' },
+      el('label', { className: 'field-label' }, label),
+      chips,
+      el('p', { className: 'field-hint' }, hint)
+    ),
+    get: () => value,
+  };
+}
+
+function quotaMeter(label, used, limit) {
+  const u = Number(used || 0);
+  const l = Number(limit || 0);
+  const ratio = l > 0 ? Math.min(100, (u / l) * 100) : 0;
+  const tone = l > 0 && u >= l ? 'crit' : l > 0 && u >= l * 0.8 ? 'warn' : '';
+  return el('div', { className: 'quota-meter' },
+    el('div', { className: 'quota-meter-head' },
+      el('span', null, label),
+      el('b', null, l > 0 ? `${fmtTokens(u)} / ${fmtTokens(l)}` : `${fmtTokens(u)} · 不限`)
+    ),
+    l > 0 ? el('div', { className: 'quota-track' }, el('div', { className: `quota-fill ${tone}`, style: { width: `${ratio}%` } })) : null
+  );
+}
+
 function effectiveRaw() {
   const base = store.server?.raw || {};
   const routing = store.getSection('routing') || {};
@@ -181,6 +257,9 @@ export function renderKeys(container) {
     const rpdIn = el('input', { className: 'input num', type: 'number', min: 0, value: String(formState.rpd) });
     const concIn = el('input', { className: 'input num', type: 'number', min: 0, value: String(formState.concurrency) });
     const expIn = el('input', { className: 'input', type: 'datetime-local', value: formState.expiresInput });
+    const qDaily = quotaPicker('每日 Token 配额', '按自然日统计输入 + 输出 Token，次日 0 点重置。', existing?.tokens_daily);
+    const qMonthly = quotaPicker('每月 Token 配额', '按自然月统计，每月 1 日重置。', existing?.tokens_monthly);
+    const qTotal = quotaPicker('总 Token 配额', '累计用量，不自动重置；用完后可在列表中清零或提高额度。', existing?.tokens_total);
     const noteIn = el('textarea', { className: 'textarea', value: formState.note, placeholder: '可选用途说明、负责人等', style: { minHeight: '72px' } });
 
     const submitBtn = el('button', { type: 'button', className: 'btn btn-primary' }, isEdit ? '保存更改' : '签发新密钥');
@@ -206,6 +285,9 @@ export function renderKeys(container) {
         rpm: Math.max(0, Number(rpmIn.value || 0)),
         rpd: Math.max(0, Number(rpdIn.value || 0)),
         concurrency: Math.max(0, Number(concIn.value || 0)),
+        tokens_daily: qDaily.get(),
+        tokens_monthly: qMonthly.get(),
+        tokens_total: qTotal.get(),
         expires_at: expiresAt,
         note: noteIn.value.trim(),
       };
@@ -276,6 +358,40 @@ export function renderKeys(container) {
             el('p', { className: 'field-hint' }, '0 表示不限')
           )
         ),
+        el('div', { className: 'sublist-head', style: { marginTop: '4px' } }, el('strong', null, 'Token 配额'),
+          el('span', { className: 'muted', style: { fontSize: '12px' } }, '达到任一配额后新请求返回 429，进行中的请求不受影响')),
+        qDaily.node,
+        qMonthly.node,
+        qTotal.node,
+        isEdit
+          ? el('div', { className: 'field' },
+            el('label', { className: 'field-label' }, '密钥明文'),
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
+              el('button', {
+                type: 'button',
+                className: 'btn btn-sm',
+                onClick: async () => {
+                  const ok = await confirmModal({
+                    title: '轮换密钥',
+                    message: `为 “${existing.name}” 生成新的密钥明文？旧密钥立即失效，正在使用它的客户端需要换成新密钥。`,
+                    confirmText: '生成新密钥',
+                    danger: true,
+                  });
+                  if (!ok) return;
+                  try {
+                    const res = await api.resetKey(existing.id);
+                    closeDrawer();
+                    await load();
+                    showSecretModal(res.key, res.api_key || existing);
+                  } catch (e) {
+                    toast(`轮换失败: ${e.message}`, 'err');
+                  }
+                },
+              }, icon('refresh', 13), '轮换密钥'),
+              el('span', { className: 'muted', style: { fontSize: '12px' } }, '生成新明文，旧密钥立即失效')
+            )
+          )
+          : null,
         el('div', { className: 'field' },
           el('label', { className: 'field-label' }, '过期时间（可选，留空永不过期）'),
           el('div', { style: { display: 'flex', gap: '8px' } },
@@ -335,7 +451,8 @@ export function renderKeys(container) {
                 el('th', null, '名称与前缀'),
                 el('th', null, '启用'),
                 el('th', null, '范围权限'),
-                el('th', null, '配额与当前用量'),
+                el('th', null, '请求限额'),
+                el('th', null, 'Token 配额'),
                 el('th', null, '有效期 / 最近使用'),
                 el('th', { className: 'th-right' }, '操作')
               )
@@ -381,6 +498,13 @@ export function renderKeys(container) {
                       meterRow('并发', k.inflight, k.concurrency)
                     )
                   ),
+                  el('td', null,
+                    el('div', { className: 'meter-stack' },
+                      quotaMeter('今日', k.tokens_today, k.tokens_daily),
+                      quotaMeter('本月', k.tokens_month, k.tokens_monthly),
+                      quotaMeter('累计', k.tokens_used, k.tokens_total)
+                    )
+                  ),
                   el('td', { className: 'nowrap', style: { fontSize: '12px' } },
                     el('div', { className: 'num' }, k.expires_at ? `到期 ${fmtDateTime(k.expires_at)}` : '长期有效'),
                     el('div', { className: 'muted num' }, k.last_used_at ? `最近 ${fmtDateTime(k.last_used_at)}` : '尚未使用')
@@ -393,20 +517,20 @@ export function renderKeys(container) {
                         className: 'btn btn-sm',
                         onClick: async () => {
                           const ok = await confirmModal({
-                            title: '重置当日计数',
-                            message: `确定清零密钥 “${k.name}” 的当日限额与 RPM 窗口计数？`,
-                            confirmText: '清零计数',
+                            title: '清零 Token 用量',
+                            message: `清零密钥 “${k.name}” 的今日、本月和累计 Token 用量？清零后各项 Token 配额重新开始计算，请求日志和统计不受影响。`,
+                            confirmText: '清零用量',
                           });
                           if (!ok) return;
                           try {
-                            await api.resetKey(k.id);
-                            toast('计数已重置', 'ok');
+                            await api.resetKeyUsage(k.id);
+                            toast('Token 用量已清零', 'ok');
                             load();
                           } catch (e) {
-                            toast(`重置失败: ${e.message}`, 'err');
+                            toast(`清零失败: ${e.message}`, 'err');
                           }
                         },
-                      }, '重置'),
+                      }, '清零用量'),
                       el('button', {
                         type: 'button',
                         className: 'btn btn-danger btn-sm',

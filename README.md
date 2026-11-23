@@ -1,5 +1,7 @@
 # Gatehouse
 
+<img src="docs/assets/icon.png" alt="Gatehouse 图标" width="128">
+
 Precinct 系列 · 自研模型网关：路由组、意图路由、脱敏、计量、短时效令牌。
 
 ## 定位
@@ -34,11 +36,16 @@ Precinct 系列 · 自研模型网关：路由组、意图路由、脱敏、计�
 
 ```sh
 go build -o gatehouse ./cmd/gatehouse   # Go 1.26+，无 cgo，单二进制
-./gatehouse serve                       # 首次运行写出 ~/.gatehouse/config.yaml 样例并退出
-./gatehouse key set ds                  # 把 DeepSeek key 存进系统钥匙串
-./gatehouse config check
-./gatehouse serve                       # 监听 127.0.0.1:7788，本机令牌写在 ~/.gatehouse/local.token
+./gatehouse serve                       # 监听 127.0.0.1:7788，控制台 127.0.0.1:7789
 ```
+
+首次运行时没有配置文件，网关会写出一份可直接启动的默认配置（`~/.gatehouse/config.yaml`，含控制台地址和脱敏默认值）并继续运行，不需要手工编辑。启动日志会打印一次性设置链接：
+
+```text
+Open the console to create the admin account (one-time setup code XXXXXXXXXX): http://127.0.0.1:7789/admin/#/setup?code=XXXXXXXXXX
+```
+
+打开链接创建管理员账号后，按控制台概览页的三步引导完成：添加模型渠道 → 建立路由组 → 签发访问密钥。设置码只在尚未设置管理员密码时有效，只有能看到服务日志的人才能拿到；错误尝试与登录共用锁定计数。仍可用 CLI 完成同样的事：`gatehouse key set ds` 把上游 key 存进系统钥匙串，`gatehouse admin set-password` 设密码，`gatehouse config check` 校验配置。本机令牌写在 `~/.gatehouse/local.token`。
 
 任意 OpenAI 兼容客户端把 base URL 设为 `http://127.0.0.1:7788/v1`，API key 填 `local.token` 的内容，`model` 填 `auto`（默认路由组）、路由组名或 `<provider>/<model>`。dsh 经 `dsh-llm-pi-ai` 的 `openai-completions` 路由接入（见 [SPEC 3.5](docs/SPEC.md)）。
 
@@ -62,19 +69,27 @@ go build -o gatehouse ./cmd/gatehouse   # Go 1.26+，无 cgo，单二进制
 
 ```sh
 gatehouse apikey create --name alice --models ds/deepseek-chat --rpm 30 --rpd 1000 --concurrency 4 --json
-gatehouse apikey list
+gatehouse apikey create --name bob --tokens-daily 1000000 --tokens-monthly 20000000 --json
+gatehouse apikey list                              # TOKENS 列显示 今日/本月/累计 用量与配额
 gatehouse apikey update <id> --rpm 60 --rpd 2000   # 在线更新，无需重发密钥
+gatehouse apikey update <id> --tokens-total 0      # 0 表示不限
 gatehouse apikey disable <id>
 gatehouse apikey enable <id>
 gatehouse apikey reset <id> --json                 # 生成新密钥，旧密钥立即失效
 gatehouse apikey delete <id>
 ```
 
-限额检查顺序为 **并发 → RPM → 每日次数（RPD）**：
+限额检查顺序为 **并发 → RPM → 每日次数（RPD）→ Token 配额**：
 
 - 上游 5xx 或网关自身失败（`status >= 500`）不占用每日额度；RPM 滑窗在准入时计数。
 - 限额状态驻留内存；进程重启后，每日已用次数会从 `request_log` 自动恢复，RPM 滑窗与实时并发计数重置。
 - 默认保留最近 `90` 天 `request_log`（可通过顶层 `request_log_days` 配置，`0` 表示永久保留）。
+
+**按 Token 量限额**：每把 Key 可分别设每日、每月、累计三种 Token 配额（输入 + 输出，含流式），`0` 为不限。控制台的密钥抽屉提供 10 万 / 100 万 / 1000 万 / 1 亿预设和自定义数值，列表里有三条用量条。
+
+- 用量在请求完成后记账，所以越过配额的那次请求会正常完成，**下一次**才返回 `429 token_quota_exceeded`。每日、每月配额带 `Retry-After`（到本地次日 0 点或下月 1 日），累计配额不自动恢复。
+- 用量写在独立的 `key_token_usage` 账本里，不随 `request_log` 清理，重启后继续生效；升级时会从现有 `request_log` 一次性回填。
+- 控制台「清零用量」只清 Token 账本，不换密钥；「轮换密钥」（CLI `apikey reset`）才会生成新密钥。
 
 ### 入口协议与客户端配置
 
@@ -88,17 +103,21 @@ gatehouse apikey delete <id>
 
 ### Web 控制面板（admin）
 
+默认配置已开启控制台（`admin.listen: 127.0.0.1:7789`），首次访问用启动日志里的设置码创建管理员账号；也可以用 CLI 设置：
+
 ```sh
 echo 'your-strong-password' | gatehouse admin set-password --user admin
 ```
 
-配置 `admin.listen` 后随 `gatehouse serve` 一并启动，访问 `http://<admin_listen>/admin/`：
+随 `gatehouse serve` 一并启动，访问 `http://<admin_listen>/admin/`：
 
 - **功能总览**：
   - **概览与门禁流**：实时查看入站请求经由「密钥鉴权 → 策略与限流 → 隐私脱敏 → 上游调度」四级关卡的分流情况（`1h` / `24h`）、今日关键 KPI、24 小时柱状节奏图与各密钥实时并发/RPM。
-  - **访问密钥与用量**：团队 `sk-` 密钥增删改/启停/重置计数（一次性展示明文）、RPM/RPD/并发用量条、按日期/密钥/模型的用量汇总，以及多条件请求日志检索与详情抽屉。
-  - **在线配置编辑与热重载**：支持在 Web 面板直接编辑 **模型渠道**（含连通探测与 `db:<name>` 上游密钥直写）、**路由组与模型别名**（顺序拖拽/权重/规则/别名映射）、**智能路由**（Shadow 旁路验证 / Active 分层接管、后端实时状态与 Starter 前缀预热管理）、**隐私脱敏规则**（各渠道模式、11 类敏感项动作、词表白名单、`fail_closed`、`vault_ttl` 与右侧实时演练）、**常规参数** 及 **原始 YAML 编辑器**。所有配置修改进入底部待应用栏，通过 `base_hash` 乐观锁校验后原子生效。
-  - **深浅色主题与响应式**：默认提供建筑图纸风格浅/深色主题切换，适配 1024px 与窄屏抽屉导航。
+  - **访问密钥**：团队 `sk-` 密钥增删改/启停/轮换（一次性展示明文）、RPM/RPD/并发用量条、Token 配额（今日/本月/累计）用量条与「清零用量」。
+  - **统计分析**：24 小时 / 7 / 14 / 30 / 90 天范围，可按密钥、模型筛选（筛选写入地址栏，可直接分享）；Token 总量、请求数、成功率、平均耗时与上一周期对比；Token 用量趋势（未命中缓存输入 / 命中缓存输入 / 输出堆叠）、模型与密钥排行（点击即筛选）、请求量与异常、耗时与首字、状态分布、耗时分布、按星期×小时的热力图和明细表，支持导出 CSV。数据来自 `GET /admin/api/stats`。
+  - **请求日志**：多条件检索与详情抽屉。
+  - **在线配置编辑与热重载**：支持在 Web 面板直接编辑 **模型渠道**（含连通探测与 `db:<name>` 上游密钥直写）、**路由组与模型别名**（顺序拖拽/权重/规则/别名映射）、**智能路由**（Shadow 旁路验证 / Active 分层接管、后端实时状态与 Starter 前缀预热管理）、**隐私脱敏规则**（各渠道模式、11 类敏感项动作、词表白名单、`fail_closed`、`vault_ttl` 与右侧实时演练）、**常规参数**（请求体上限、日志保留、令牌有效期均为下拉选项）、**服务与端口**（数据面/控制台监听用「仅本机 / 所有网卡 / 关闭」加端口选择，会话有效期、审计目录、OTLP 指标导出开关，需重启的字段带标签）及折叠在底部的 **高级：直接编辑 YAML**。所有配置修改进入底部待应用栏，通过 `base_hash` 乐观锁校验后原子生效。
+  - **深浅色主题与响应式**：与 Index 同一套奶油色/陶土色配色，深色侧栏，浅/深色主题切换，适配 1024px 与窄屏抽屉导航。
 - **热重载语义与运维说明**：
   - **无损在途请求**：所有请求在进入门禁流水线时绑定当前配置快照；热重载通过原子切换快照立即对新请求生效，正在执行的流式或长耗时请求不会被打断或受半截配置影响。
   - **无需重启 vs 需重启字段**：`providers`、`routing_groups`、`default_group`、`model_aliases`、`redaction`、`max_body_mb`、`request_log_days`、`tokens.default_ttl` 均**支持热重载即时生效**；`listen`、`mode`、`data_dir`、`admin.*`、`meter.*`、`audit.*`、`org.*`、`plugins.*` 等启动期基础设施字段变更后会在控制台与接口返回 `restart_required` 提示，需重启进程后生效（热重载期间也不主动拉起新插件进程）。
