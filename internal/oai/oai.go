@@ -175,15 +175,58 @@ func EstimateTokens(req Object) int {
 	return n
 }
 
-// LastUserText returns the text of the last user message.
+// LastUserText returns the text of the last user message, skipping messages
+// that only carry tool images.
 func LastUserText(req Object) string {
 	ms := Messages(req)
-	for i := len(ms) - 1; i >= 0; i-- {
-		if Str(ms[i], "role") == "user" {
-			return Text(ms[i])
-		}
+	if i := LastUserIndex(ms); i >= 0 {
+		return Text(ms[i])
 	}
 	return ""
+}
+
+// LastUserIndex returns the index of the last user message in ms that is not
+// a tool image carrier, or -1.
+func LastUserIndex(ms []Object) int {
+	for i := len(ms) - 1; i >= 0; i-- {
+		if Str(ms[i], "role") == "user" && !IsToolImageCarrier(ms, i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// ToolImageLabel starts the text parts of a tool image carrier.
+const ToolImageLabel = "Image output of tool call "
+
+// IsToolImageCarrier reports whether ms[i] is a user message the Responses
+// adapter inserted to carry images that tools returned: it follows a tool
+// message and holds only ToolImageLabel text parts and image parts. Such a
+// message continues the tool round, so routing does not treat it as the
+// user's turn.
+func IsToolImageCarrier(ms []Object, i int) bool {
+	if i <= 0 || Str(ms[i], "role") != "user" || Str(ms[i-1], "role") != "tool" {
+		return false
+	}
+	parts, _ := ms[i]["content"].([]any)
+	labelled := false
+	for _, p := range parts {
+		po, ok := p.(map[string]any)
+		if !ok {
+			return false
+		}
+		switch Str(po, "type") {
+		case "image_url":
+		case "text":
+			if !strings.HasPrefix(Str(po, "text"), ToolImageLabel) {
+				return false
+			}
+			labelled = true
+		default:
+			return false
+		}
+	}
+	return labelled
 }
 
 // Usage is the token usage reported by a provider.

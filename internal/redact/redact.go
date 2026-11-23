@@ -163,12 +163,56 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Msg }
 
+// inlineImageMin is the smallest base64 payload of a `data:image/...;base64,`
+// URI that DetectText skips (line-wrapped payloads included). Such payloads hold no readable PII, and running
+// every detector over a multi-megabyte image stalled requests for minutes.
+const inlineImageMin = 1024
+
 // DetectText runs every detector on one string. The findings are sorted by
 // start (longer first) and may overlap.
 func (e *Engine) DetectText(ctx context.Context, text string) ([]Finding, error) {
+	fs, _, err := e.detect(ctx, text)
+	return fs, err
+}
+
+// detect is DetectText that also reports whether it skipped an inline base64
+// image. Detectors run on the text between such images, with offsets mapped
+// back to text.
+func (e *Engine) detect(ctx context.Context, text string) ([]Finding, bool, error) {
 	if text == "" {
-		return nil, nil
+		return nil, false, nil
 	}
+	spans := oai.DataImageSpans(text, inlineImageMin, true)
+	if len(spans) == 0 {
+		fs, err := e.detectSegment(ctx, text)
+		return fs, false, err
+	}
+	var out []Finding
+	last := 0
+	for i := 0; i <= len(spans); i++ {
+		end := len(text)
+		if i < len(spans) {
+			end = spans[i][0]
+		}
+		if end > last {
+			fs, err := e.detectSegment(ctx, text[last:end])
+			if err != nil {
+				return nil, true, err
+			}
+			for _, f := range fs {
+				f.Start += last
+				f.End += last
+				out = append(out, f)
+			}
+		}
+		if i < len(spans) {
+			last = spans[i][1]
+		}
+	}
+	return out, true, nil
+}
+
+func (e *Engine) detectSegment(ctx context.Context, text string) ([]Finding, error) {
 	var all []Finding
 	for _, f := range e.rules.Detect(text) {
 		all = append(all, Finding{Kind: f.Kind, Start: f.Start, End: f.End, Source: "rules"})
@@ -252,8 +296,10 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 
 	// processKeep redacts text but never rewrites its first `keep` bytes (a
 	// synthetic "key: " context prefix); masks reaching into it are clipped.
+	inlineImage := false
 	processKeep := func(text string, keep int) (string, error) {
-		fs, err := e.DetectText(ctx, text)
+		fs, skipped, err := e.detect(ctx, text)
+		inlineImage = inlineImage || skipped
 		if err != nil {
 			if mode == ModeAudit || !e.cfg.FailClosedOn() {
 				res.Report.Alerts = append(res.Report.Alerts, err.Error())
@@ -345,7 +391,7 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 	if err := walkRequest(req, processKeep); err != nil {
 		return res, err
 	}
-	if oai.HasImage(req) {
+	if inlineImage || oai.HasImage(req) {
 		if act := e.action("image", mode); act != "keep" && mode != ModeAudit {
 			res.Report.Counts["image"]++
 			if act == "block" {

@@ -27,6 +27,18 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 	if inst := oai.Str(in, "instructions"); inst != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": inst})
 	}
+	// Chat Completions only allows image parts in user messages, so images a
+	// tool returns are held here and sent in one user message right after the
+	// run of tool messages; the tool messages stay adjacent to their
+	// assistant tool_calls.
+	var toolImages []any
+	flushToolImages := func() {
+		if len(toolImages) > 0 {
+			msgs = append(msgs, map[string]any{"role": "user", "content": toolImages})
+			toolImages = nil
+		}
+	}
+	var extraTools []any
 	switch inp := in["input"].(type) {
 	case string:
 		if inp != "" {
@@ -41,6 +53,7 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 			typ := oai.Str(item, "type")
 			switch {
 			case typ == "message" || (typ == "" && oai.Str(item, "role") != ""):
+				flushToolImages()
 				role := oai.Str(item, "role")
 				if role == "developer" {
 					role = "system"
@@ -48,6 +61,7 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 				content := convertResponseInputContent(item["content"])
 				msgs = append(msgs, map[string]any{"role": role, "content": content})
 			case typ == "function_call":
+				flushToolImages()
 				callID := oai.Str(item, "call_id")
 				if callID == "" {
 					callID = oai.Str(item, "id")
@@ -74,35 +88,42 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 					"tool_calls": []any{tc},
 				})
 			case typ == "function_call_output":
-				var outVal any = ""
-				switch ov := item["output"].(type) {
-				case string:
-					outVal = ov
-				case []any:
-					outVal = convertResponseInputContent(ov)
-				case nil:
-					outVal = ""
-				default:
-					outVal = string(oai.Encode(ov))
+				callID := oai.Str(item, "call_id")
+				text, images := splitToolOutput(item["output"])
+				if len(images) > 0 {
+					if text == "" {
+						text = toolImagePlaceholder
+					}
+					toolImages = append(toolImages, map[string]any{"type": "text", "text": oai.ToolImageLabel + callID + ":"})
+					toolImages = append(toolImages, images...)
 				}
 				msgs = append(msgs, map[string]any{
 					"role":         "tool",
-					"tool_call_id": oai.Str(item, "call_id"),
-					"content":      outVal,
+					"tool_call_id": callID,
+					"content":      text,
 				})
+			case typ == "additional_tools":
+				// Codex Desktop sends tool definitions as an input item; they
+				// join the request's tools.
+				if ts, ok := item["tools"].([]any); ok {
+					extraTools = append(extraTools, ts...)
+				}
 			case typ == "reasoning":
 				// dropped
 			default:
 				return nil, reqModel, nil, oai.Errorf(http.StatusBadRequest, "unsupported_input_item", "unsupported input item type %q", typ)
 			}
 		}
+		flushToolImages()
 	}
 	if len(msgs) > 0 {
 		out["messages"] = msgs
 	}
 
 	var dropped []string
-	if tools, ok := in["tools"].([]any); ok && len(tools) > 0 {
+	tools, _ := in["tools"].([]any)
+	tools = append(tools[:len(tools):len(tools)], extraTools...)
+	if len(tools) > 0 {
 		var chatTools []any
 		for _, rt := range tools {
 			t, ok := rt.(map[string]any)
@@ -203,19 +224,9 @@ func convertResponseInputContent(v any) any {
 			switch oai.Str(p, "type") {
 			case "input_text", "output_text", "text":
 				parts = append(parts, map[string]any{"type": "text", "text": oai.Str(p, "text")})
-			case "input_image":
-				var imgURL string
-				switch u := p["image_url"].(type) {
-				case string:
-					imgURL = u
-				case map[string]any:
-					imgURL = oai.Str(u, "url")
-				}
-				if imgURL != "" {
-					parts = append(parts, map[string]any{
-						"type":      "image_url",
-						"image_url": map[string]any{"url": imgURL},
-					})
+			case "input_image", "image_url", "image":
+				if img := imagePart(p); img != nil {
+					parts = append(parts, img)
 				}
 			}
 		}
@@ -228,6 +239,175 @@ func convertResponseInputContent(v any) any {
 	default:
 		return ""
 	}
+}
+
+// imagePart converts a Responses or Chat image content part
+// (`input_image`/`image_url`/`image`, with `image_url` as a string or
+// {url, detail}, or a bare `url`) into a Chat `image_url` part, or nil when it
+// carries no URL.
+func imagePart(p map[string]any) map[string]any {
+	var url, detail string
+	switch u := p["image_url"].(type) {
+	case string:
+		url = u
+	case map[string]any:
+		url, detail = oai.Str(u, "url"), oai.Str(u, "detail")
+	}
+	if url == "" {
+		url = oai.Str(p, "url")
+	}
+	if url == "" {
+		url = inlineImageURL(p)
+	}
+	if url == "" {
+		return nil
+	}
+	if detail == "" {
+		detail = oai.Str(p, "detail")
+	}
+	iu := map[string]any{"url": url}
+	if detail != "" {
+		iu["detail"] = detail
+	}
+	return map[string]any{"type": "image_url", "image_url": iu}
+}
+
+// inlineImageURL builds a data URI from an image given as base64 data plus a
+// media type: MCP's {data, mimeType} or Anthropic's
+// {source: {type: base64, media_type, data}} / {source: {type: url, url}}.
+func inlineImageURL(p map[string]any) string {
+	if src, ok := p["source"].(map[string]any); ok {
+		if oai.Str(src, "type") == "url" {
+			return oai.Str(src, "url")
+		}
+		p = src
+	}
+	data := oai.Str(p, "data")
+	mime := oai.Str(p, "mimeType")
+	if mime == "" {
+		mime = oai.Str(p, "mime_type")
+	}
+	if mime == "" {
+		mime = oai.Str(p, "media_type")
+	}
+	if data == "" || !strings.HasPrefix(mime, "image/") {
+		return ""
+	}
+	return "data:" + mime + ";base64," + data
+}
+
+const (
+	toolImagePlaceholder   = "[image returned by tool; attached in the next user message]"
+	inlineImagePlaceholder = "[image]"
+	// inlineImageMin is the smallest base64 payload pulled out of tool output
+	// text as an image; shorter data URIs stay text.
+	inlineImageMin = 4096
+)
+
+// splitToolOutput turns a function_call_output `output` into the tool
+// message's text and the image parts it returned. Images must not stay in
+// the tool message: Chat Completions rejects image parts outside user
+// messages and providers that render tool results as text tokenize the whole
+// base64 payload.
+func splitToolOutput(v any) (string, []any) {
+	switch ov := v.(type) {
+	case nil:
+		return "", nil
+	case string:
+		// Codex sends a content array JSON-encoded into the string.
+		t := strings.TrimSpace(ov)
+		if (strings.HasPrefix(t, "[") || strings.HasPrefix(t, "{")) &&
+			strings.Contains(t, "image") {
+			// Only an output that carries an image is read as content parts;
+			// any other JSON result stays verbatim.
+			if parsed, err := oai.DecodeValue([]byte(t)); err == nil {
+				if text, images, ok := splitContentParts(parsed); ok && len(images) > 0 {
+					return text, images
+				}
+			}
+		}
+		return extractInlineImages(ov)
+	default:
+		if text, images, ok := splitContentParts(ov); ok {
+			return text, images
+		}
+		return extractInlineImages(string(oai.Encode(ov)))
+	}
+}
+
+// splitContentParts reads v as one content part or an array of them. ok is
+// false when v holds no recognised part, so that an ordinary JSON result is
+// kept as text instead of being dropped.
+func splitContentParts(v any) (text string, images []any, ok bool) {
+	var parts []any
+	switch t := v.(type) {
+	case []any:
+		parts = t
+	case map[string]any:
+		parts = []any{t}
+	default:
+		return "", nil, false
+	}
+	var texts []string
+	// keepRaw keeps a part this adapter does not convert as text, so that
+	// pulling the images out of an output never loses the rest of it
+	keepRaw := func(raw any) {
+		s, ok := raw.(string)
+		if !ok {
+			s = string(oai.Encode(raw))
+		}
+		s, imgs := extractInlineImages(s)
+		if s != "" {
+			texts = append(texts, s)
+		}
+		images = append(images, imgs...)
+	}
+	for _, raw := range parts {
+		p, isObj := raw.(map[string]any)
+		if !isObj {
+			keepRaw(raw)
+			continue
+		}
+		switch oai.Str(p, "type") {
+		case "input_text", "output_text", "text":
+			ok = true
+			s, imgs := extractInlineImages(oai.Str(p, "text"))
+			if s != "" {
+				texts = append(texts, s)
+			}
+			images = append(images, imgs...)
+		case "input_image", "image_url", "image":
+			ok = true
+			if img := imagePart(p); img != nil {
+				images = append(images, img)
+			} else {
+				keepRaw(p)
+			}
+		default:
+			keepRaw(p)
+		}
+	}
+	return strings.Join(texts, "\n"), images, ok
+}
+
+// extractInlineImages moves large `data:image/...;base64,` URIs out of s into
+// image parts, leaving a short placeholder in the text.
+func extractInlineImages(s string) (string, []any) {
+	spans := oai.DataImageSpans(s, inlineImageMin, false)
+	if len(spans) == 0 {
+		return s, nil
+	}
+	var b strings.Builder
+	var images []any
+	last := 0
+	for _, sp := range spans {
+		b.WriteString(s[last:sp[0]])
+		b.WriteString(inlineImagePlaceholder)
+		images = append(images, map[string]any{"type": "image_url", "image_url": map[string]any{"url": s[sp[0]:sp[1]]}})
+		last = sp[1]
+	}
+	b.WriteString(s[last:])
+	return b.String(), images
 }
 
 type openRespTool struct {
