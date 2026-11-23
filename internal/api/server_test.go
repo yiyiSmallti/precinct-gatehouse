@@ -1199,3 +1199,120 @@ routing_groups:
 		t.Fatalf("expected request_log route_backend to record winning backend tb2, got %q", routeBackend)
 	}
 }
+
+func TestPipelineKeepalivePreservesCandidateFailover(t *testing.T) {
+	dir := t.TempDir()
+	var p1Fail, p2Fail atomic.Bool
+	p1Fail.Store(true)
+
+	p1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if p1Fail.Load() {
+			time.Sleep(40 * time.Millisecond)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`p1 overloaded`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"from-p1\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer p1.Close()
+
+	p2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if p2Fail.Load() {
+			time.Sleep(40 * time.Millisecond)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`p2 overloaded`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"2\",\"object\":\"chat.completion.chunk\",\"model\":\"m2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"from-p2\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"2\",\"object\":\"chat.completion.chunk\",\"model\":\"m2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer p2.Close()
+
+	cfgRaw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p1
+    base_url: %s/v1
+    target: local
+    models: [m1]
+  - name: p2
+    base_url: %s/v1
+    target: local
+    models: [m2]
+default_group: main
+routing_groups:
+  main:
+    type: order
+    members: [p1/m1, p2/m2]
+`, dir, p1.URL, p2.URL)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(cfgRaw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	srv.Pipeline.SSEKeepaliveInitDelay = 15 * time.Millisecond
+	srv.Pipeline.SSEKeepaliveInterval = 15 * time.Millisecond
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Candidate 1 fails with 503 after keepalive delay -> fails over to Candidate 2 and marks Candidate 1 failed.
+	req1, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"main","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req1.Header.Set("Authorization", "Bearer "+tok)
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK || !strings.Contains(rec1.Body.String(), ": keepalive\n\n") || !strings.Contains(rec1.Body.String(), `"content":"from-p2"`) {
+		t.Fatalf("expected keepalive + failover stream from p2, got code=%d body=%q", rec1.Code, rec1.Body.String())
+	}
+	if srv.Live.Current().Reg.Healthy("p1/m1") {
+		t.Fatalf("expected failed candidate p1/m1 to be marked unhealthy for cooldown")
+	}
+	var gotStatus int
+	var gotModel string
+	if err := srv.DB.QueryRow(`SELECT status, model FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&gotStatus, &gotModel); err != nil {
+		t.Fatalf("query request_log 1 failed: %v", err)
+	}
+	if gotStatus != http.StatusOK || gotModel != "p2/m2" {
+		t.Fatalf("expected request_log status=200 model=p2/m2, got status=%d model=%q", gotStatus, gotModel)
+	}
+
+	// 2. When all candidates fail after keepalives start -> emits terminal SSE error + [DONE] and logs status 502.
+	p2Fail.Store(true)
+	req2, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"main","stream":true,"messages":[{"role":"user","content":"hi2"}]}`)))
+	req2.Header.Set("Authorization", "Bearer "+tok)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec2, req2)
+	body2 := rec2.Body.String()
+	if !strings.Contains(body2, ": keepalive\n\n") || !strings.Contains(body2, `"upstream_error"`) || !strings.Contains(body2, "data: [DONE]\n\n") {
+		t.Fatalf("expected keepalive + terminal SSE error + [DONE], got %q", body2)
+	}
+	if err := srv.DB.QueryRow(`SELECT status FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&gotStatus); err != nil {
+		t.Fatalf("query request_log 2 failed: %v", err)
+	}
+	if gotStatus != http.StatusBadGateway {
+		t.Fatalf("expected request_log status=502 when all candidates fail, got %d", gotStatus)
+	}
+}
