@@ -317,12 +317,7 @@ func turnKey(group, session string, req oai.Object) string {
 	h := sha256.New()
 	io.WriteString(h, group+"\x00"+session+"\x00")
 	ms := oai.Messages(req)
-	last := -1
-	for i, m := range ms {
-		if oai.Str(m, "role") == "user" {
-			last = i
-		}
-	}
+	last := oai.LastUserIndex(ms)
 	for i := 0; i <= last; i++ {
 		h.Write(oai.Encode(map[string]any{"r": ms[i]["role"], "c": ms[i]["content"]}))
 	}

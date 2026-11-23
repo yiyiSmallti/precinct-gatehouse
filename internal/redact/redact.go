@@ -164,7 +164,7 @@ type Error struct {
 func (e *Error) Error() string { return e.Msg }
 
 // inlineImageMin is the smallest base64 payload of a `data:image/...;base64,`
-// URI that DetectText skips. Such payloads hold no readable PII, and running
+// URI that DetectText skips (line-wrapped payloads included). Such payloads hold no readable PII, and running
 // every detector over a multi-megabyte image stalled requests for minutes.
 const inlineImageMin = 1024
 

@@ -94,7 +94,7 @@ func DecodeResponses(body []byte) (oai.Object, string, []string, error) {
 					if text == "" {
 						text = toolImagePlaceholder
 					}
-					toolImages = append(toolImages, map[string]any{"type": "text", "text": "Image output of tool call " + callID + ":"})
+					toolImages = append(toolImages, map[string]any{"type": "text", "text": oai.ToolImageLabel + callID + ":"})
 					toolImages = append(toolImages, images...)
 				}
 				msgs = append(msgs, map[string]any{
@@ -290,9 +290,11 @@ func splitToolOutput(v any) (string, []any) {
 		// Codex sends a content array JSON-encoded into the string.
 		t := strings.TrimSpace(ov)
 		if (strings.HasPrefix(t, "[") || strings.HasPrefix(t, "{")) &&
-			(strings.Contains(t, "input_image") || strings.Contains(t, "image_url") || strings.Contains(t, "data:image/")) {
+			strings.Contains(t, "image") {
+			// Only an output that carries an image is read as content parts;
+			// any other JSON result stays verbatim.
 			if parsed, err := oai.DecodeValue([]byte(t)); err == nil {
-				if text, images, ok := splitContentParts(parsed); ok {
+				if text, images, ok := splitContentParts(parsed); ok && len(images) > 0 {
 					return text, images
 				}
 			}
