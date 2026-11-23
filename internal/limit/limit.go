@@ -7,6 +7,7 @@ package limit
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -58,13 +59,20 @@ type Limiter struct {
 	// overwrite a live charge. Lock order: ledgerMu, then mu. mu is still
 	// never held across database access.
 	ledgerMu sync.Mutex
+	// unsaved holds charges the ledger rejected (key → day → tokens), guarded
+	// by ledgerMu. They are retried before every later charge and reload of
+	// the key, and reloads add them on top of the ledger sums, so a failed
+	// write never lets a reload forget usage. They are lost only if the
+	// process exits before a retry succeeds.
+	unsaved map[string]map[string]int64
 }
 
 // New creates a Limiter backed by db for daily count initialization.
 func New(db *sql.DB) *Limiter {
 	return &Limiter{
-		db:     db,
-		states: map[string]*keyState{},
+		db:      db,
+		states:  map[string]*keyState{},
+		unsaved: map[string]map[string]int64{},
 	}
 }
 
@@ -80,6 +88,7 @@ func (l *Limiter) ensureDay(keyID, day string) error {
 	// Never hold l.mu across database access.
 	l.ledgerMu.Lock()
 	defer l.ledgerMu.Unlock()
+	l.flushUnsavedLocked(keyID)
 	var count int
 	var tokToday, tokMonth, tokTotal int64
 	if l.db != nil {
@@ -93,6 +102,15 @@ func (l *Limiter) ensureDay(keyID, day string) error {
 			FROM key_token_usage WHERE key_id=?`, day, day[:7], keyID).Scan(&tokToday, &tokMonth, &tokTotal); err != nil {
 			return err
 		}
+	}
+	for d, t := range l.unsaved[keyID] {
+		if d == day {
+			tokToday += t
+		}
+		if d[:7] == day[:7] {
+			tokMonth += t
+		}
+		tokTotal += t
 	}
 
 	l.mu.Lock()
@@ -195,12 +213,9 @@ func (l *Limiter) Acquire(keyID string, lim keys.Limits, now time.Time) (func(co
 			}
 			l.ledgerMu.Lock()
 			defer l.ledgerMu.Unlock()
-			if l.db != nil {
-				// Charge the day the request was admitted on, matching the
-				// in-memory counters below.
-				_, _ = l.db.Exec(`INSERT INTO key_token_usage(key_id, day, tokens) VALUES(?,?,?)
-					ON CONFLICT(key_id, day) DO UPDATE SET tokens = tokens + excluded.tokens`, keyID, day, tokens)
-			}
+			// Charge the day the request was admitted on, matching the
+			// in-memory counters below.
+			l.chargeLocked(keyID, day, tokens)
 			l.mu.Lock()
 			if ks.day == day {
 				ks.tokToday += tokens
@@ -212,6 +227,46 @@ func (l *Limiter) Acquire(keyID string, lim keys.Limits, now time.Time) (func(co
 			l.mu.Unlock()
 		})
 	}, nil
+}
+
+// chargeLocked records tokens for keyID on day in the ledger, first retrying
+// earlier failed charges of the key. A charge the ledger rejects is kept in
+// l.unsaved. Callers hold l.ledgerMu.
+func (l *Limiter) chargeLocked(keyID, day string, tokens int64) {
+	if l.db == nil {
+		return
+	}
+	l.flushUnsavedLocked(keyID)
+	if err := l.writeLedger(keyID, day, tokens); err != nil {
+		slog.Warn("token ledger write failed; keeping charge in memory for retry",
+			"key_id", keyID, "day", day, "tokens", tokens, "err", err)
+		if l.unsaved[keyID] == nil {
+			l.unsaved[keyID] = map[string]int64{}
+		}
+		l.unsaved[keyID][day] += tokens
+	}
+}
+
+// flushUnsavedLocked retries keyID's failed charges, dropping each one the
+// ledger accepts. Callers hold l.ledgerMu.
+func (l *Limiter) flushUnsavedLocked(keyID string) {
+	pending := l.unsaved[keyID]
+	if l.db == nil || len(pending) == 0 {
+		return
+	}
+	for d, t := range pending {
+		if err := l.writeLedger(keyID, d, t); err != nil {
+			return
+		}
+		delete(pending, d)
+	}
+	delete(l.unsaved, keyID)
+}
+
+func (l *Limiter) writeLedger(keyID, day string, tokens int64) error {
+	_, err := l.db.Exec(`INSERT INTO key_token_usage(key_id, day, tokens) VALUES(?,?,?)
+		ON CONFLICT(key_id, day) DO UPDATE SET tokens = tokens + excluded.tokens`, keyID, day, tokens)
+	return err
 }
 
 // tokenQuotaError reports the first exhausted token quota, or nil.
@@ -250,6 +305,7 @@ func (l *Limiter) ResetTokens(keyID string) error {
 			return err
 		}
 	}
+	delete(l.unsaved, keyID)
 	l.mu.Lock()
 	if ks := l.states[keyID]; ks != nil {
 		ks.tokToday, ks.tokMonth, ks.tokTotal = 0, 0, 0

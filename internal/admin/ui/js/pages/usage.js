@@ -114,6 +114,9 @@ export function renderUsage(container, ctx) {
   // Only the latest load may render: a slower, superseded response must not
   // overwrite figures for the filters now shown in the controls and URL.
   let loadSeq = 0;
+  // Leaving the page invalidates any pending load, so a late response cannot
+  // rewrite the next page's URL or render into a detached tree.
+  ctx?.registerCleanup?.(() => { loadSeq += 1; });
   const load = async () => {
     const seq = ++loadSeq;
     bodyHost.classList.add('is-refetching');
@@ -128,11 +131,12 @@ export function renderUsage(container, ctx) {
       if (seq !== loadSeq) return;
       data = stats;
       if (keysRes?.keys) keyOptions = keysRes.keys.map((k) => ({ id: k.id, name: k.name }));
-      if (!modelFilter) {
-        const seen = new Set(modelOptions);
-        (stats.by_model || []).forEach((m) => seen.add(m.label));
-        modelOptions = [...seen].filter((m) => m && m !== '(unknown)').sort();
-      }
+      // Accumulate every model seen, and always offer the active filter: a
+      // shared #/usage?model=… URL must show (and be able to clear) that model.
+      const seen = new Set(modelOptions);
+      if (modelFilter) seen.add(modelFilter);
+      (stats.by_model || []).forEach((m) => seen.add(m.label));
+      modelOptions = [...seen].filter((m) => m && m !== '(unknown)').sort();
       syncHash();
       paintFilters();
       paint();
