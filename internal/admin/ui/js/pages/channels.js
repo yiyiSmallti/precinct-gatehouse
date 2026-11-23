@@ -619,7 +619,7 @@ export function renderChannels(container) {
       )
       : null;
 
-    root.append(toolbar, table, statsSheet);
+    root.append(...[toolbar, table, statsSheet].filter(Boolean));
   };
 
   loadRuntime();

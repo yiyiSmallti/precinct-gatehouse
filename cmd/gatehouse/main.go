@@ -46,9 +46,9 @@ const usage = `gatehouse — Precinct model gateway (OpenAI-compatible)
 
 Usage:
   gatehouse serve                      run the gateway
-  gatehouse apikey create --name N [--models a,b] [--groups g] [--rpm N] [--rpd N] [--concurrency N] [--ttl 0|720h] [--note s] [--json]
+  gatehouse apikey create --name N [--models a,b] [--groups g] [--rpm N] [--rpd N] [--concurrency N] [--tokens-daily N] [--tokens-monthly N] [--tokens-total N] [--ttl 0|720h] [--note s] [--json]
   gatehouse apikey list [--json]
-  gatehouse apikey update <id> [--name N] [--models a,b] [--groups g] [--rpm N] [--rpd N] [--concurrency N] [--ttl 0|720h] [--note s]
+  gatehouse apikey update <id> [--name N] [--models a,b] [--groups g] [--rpm N] [--rpd N] [--concurrency N] [--tokens-daily N] [--tokens-monthly N] [--tokens-total N] [--ttl 0|720h] [--note s]
   gatehouse apikey enable|disable|reset|delete <id>
   gatehouse admin set-password [--user admin]   (reads password from stdin)
   gatehouse token issue --name N [--ttl 24h] [--models p/m,...] [--groups g,...] [--max-tokens N] [--data-class internal]
@@ -133,23 +133,18 @@ func serve(args []string) error {
 		return exitErr(2)
 	}
 	cfg, err := config.Load(*cfgPath)
+	firstRun := false
 	if errors.Is(err, config.ErrNotFound) {
+		// No hand-written config is needed: start from a bootable default and
+		// let the web console fill in providers, routing and everything else.
 		if err := os.MkdirAll(filepath.Dir(*cfgPath), 0o700); err != nil {
 			return err
 		}
 		if err := os.WriteFile(*cfgPath, []byte(config.Sample), 0o600); err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, `No configuration found, so a sample was written to
-  %s
-
-Next steps:
-  1. Edit providers and routing_groups in that file.
-  2. Store each provider key:  gatehouse key set ds   (paste the key, then Enter)
-  3. Check it:                 gatehouse config check
-  4. Start again:              gatehouse serve
-`, *cfgPath)
-		return exitErr(2)
+		firstRun = true
+		cfg, err = config.Load(*cfgPath)
 	}
 	if err != nil {
 		return err
@@ -176,6 +171,9 @@ Next steps:
 		srv.Shutdown(context.Background())
 		return err
 	}
+	if firstRun {
+		log.Info("no configuration found; wrote a default one, configure everything from the web console", "file", *cfgPath)
+	}
 	log.Info("gatehouse listening", "addr", "http://"+ln.Addr().String()+"/v1", "mode", cfg.Mode, "token_file", tokPath)
 	if srv.PolicyDown {
 		log.Warn("policy plugin unavailable; org mode refuses every request with 503 (fail-closed)")
@@ -185,9 +183,6 @@ Next steps:
 	}
 	var admSrv *http.Server
 	if cfg.Admin.Listen != "" {
-		if !admin.HasPassword(srv.DB) {
-			log.Warn("admin password is not set; run `gatehouse admin set-password`")
-		}
 		adm := admin.New(admin.Deps{
 			DB:               srv.DB,
 			Keys:             srv.Keys,
@@ -206,6 +201,9 @@ Next steps:
 		}
 		admSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second}
 		log.Info("admin listening", "addr", "http://"+admLn.Addr().String()+"/admin/")
+		if code := adm.SetupCode(); code != "" {
+			fmt.Fprintf(os.Stderr, "\nOpen the console to create the admin account (one-time setup code %s):\n  http://%s/admin/#/setup?code=%s\n\n", code, admLn.Addr().String(), code)
+		}
 		defer admLn.Close()
 		go func() {
 			if err := admSrv.Serve(admLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
@@ -580,6 +578,9 @@ func apikeyCmd(args []string) error {
 	rpm := fs.Int("rpm", 0, "requests per minute limit (0 = unlimited)")
 	rpd := fs.Int("rpd", 0, "requests per day limit (0 = unlimited)")
 	conc := fs.Int("concurrency", 0, "max concurrent requests (0 = unlimited)")
+	tokDaily := fs.Int64("tokens-daily", 0, "daily token quota, prompt + completion (0 = unlimited)")
+	tokMonthly := fs.Int64("tokens-monthly", 0, "monthly token quota (0 = unlimited)")
+	tokTotal := fs.Int64("tokens-total", 0, "lifetime token quota (0 = unlimited)")
 	ttl := fs.Duration("ttl", 0, "lifetime, e.g. 720h (0 = never expires)")
 	note := fs.String("note", "", "optional note")
 	asJSON := fs.Bool("json", false, "print JSON")
@@ -619,6 +620,10 @@ func apikeyCmd(args []string) error {
 			RPD:         *rpd,
 			Concurrency: *conc,
 			Note:        *note,
+
+			TokensDaily:   *tokDaily,
+			TokensMonthly: *tokMonthly,
+			TokensTotal:   *tokTotal,
 		})
 		if err != nil {
 			return err
@@ -650,6 +655,10 @@ func apikeyCmd(args []string) error {
 			RPD:         *rpd,
 			Concurrency: *conc,
 			Note:        *note,
+
+			TokensDaily:   *tokDaily,
+			TokensMonthly: *tokMonthly,
+			TokensTotal:   *tokTotal,
 		})
 		if err != nil {
 			return err
@@ -667,7 +676,7 @@ func apikeyCmd(args []string) error {
 			return json.NewEncoder(os.Stdout).Encode(list)
 		}
 		tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tNAME\tPREFIX\tSTATE\tRPM/RPD/CONC\tMODELS\tGROUPS\tEXPIRES")
+		fmt.Fprintln(tw, "ID\tNAME\tPREFIX\tSTATE\tRPM/RPD/CONC\tTOKENS DAY/MONTH/TOTAL\tMODELS\tGROUPS\tEXPIRES")
 		now := time.Now()
 		for _, k := range list {
 			state := "enabled"
@@ -680,8 +689,9 @@ func apikeyCmd(args []string) error {
 			if k.ExpiresAt > 0 {
 				exp = time.Unix(k.ExpiresAt, 0).Format(time.RFC3339)
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d/%d/%d\t%s\t%s\t%s\n",
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d/%d/%d\t%d/%d/%d\t%s\t%s\t%s\n",
 				k.ID, k.Name, k.KeyPrefix, state, k.RPM, k.RPD, k.Concurrency,
+				k.TokensDaily, k.TokensMonthly, k.TokensTotal,
 				strings.Join(k.Models, ","), strings.Join(k.Groups, ","), exp)
 		}
 		tw.Flush()
@@ -709,6 +719,15 @@ func apikeyCmd(args []string) error {
 		}
 		if setFlags["concurrency"] {
 			patch.Concurrency = conc
+		}
+		if setFlags["tokens-daily"] {
+			patch.TokensDaily = tokDaily
+		}
+		if setFlags["tokens-monthly"] {
+			patch.TokensMonthly = tokMonthly
+		}
+		if setFlags["tokens-total"] {
+			patch.TokensTotal = tokTotal
 		}
 		if setFlags["note"] {
 			patch.Note = note

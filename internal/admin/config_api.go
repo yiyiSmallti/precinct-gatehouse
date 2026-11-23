@@ -114,6 +114,11 @@ func applySectionToRaw(raw *config.Config, section string, data json.RawMessage)
 			MaxBodyMB      *int                  `json:"max_body_mb"`
 			RequestLogDays *int                  `json:"request_log_days"`
 			Tokens         *config.TokenDefaults `json:"tokens"`
+			// Startup fields: optional, applied on the next restart.
+			Listen *string       `json:"listen"`
+			Admin  *config.Admin `json:"admin"`
+			Meter  *config.Meter `json:"meter"`
+			Audit  *config.Audit `json:"audit"`
 		}
 		if err := json.Unmarshal(data, &gen); err != nil {
 			return err
@@ -122,6 +127,26 @@ func applySectionToRaw(raw *config.Config, section string, data json.RawMessage)
 		raw.RequestLogDays = gen.RequestLogDays
 		if gen.Tokens != nil {
 			raw.Tokens = *gen.Tokens
+		}
+		if gen.Listen != nil {
+			raw.Listen = strings.TrimSpace(*gen.Listen)
+		}
+		if gen.Admin != nil {
+			raw.Admin = *gen.Admin
+		}
+		if gen.Meter != nil {
+			// The console edits only endpoint and interval; keep collector
+			// headers (often auth) when the submission does not carry them.
+			if gen.Meter.OTLP != nil && gen.Meter.OTLP.Headers == nil && raw.Meter.OTLP != nil {
+				gen.Meter.OTLP.Headers = raw.Meter.OTLP.Headers
+			}
+			raw.Meter = *gen.Meter
+			if raw.Meter.OTLP != nil && strings.TrimSpace(raw.Meter.OTLP.Endpoint) == "" {
+				raw.Meter.OTLP = nil
+			}
+		}
+		if gen.Audit != nil {
+			raw.Audit = *gen.Audit
 		}
 	default:
 		return errors.New("unknown section: " + section)

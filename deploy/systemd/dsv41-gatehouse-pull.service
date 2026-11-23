@@ -1,0 +1,8 @@
+[Unit]
+Description=Pull and deploy Precinct Gatehouse updates from domestic OCI mirror
+After=network-online.target dsv41-gatehouse.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/AIOS/sglang-kunlun-v0522-1017/deploy-dsv41-1017/gateway/gatehouse/scripts/pull-and-deploy.sh --if-changed

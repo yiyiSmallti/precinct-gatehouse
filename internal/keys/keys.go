@@ -1,5 +1,5 @@
 // Package keys manages persistent API keys (sk-...) stored in SQLite with
-// per-key model/group scopes and request-count rate limits.
+// per-key model/group scopes, request-count rate limits and token quotas.
 package keys
 
 import (
@@ -29,11 +29,28 @@ var (
 	ErrExpired  = errors.New("api key has expired")
 )
 
-// Limits bounds how many requests a key may send. Zero means unlimited.
+// Limits bounds how many requests and tokens a key may use. Zero means unlimited.
+//
+// Token quotas count prompt + completion tokens of finished requests. They are
+// checked at admission, so the request that crosses a quota still completes;
+// the next one is refused.
 type Limits struct {
-	RPM         int `json:"rpm"`
-	RPD         int `json:"rpd"`
-	Concurrency int `json:"concurrency"`
+	RPM           int   `json:"rpm"`
+	RPD           int   `json:"rpd"`
+	Concurrency   int   `json:"concurrency"`
+	TokensDaily   int64 `json:"tokens_daily"`
+	TokensMonthly int64 `json:"tokens_monthly"`
+	TokensTotal   int64 `json:"tokens_total"`
+}
+
+func (l Limits) validate() error {
+	if l.RPM < 0 || l.RPD < 0 || l.Concurrency < 0 {
+		return fmt.Errorf("limits must be >= 0")
+	}
+	if l.TokensDaily < 0 || l.TokensMonthly < 0 || l.TokensTotal < 0 {
+		return fmt.Errorf("token quotas must be >= 0")
+	}
+	return nil
 }
 
 // Key is one API key record (plaintext secret is never stored).
@@ -61,6 +78,10 @@ type CreateOpts struct {
 	RPD         int
 	Concurrency int
 	Note        string
+
+	TokensDaily   int64
+	TokensMonthly int64
+	TokensTotal   int64
 }
 
 // Patch updates mutable fields on an existing API key.
@@ -74,6 +95,10 @@ type Patch struct {
 	RPD         *int
 	Concurrency *int
 	Note        *string
+
+	TokensDaily   *int64
+	TokensMonthly *int64
+	TokensTotal   *int64
 }
 
 type cacheEntry struct {
@@ -178,10 +203,8 @@ func validateCreateOpts(opts CreateOpts) error {
 	if strings.TrimSpace(opts.Name) == "" {
 		return fmt.Errorf("name is required")
 	}
-	if opts.RPM < 0 || opts.RPD < 0 || opts.Concurrency < 0 {
-		return fmt.Errorf("limits must be >= 0")
-	}
-	return nil
+	return Limits{RPM: opts.RPM, RPD: opts.RPD, Concurrency: opts.Concurrency,
+		TokensDaily: opts.TokensDaily, TokensMonthly: opts.TokensMonthly, TokensTotal: opts.TokensTotal}.validate()
 }
 
 func (s *Store) insertKey(plain string, opts CreateOpts) (Key, error) {
@@ -204,16 +227,19 @@ func (s *Store) insertKey(plain string, opts CreateOpts) (Key, error) {
 		Models:    models,
 		Groups:    groups,
 		Limits: Limits{
-			RPM:         opts.RPM,
-			RPD:         opts.RPD,
-			Concurrency: opts.Concurrency,
+			RPM:           opts.RPM,
+			RPD:           opts.RPD,
+			Concurrency:   opts.Concurrency,
+			TokensDaily:   opts.TokensDaily,
+			TokensMonthly: opts.TokensMonthly,
+			TokensTotal:   opts.TokensTotal,
 		},
 		Note: opts.Note,
 	}
-	_, err = s.db.Exec(`INSERT INTO api_keys(id,name,key_hash,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at)
-		VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?,0)`,
+	_, err = s.db.Exec(`INSERT INTO api_keys(id,name,key_hash,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total)
+		VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?,0,?,?,?)`,
 		k.ID, k.Name, hashSecret(plain), k.KeyPrefix, k.CreatedAt, k.ExpiresAt, string(mj), string(gj),
-		k.RPM, k.RPD, k.Concurrency, k.Note)
+		k.RPM, k.RPD, k.Concurrency, k.Note, k.TokensDaily, k.TokensMonthly, k.TokensTotal)
 	if err != nil {
 		return Key{}, err
 	}
@@ -251,7 +277,7 @@ func (s *Store) Lookup(plain string) (Key, error) {
 	if ok && now.Before(ce.expires) {
 		k = ce.key
 	} else {
-		row := s.db.QueryRow(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at
+		row := s.db.QueryRow(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total
 			FROM api_keys WHERE key_hash=? AND deleted_at IS NULL`, h)
 		var err error
 		k, err = scanKey(row)
@@ -282,7 +308,7 @@ func (s *Store) Lookup(plain string) (Key, error) {
 
 // List returns all non-deleted API keys ordered newest first.
 func (s *Store) List() ([]Key, error) {
-	rows, err := s.db.Query(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at
+	rows, err := s.db.Query(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total
 		FROM api_keys WHERE deleted_at IS NULL ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
@@ -301,7 +327,7 @@ func (s *Store) List() ([]Key, error) {
 
 // Get returns one non-deleted API key by id.
 func (s *Store) Get(id string) (Key, error) {
-	row := s.db.QueryRow(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at
+	row := s.db.QueryRow(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total
 		FROM api_keys WHERE id=? AND deleted_at IS NULL`, id)
 	k, err := scanKey(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -353,6 +379,18 @@ func (s *Store) Update(id string, p Patch) (Key, error) {
 		}
 		cur.Concurrency = *p.Concurrency
 	}
+	if p.TokensDaily != nil {
+		cur.TokensDaily = *p.TokensDaily
+	}
+	if p.TokensMonthly != nil {
+		cur.TokensMonthly = *p.TokensMonthly
+	}
+	if p.TokensTotal != nil {
+		cur.TokensTotal = *p.TokensTotal
+	}
+	if err := cur.Limits.validate(); err != nil {
+		return Key{}, err
+	}
 	if p.Note != nil {
 		cur.Note = *p.Note
 	}
@@ -362,8 +400,9 @@ func (s *Store) Update(id string, p Patch) (Key, error) {
 	if cur.Enabled {
 		en = 1
 	}
-	res, err := s.db.Exec(`UPDATE api_keys SET name=?,expires_at=?,enabled=?,models=?,groups=?,rpm=?,rpd=?,concurrency=?,note=? WHERE id=? AND deleted_at IS NULL`,
-		cur.Name, cur.ExpiresAt, en, string(mj), string(gj), cur.RPM, cur.RPD, cur.Concurrency, cur.Note, id)
+	res, err := s.db.Exec(`UPDATE api_keys SET name=?,expires_at=?,enabled=?,models=?,groups=?,rpm=?,rpd=?,concurrency=?,note=?,tokens_daily=?,tokens_monthly=?,tokens_total=? WHERE id=? AND deleted_at IS NULL`,
+		cur.Name, cur.ExpiresAt, en, string(mj), string(gj), cur.RPM, cur.RPD, cur.Concurrency, cur.Note,
+		cur.TokensDaily, cur.TokensMonthly, cur.TokensTotal, id)
 	if err != nil {
 		return Key{}, err
 	}
@@ -450,7 +489,8 @@ func scanKey(sc scanner) (Key, error) {
 	var en int
 	var mj, gj string
 	if err := sc.Scan(&k.ID, &k.Name, &k.KeyPrefix, &k.CreatedAt, &k.ExpiresAt, &en, &mj, &gj,
-		&k.RPM, &k.RPD, &k.Concurrency, &k.Note, &k.LastUsedAt); err != nil {
+		&k.RPM, &k.RPD, &k.Concurrency, &k.Note, &k.LastUsedAt,
+		&k.TokensDaily, &k.TokensMonthly, &k.TokensTotal); err != nil {
 		return Key{}, err
 	}
 	k.Enabled = en != 0

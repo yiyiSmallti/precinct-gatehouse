@@ -42,10 +42,11 @@ type Deps struct {
 
 // Server serves the /admin/ Web UI and /admin/api/* JSON API.
 type Server struct {
-	deps Deps
-	auth *authStore
-	ui   fs.FS
-	mux  *http.ServeMux
+	deps  Deps
+	auth  *authStore
+	setup setupState
+	ui    fs.FS
+	mux   *http.ServeMux
 }
 
 // New constructs an admin HTTP handler.
@@ -82,6 +83,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/", s.handleStatic())
 
 	s.mux.HandleFunc("POST /admin/api/login", s.login)
+	s.mux.HandleFunc("GET /admin/api/setup", s.setupStatus)
+	s.mux.HandleFunc("POST /admin/api/setup", s.completeSetup)
 	s.mux.HandleFunc("POST /admin/api/logout", s.guard(s.logout))
 	s.mux.HandleFunc("GET /admin/api/me", s.guard(s.me))
 	s.mux.HandleFunc("GET /admin/api/overview", s.guard(s.overview))
@@ -89,9 +92,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /admin/api/keys", s.guard(s.createKey))
 	s.mux.HandleFunc("PATCH /admin/api/keys/{id}", s.guard(s.updateKey))
 	s.mux.HandleFunc("POST /admin/api/keys/{id}/reset", s.guard(s.resetKey))
+	s.mux.HandleFunc("POST /admin/api/keys/{id}/reset-usage", s.guard(s.resetKeyUsage))
 	s.mux.HandleFunc("DELETE /admin/api/keys/{id}", s.guard(s.deleteKey))
 	s.mux.HandleFunc("GET /admin/api/logs", s.guard(s.logs))
 	s.mux.HandleFunc("GET /admin/api/usage", s.guard(s.usage))
+	s.mux.HandleFunc("GET /admin/api/stats", s.guard(s.stats))
 	s.mux.HandleFunc("GET /admin/api/channels", s.guard(s.channels))
 	s.mux.HandleFunc("GET /admin/api/redaction", s.guard(s.redactionInfo))
 	s.mux.HandleFunc("POST /admin/api/redaction/try", s.guard(s.redactionTry))
@@ -261,7 +266,7 @@ func (s *Server) overview(w http.ResponseWriter, _ *http.Request, _ string) {
 	}
 
 	// 24 hourly buckets ending at current local hour.
-	curHour := now.Local().Truncate(time.Hour)
+	curHour := localHour(now)
 	startHour := curHour.Add(-23 * time.Hour)
 	type hourBucket struct {
 		Hour     string `json:"hour"`
@@ -372,6 +377,10 @@ type keyView struct {
 	Inflight  int    `json:"inflight"`
 	RPMUsed   int    `json:"rpm_used"`
 	TodayUsed int    `json:"today_used"`
+
+	TokensToday int64 `json:"tokens_today"`
+	TokensMonth int64 `json:"tokens_month"`
+	TokensUsed  int64 `json:"tokens_used"` // lifetime, compared with tokens_total
 }
 
 func (s *Server) makeKeyView(k keys.Key, now time.Time) keyView {
@@ -388,6 +397,10 @@ func (s *Server) makeKeyView(k keys.Key, now time.Time) keyView {
 		Inflight:  snap.Inflight,
 		RPMUsed:   snap.RPMUsed,
 		TodayUsed: snap.TodayUsed,
+
+		TokensToday: snap.TokensToday,
+		TokensMonth: snap.TokensMonth,
+		TokensUsed:  snap.TokensTotal,
 	}
 }
 
@@ -415,6 +428,10 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request, _ string) {
 		Concurrency int      `json:"concurrency"`
 		ExpiresAt   int64    `json:"expires_at"`
 		Note        string   `json:"note"`
+
+		TokensDaily   int64 `json:"tokens_daily"`
+		TokensMonthly int64 `json:"tokens_monthly"`
+		TokensTotal   int64 `json:"tokens_total"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid json")
@@ -429,6 +446,10 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request, _ string) {
 		RPD:         req.RPD,
 		Concurrency: req.Concurrency,
 		Note:        req.Note,
+
+		TokensDaily:   req.TokensDaily,
+		TokensMonthly: req.TokensMonthly,
+		TokensTotal:   req.TokensTotal,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -452,6 +473,10 @@ func (s *Server) updateKey(w http.ResponseWriter, r *http.Request, _ string) {
 		ExpiresAt   *int64    `json:"expires_at"`
 		Note        *string   `json:"note"`
 		Enabled     *bool     `json:"enabled"`
+
+		TokensDaily   *int64 `json:"tokens_daily"`
+		TokensMonthly *int64 `json:"tokens_monthly"`
+		TokensTotal   *int64 `json:"tokens_total"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid json")
@@ -467,6 +492,10 @@ func (s *Server) updateKey(w http.ResponseWriter, r *http.Request, _ string) {
 		ExpiresAt:   req.ExpiresAt,
 		Note:        req.Note,
 		Enabled:     req.Enabled,
+
+		TokensDaily:   req.TokensDaily,
+		TokensMonthly: req.TokensMonthly,
+		TokensTotal:   req.TokensTotal,
 	})
 	if errors.Is(err, keys.ErrNotFound) {
 		writeJSONError(w, http.StatusNotFound, err.Error())
@@ -494,6 +523,25 @@ func (s *Server) resetKey(w http.ResponseWriter, r *http.Request, _ string) {
 		"key":     plain,
 		"api_key": s.makeKeyView(k, time.Now()),
 	})
+}
+
+// resetKeyUsage clears the token ledger of a key so its quotas start over.
+func (s *Server) resetKeyUsage(w http.ResponseWriter, r *http.Request, _ string) {
+	id := r.PathValue("id")
+	k, err := s.deps.Keys.Get(id)
+	if errors.Is(err, keys.ErrNotFound) {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.deps.Limiter.ResetTokens(id); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"api_key": s.makeKeyView(k, time.Now())})
 }
 
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request, _ string) {

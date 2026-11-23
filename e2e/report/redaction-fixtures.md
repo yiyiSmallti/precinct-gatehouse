@@ -1,6 +1,6 @@
 # 脱敏规则包样本集
 
-结果：**通过** · 运行于 2026-11-22 06:13:02 PST · darwin/arm64
+结果：**通过** · 运行于 2026-11-22 21:28:50 PST · darwin/arm64
 
 `fixtures/redaction/samples.tsv` 每行：期望类别（逗号分隔，`-` 表示不应检出）、文本。经 `gatehouse redact try --json` 检测，比较检出类别与期望。
 

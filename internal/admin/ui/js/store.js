@@ -83,6 +83,11 @@ export const store = {
         max_body_mb: raw.max_body_mb ?? 32,
         request_log_days: raw.request_log_days ?? 90,
         tokens: { default_ttl: raw.tokens?.default_ttl || '' },
+        listen: raw.listen || '',
+        admin: { listen: raw.admin?.listen || '', session_ttl: raw.admin?.session_ttl || '' },
+        // Keep every OTLP field (headers carry collector auth); the form edits only endpoint/interval.
+        meter: { otlp: raw.meter?.otlp ? { ...raw.meter.otlp, endpoint: raw.meter.otlp.endpoint || '', interval: raw.meter.otlp.interval || '' } : null },
+        audit: { dir: raw.audit?.dir || '' },
       });
     }
     return {};
