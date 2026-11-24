@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS request_log (
   cached_tokens     INTEGER NOT NULL DEFAULT 0,
   latency_ms        INTEGER NOT NULL DEFAULT 0,
   ttft_ms           INTEGER NOT NULL DEFAULT 0,
+  body_read_ms      INTEGER NOT NULL DEFAULT 0,
+  request_bytes     INTEGER NOT NULL DEFAULT 0,
   admitted          INTEGER NOT NULL DEFAULT 0,
   redaction_mode    TEXT NOT NULL DEFAULT '',
   redaction_count   INTEGER NOT NULL DEFAULT 0,
@@ -131,6 +133,14 @@ func Open(dataDir string) (*sql.DB, error) {
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
 	}
 	if err := ensureColumn(db, "request_log", "route_reason", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	if err := ensureColumn(db, "request_log", "body_read_ms", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	if err := ensureColumn(db, "request_log", "request_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
 	}

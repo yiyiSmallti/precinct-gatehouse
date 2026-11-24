@@ -609,7 +609,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {
 		}
 	}
 	sqlStr := `SELECT id,request_id,ts,day,key_id,key_name,protocol,client_ip,requested_model,model,
-		status,error_code,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,admitted,
+		status,error_code,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,body_read_ms,request_bytes,admitted,
 		redaction_mode,redaction_count,route_backend,route_reason
 		FROM request_log`
 	if len(where) > 0 {
@@ -644,6 +644,8 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {
 		CachedTokens     int    `json:"cached_tokens"`
 		LatencyMS        int64  `json:"latency_ms"`
 		TTFTMS           int64  `json:"ttft_ms"`
+		BodyReadMS       int64  `json:"body_read_ms"`
+		RequestBytes     int64  `json:"request_bytes"`
 		Admitted         bool   `json:"admitted"`
 		RedactionMode    string `json:"redaction_mode"`
 		RedactionCount   int    `json:"redaction_count"`
@@ -658,7 +660,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {
 		if err := rows.Scan(&row.ID, &row.RequestID, &row.TS, &row.Day, &row.KeyID, &row.KeyName,
 			&row.Protocol, &row.ClientIP, &row.RequestedModel, &row.Model,
 			&row.Status, &row.ErrorCode, &streamInt, &row.PromptTokens, &row.CompletionTokens,
-			&row.CachedTokens, &row.LatencyMS, &row.TTFTMS, &admInt,
+			&row.CachedTokens, &row.LatencyMS, &row.TTFTMS, &row.BodyReadMS, &row.RequestBytes, &admInt,
 			&row.RedactionMode, &row.RedactionCount, &row.RouteBackend, &row.RouteReason); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return

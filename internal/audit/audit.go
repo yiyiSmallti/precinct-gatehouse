@@ -40,6 +40,8 @@ type Record struct {
 	PromptTokens     int        `json:"prompt_tokens,omitempty"`
 	CompletionTokens int        `json:"completion_tokens,omitempty"`
 	LatencyMS        int64      `json:"latency_ms"`
+	BodyReadMS       int64      `json:"body_read_ms,omitempty"`
+	RequestBytes     int64      `json:"request_bytes,omitempty"`
 }
 
 // Attempt is one upstream try during failover.
