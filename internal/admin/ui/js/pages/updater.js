@@ -335,12 +335,11 @@ export function renderUpdater(container, ctx) {
       );
     }
 
-    const hasPwd = Boolean(cfgRaw.has_password || st.config?.has_password);
     const hasTok = Boolean(cfgRaw.has_token || st.config?.has_token);
 
     const sourceFields = activeSrc === 'oci'
       ? [
-        el('div', { className: 'opt-item' },
+        el('div', { className: 'opt-item', style: { gridColumn: '1 / -1' } },
           el('label', { className: 'field-label' }, '镜像地址'),
           el('input', {
             className: 'input mono',
@@ -349,23 +348,6 @@ export function renderUpdater(container, ctx) {
             onChange: (e) => setUpdater((n) => { n.image = e.target.value.trim(); }),
           })
         ),
-        el('div', { className: 'opt-item' },
-          el('label', { className: 'field-label' }, '用户名'),
-          el('input', {
-            className: 'input mono',
-            placeholder: '如 aliyun9166...',
-            value: u.username || '',
-            onChange: (e) => setUpdater((n) => { n.username = e.target.value.trim(); }),
-          })
-        ),
-        renderSecretItem({
-          kind: 'password',
-          fieldLabel: '仓库密码',
-          actionLabel: '密码',
-          configured: hasPwd,
-          ref: u.password_ref || cfgRaw.password_ref,
-          clearToast: '已清除仓库密码',
-        }),
       ]
       : [
         el('div', { className: 'opt-item' },
