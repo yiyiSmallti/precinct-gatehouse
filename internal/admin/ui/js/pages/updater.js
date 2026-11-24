@@ -512,20 +512,43 @@ export function renderUpdater(container, ctx) {
               : null
           )
         ),
-        el('div', { className: 'opt-item', style: { gridColumn: '1 / -1' } },
-          el('label', { className: 'field-label' }, '兜底 DNS 服务器（逗号分隔）'),
-          el('input', {
-            className: 'input mono',
-            placeholder: '留空使用默认 223.5.5.5, 119.29.29.29',
-            value: Array.isArray(u.fallback_dns) ? u.fallback_dns.join(', ') : '',
-            onChange: (e) => setUpdater((n) => {
-              const items = e.target.value.split(',').map((s) => s.trim()).filter(Boolean);
-              if (items.length) n.fallback_dns = items;
-              else delete n.fallback_dns;
-            }),
-          }),
-          el('p', { className: 'field-hint' }, '仅在系统 DNS 解析失败时自动使用 UDP 查询兜底，无需改动宿主机 /etc/resolv.conf。')
-        ),
+        (() => {
+          const dnsDisabled = Array.isArray(u.fallback_dns) && u.fallback_dns.length === 0;
+          return el('div', { className: 'opt-item', style: { gridColumn: '1 / -1' } },
+            el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap', marginBottom: '6px' } },
+              el('label', { className: 'field-label', style: { marginBottom: 0 } }, '兜底 DNS 服务器（逗号分隔）'),
+              el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+                createSwitch({
+                  checked: !dnsDisabled,
+                  label: '启用兜底 DNS',
+                  onChange: (on) => {
+                    setUpdater((n) => {
+                      if (on) delete n.fallback_dns;
+                      else n.fallback_dns = [];
+                    });
+                    paint();
+                  },
+                }),
+                el('span', { className: 'muted', style: { fontSize: '12px' } }, dnsDisabled ? '已显式禁用' : '已启用')
+              )
+            ),
+            dnsDisabled
+              ? el('p', { className: 'field-hint', style: { margin: 0 } }, '已显式禁用外部兜底 DNS（fallback_dns: []），仅使用系统 DNS。')
+              : el('input', {
+                className: 'input mono',
+                placeholder: '留空使用默认 223.5.5.5, 119.29.29.29',
+                value: Array.isArray(u.fallback_dns) ? u.fallback_dns.join(', ') : '',
+                onChange: (e) => setUpdater((n) => {
+                  const items = e.target.value.split(',').map((s) => s.trim()).filter(Boolean);
+                  if (items.length) n.fallback_dns = items;
+                  else delete n.fallback_dns;
+                }),
+              }),
+            dnsDisabled
+              ? null
+              : el('p', { className: 'field-hint' }, '仅在系统 DNS 解析失败时自动使用 UDP 查询兜底，无需改动宿主机 /etc/resolv.conf。')
+          );
+        })(),
       ]
       : [
         el('div', { className: 'opt-item' },

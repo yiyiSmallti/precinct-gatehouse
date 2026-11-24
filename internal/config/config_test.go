@@ -1,7 +1,9 @@
 package config
 
 import (
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -190,6 +192,29 @@ updater:
 		}
 		if len(cfg.Updater.EffectiveFallbackDNS()) != 0 {
 			t.Fatalf("expected empty fallback DNS when explicitly [], got %v", cfg.Updater.EffectiveFallbackDNS())
+		}
+
+		// Round-trip through RawCopy + MarshalRaw + Parse must preserve fallback_dns: [] (and JSON [] serialization).
+		rawYAML, err := MarshalRaw(cfg.RawCopy())
+		if err != nil {
+			t.Fatalf("MarshalRaw failed: %v", err)
+		}
+		if !strings.Contains(string(rawYAML), "fallback_dns: []") {
+			t.Fatalf("expected MarshalRaw to preserve 'fallback_dns: []', got:\n%s", string(rawYAML))
+		}
+		reloaded, err := Parse(rawYAML, filepath.Join(dir, "gh-roundtrip.yaml"))
+		if err != nil {
+			t.Fatalf("re-Parse failed: %v", err)
+		}
+		if len(reloaded.Updater.EffectiveFallbackDNS()) != 0 {
+			t.Fatalf("expected empty EffectiveFallbackDNS after round-trip, got %v", reloaded.Updater.EffectiveFallbackDNS())
+		}
+		jb, err := json.Marshal(reloaded.RawCopy().Updater)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(jb), `"fallback_dns":[]`) {
+			t.Fatalf("expected JSON to preserve '\"fallback_dns\":[]', got %s", string(jb))
 		}
 	})
 

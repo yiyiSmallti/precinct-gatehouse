@@ -259,3 +259,118 @@ func TestAdminUpdaterEndpointsAndSecretHandling(t *testing.T) {
 		t.Fatal("expected db:password secret deleted")
 	}
 }
+
+func TestAdminPreservesEmptyFallbackDNSAcrossSaves(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	db, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := SetPassword(db, "admin", "admin-pass-123"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	initialYAML := "listen: 127.0.0.1:17788\nmode: personal\ndata_dir: " + dataDir + "\nupdater:\n  source: oci\n  image: registry.example.com/smallti/gatehouse\n  fallback_dns: []\n"
+	if err := os.WriteFile(cfgPath, []byte(initialYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveMgr, err := live.New(cfg, func(c *config.Config, _ *live.Snapshot) (*live.Snapshot, error) {
+		return &live.Snapshot{Cfg: c}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updMgr := updater.NewManager(updater.Deps{
+		CurrentVersion: "v0.1.1",
+		ConfigPath:     cfgPath,
+		Live:           liveMgr,
+		DB:             db,
+	})
+	srv := New(Deps{DB: db, Live: liveMgr, Updater: updMgr, Version: "v0.1.1"})
+
+	loginReq, _ := http.NewRequest(http.MethodPost, "/admin/api/login", bytes.NewReader([]byte(`{"username":"admin","password":"admin-pass-123"}`)))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	srv.ServeHTTP(loginRec, loginReq)
+	var sessionCookie *http.Cookie
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == cookieName {
+			sessionCookie = c
+		}
+	}
+	doReq := func(method, path string, body any) *httptest.ResponseRecorder {
+		var buf bytes.Buffer
+		if body != nil {
+			_ = json.NewEncoder(&buf).Encode(body)
+		}
+		req, _ := http.NewRequest(method, path, &buf)
+		req.AddCookie(sessionCookie)
+		if method != http.MethodGet {
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Gatehouse-Admin", "1")
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Save unrelated general section while updater.fallback_dns is [].
+	var cfg1 map[string]any
+	_ = json.Unmarshal(doReq(http.MethodGet, "/admin/api/config", nil).Body.Bytes(), &cfg1)
+	h1, _ := cfg1["hash"].(string)
+	genRec := doReq(http.MethodPut, "/admin/api/config/sections/general", map[string]any{
+		"base_hash": h1,
+		"data": map[string]any{
+			"max_body_mb":      16,
+			"request_log_days": 30,
+		},
+	})
+	if genRec.Code != http.StatusOK {
+		t.Fatalf("put general failed: %d %s", genRec.Code, genRec.Body.String())
+	}
+	var genRes map[string]any
+	_ = json.Unmarshal(genRec.Body.Bytes(), &genRes)
+	h2, _ := genRes["hash"].(string)
+
+	// 2. Save updater secret (triggers MarshalRaw serialization).
+	secRec := doReq(http.MethodPut, "/admin/api/updater/secret", map[string]string{
+		"kind":      "password",
+		"value":     "secret-pass",
+		"base_hash": h2,
+	})
+	if secRec.Code != http.StatusOK {
+		t.Fatalf("put secret failed: %d %s", secRec.Code, secRec.Body.String())
+	}
+
+	// 3. Verify disk YAML, GET /admin/api/config, and GET /admin/api/updater all keep fallback_dns: [].
+	diskBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(diskBytes), "fallback_dns: []") {
+		t.Fatalf("expected disk config.yaml to preserve 'fallback_dns: []', got:\n%s", string(diskBytes))
+	}
+	var cfg2 struct {
+		Raw struct {
+			Updater struct {
+				FallbackDNS *[]string `json:"fallback_dns"`
+			} `json:"updater"`
+		} `json:"raw"`
+	}
+	_ = json.Unmarshal(doReq(http.MethodGet, "/admin/api/config", nil).Body.Bytes(), &cfg2)
+	if cfg2.Raw.Updater.FallbackDNS == nil || len(*cfg2.Raw.Updater.FallbackDNS) != 0 {
+		t.Fatalf("expected raw.updater.fallback_dns=[] in GET /admin/api/config, got %+v", cfg2.Raw.Updater.FallbackDNS)
+	}
+	var st updater.Status
+	_ = json.Unmarshal(doReq(http.MethodGet, "/admin/api/updater", nil).Body.Bytes(), &st)
+	if st.Config.FallbackDNS == nil || len(st.Config.FallbackDNS) != 0 {
+		t.Fatalf("expected empty non-nil fallback_dns in GET /admin/api/updater, got %#v", st.Config.FallbackDNS)
+	}
+}

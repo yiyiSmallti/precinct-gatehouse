@@ -62,6 +62,14 @@ func (s *Server) Inflight() int64 {
 	return s.Pipeline.Inflight()
 }
 
+// SetDraining toggles data-plane admission quiescing during update cutovers.
+func (s *Server) SetDraining(draining bool) {
+	if s == nil || s.Pipeline == nil {
+		return
+	}
+	s.Pipeline.SetDraining(draining)
+}
+
 // ResolveKey resolves a provider key_ref, reading db:NAME from settings and
 // delegating other references (env:, keychain:, file:) to keystore.Resolve.
 func ResolveKey(db *sql.DB, ref string) (string, error) {

@@ -907,3 +907,192 @@ func TestSupervisorSyncsHomeDirOnHotReload(t *testing.T) {
 		t.Fatalf("expected homeB .update_pending cleared after health check, got %+v", pending)
 	}
 }
+
+func TestStoreArchiveFallbackBinaryWhenBinLinkMissing(t *testing.T) {
+	home := t.TempDir()
+	st := NewStore(home)
+	st.PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+
+	fbDir := t.TempDir()
+	fbBin := filepath.Join(fbDir, binaryFilename())
+	if err := os.WriteFile(fbBin, []byte("fallback-running-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	res, err := st.Install(ctx, InstallRequest{
+		Version:            "v0.2.0",
+		Digest:             "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		Artifact:           makeStagedArtifactWithData(t, "v0.2.0", "new-binary"),
+		FallbackBinaryPath: fbBin,
+		KeepReleases:       5,
+		RecordPending:      true,
+	})
+	if err != nil {
+		t.Fatalf("Install with FallbackBinaryPath failed: %v", err)
+	}
+	if !strings.HasPrefix(res.PreviousVersion, "baseline-") {
+		t.Fatalf("expected archived baseline PreviousVersion, got %q", res.PreviousVersion)
+	}
+
+	pending, err := st.ReadPending()
+	if err != nil || pending == nil {
+		t.Fatalf("expected pending update, got %+v err=%v", pending, err)
+	}
+	if pending.PreviousVersion != res.PreviousVersion || pending.PreviousVersion == pending.TargetVersion {
+		t.Fatalf("expected distinct baseline PreviousVersion in pending update: %+v", pending)
+	}
+
+	if err := st.EmergencyRollback(pending.PreviousVersion, pending.PreviousDigest); err != nil {
+		t.Fatalf("EmergencyRollback to archived fallback baseline failed: %v", err)
+	}
+	activeBytes, err := os.ReadFile(st.BinLink())
+	if err != nil {
+		if target := st.releaseBinaryPath(st.CurrentVersion()); target != "" {
+			activeBytes, err = os.ReadFile(target)
+		}
+	}
+	if err != nil || string(activeBytes) != "fallback-running-binary" {
+		t.Fatalf("expected restored fallback binary contents, got %q err=%v", string(activeBytes), err)
+	}
+}
+
+func TestManagerQuiescesAdmissionAndRestoresOnFailure(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(home, "data")
+	db, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	liveMgr, cfgPath := newTestLiveManager(t, fmt.Sprintf(`listen: 127.0.0.1:17788
+mode: personal
+data_dir: %s
+updater:
+  enabled: true
+  source: oci
+  image: registry.example.com/smallti/gatehouse
+  home_dir: %s
+  drain_timeout: 5s
+`, dataDir, home))
+
+	src := &fakeSource{
+		remote: &RemoteInfo{Source: "oci", Version: "v0.2.0", Digest: "sha256:quiesce1"},
+		artifact: &DownloadedArtifact{
+			Version: "v0.2.0",
+			Remote:  RemoteInfo{Source: "oci", Version: "v0.2.0", Digest: "sha256:quiesce1"},
+		},
+	}
+
+	t.Run("quiesces_before_drain_check_and_stays_drained_on_restart", func(t *testing.T) {
+		var draining atomic.Bool
+		var sawDrainingBeforeInflight bool
+		var restarted atomic.Int32
+		var inflightCalls atomic.Int32
+
+		mgr := NewManager(Deps{
+			CurrentVersion: "v0.1.1",
+			ConfigPath:     cfgPath,
+			Live:           liveMgr,
+			DB:             db,
+			Inflight: func() int64 {
+				inflightCalls.Add(1)
+				if draining.Load() {
+					sawDrainingBeforeInflight = true
+				}
+				return 0
+			},
+			SetDraining: func(d bool) {
+				draining.Store(d)
+			},
+			RequestRestart: func() {
+				restarted.Add(1)
+			},
+			NewSource: func(_ config.Updater, _ string) (ArtifactSource, error) {
+				return src, nil
+			},
+		})
+		mgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error {
+			if draining.Load() {
+				t.Fatal("SetDraining(true) should only run after preflight succeeds")
+			}
+			return nil
+		}
+
+		res, err := mgr.Apply(context.Background(), ApplyOptions{})
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if res.Version != "v0.2.0" {
+			t.Fatalf("expected v0.2.0, got %q", res.Version)
+		}
+		if inflightCalls.Load() == 0 || !sawDrainingBeforeInflight {
+			t.Fatalf("expected SetDraining(true) before checking Inflight() (calls=%d saw=%v)", inflightCalls.Load(), sawDrainingBeforeInflight)
+		}
+		if !draining.Load() {
+			t.Fatal("expected draining to remain true while shutting down for restart")
+		}
+	})
+
+	t.Run("restores_admission_when_drain_or_rollback_fails", func(t *testing.T) {
+		var draining atomic.Bool
+		var events []bool
+		var mu sync.Mutex
+		record := func(d bool) {
+			draining.Store(d)
+			mu.Lock()
+			events = append(events, d)
+			mu.Unlock()
+		}
+
+		mgr := NewManager(Deps{
+			CurrentVersion: "v0.2.0",
+			ConfigPath:     cfgPath,
+			Live:           liveMgr,
+			DB:             db,
+			Inflight:       func() int64 { return 1 },
+			SetDraining:    record,
+			RequestRestart: func() {},
+			NewSource:      func(_ config.Updater, _ string) (ArtifactSource, error) { return src, nil },
+		})
+		mgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				if draining.Load() {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			cancel()
+		}()
+
+		if _, err := mgr.Apply(ctx, ApplyOptions{}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled on cancelled drain, got %v", err)
+		}
+		if draining.Load() {
+			t.Fatal("expected SetDraining(false) called after drain cancellation")
+		}
+
+		// Also verify rollback failure after SetDraining(true) restores admission.
+		events = nil
+		mgr2 := NewManager(Deps{
+			CurrentVersion: "v0.2.0",
+			ConfigPath:     cfgPath,
+			Live:           liveMgr,
+			DB:             db,
+			Inflight:       func() int64 { return 0 },
+			SetDraining:    record,
+			RequestRestart: func() {},
+		})
+		if _, err := mgr2.Rollback(context.Background(), RollbackOptions{TargetVersion: "missing-version"}); err == nil {
+			t.Fatal("expected rollback error for missing target version")
+		}
+		if draining.Load() || len(events) < 2 || !events[0] || events[len(events)-1] {
+			t.Fatalf("expected [true ..., false] draining transitions on failed rollback, got %v (final=%v)", events, draining.Load())
+		}
+	})
+}

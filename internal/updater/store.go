@@ -224,13 +224,14 @@ func (s *Store) Preflight(ctx context.Context, binPath, configPath string) error
 
 // InstallRequest describes a validated artifact ready to be installed into releases/.
 type InstallRequest struct {
-	Version       string
-	Digest        string
-	Artifact      VerifiedArtifact
-	ConfigPath    string
-	KeepReleases  int
-	RecordPending bool
-	SkipPreflight bool
+	Version            string
+	Digest             string
+	Artifact           VerifiedArtifact
+	ConfigPath         string
+	FallbackBinaryPath string
+	KeepReleases       int
+	RecordPending      bool
+	SkipPreflight      bool
 }
 
 // InstallResult summarizes the state changes produced by Install.
@@ -271,7 +272,7 @@ func (s *Store) Install(ctx context.Context, req InstallRequest) (InstallResult,
 		}
 	}
 
-	if err := s.archiveBaselineIfRegularFile(); err != nil {
+	if err := s.archiveBaseline(req.FallbackBinaryPath); err != nil {
 		return InstallResult{}, fmt.Errorf("archive baseline binary: %w", err)
 	}
 
@@ -575,45 +576,107 @@ func (s *Store) resolveRollbackTarget(curVer string) string {
 	return ""
 }
 
-func (s *Store) archiveBaselineIfRegularFile() error {
+func (s *Store) archiveBaseline(fallbackBin string) error {
 	binPath := s.BinLink()
 	fi, err := os.Lstat(binPath)
-	if err != nil {
-		return nil // missing bin/gatehouse is fine
-	}
-	if fi.Mode()&os.ModeSymlink != 0 || fi.IsDir() {
+	switch {
+	case err == nil:
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if cur := s.CurrentVersion(); cur != "" && s.releaseBinaryPath(cur) != "" {
+				return nil
+			}
+			if fb := strings.TrimSpace(fallbackBin); fb != "" {
+				if st, serr := os.Stat(fb); serr == nil && !st.IsDir() {
+					return s.archiveBinaryAsBaseline(fb, "archived running fallback baseline")
+				}
+			}
+			return nil
+		}
+		if fi.IsDir() {
+			return nil
+		}
+		// On Windows where bin/gatehouse.exe is a regular file, only archive if no current release exists yet.
+		if cur := readTrimmedFile(filepath.Join(s.HomeDir, currentVerFileName)); cur != "" && s.releaseBinaryPath(cur) != "" {
+			return nil
+		}
+		return s.archiveBinaryAsBaseline(binPath, "archived pre-updater baseline")
+
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+
+	default:
+		if cur := s.CurrentVersion(); cur != "" && s.releaseBinaryPath(cur) != "" {
+			return nil
+		}
+		if fb := strings.TrimSpace(fallbackBin); fb != "" {
+			if st, serr := os.Stat(fb); serr == nil && !st.IsDir() {
+				return s.archiveBinaryAsBaseline(fb, "archived running fallback baseline")
+			}
+		}
 		return nil
 	}
-	// On Windows where bin/gatehouse.exe is a regular file, only archive if no current release exists yet.
-	if cur := readTrimmedFile(filepath.Join(s.HomeDir, currentVerFileName)); cur != "" && s.releaseBinaryPath(cur) != "" {
-		return nil
-	}
-	baseVer := "baseline-" + time.Now().UTC().Format("20060102150405")
-	baseDir := filepath.Join(s.ReleasesDir(), baseVer)
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+}
+
+func (s *Store) archiveBinaryAsBaseline(srcBin, note string) error {
+	if err := os.MkdirAll(s.BinDir(), 0o755); err != nil {
 		return err
 	}
+	if err := os.MkdirAll(s.ReleasesDir(), 0o755); err != nil {
+		return err
+	}
+	baseVer := "baseline-" + time.Now().UTC().Format("20060102150405")
+	if _, err := os.Stat(filepath.Join(s.ReleasesDir(), baseVer)); !errors.Is(err, os.ErrNotExist) {
+		for i := 2; ; i++ {
+			cand := fmt.Sprintf("%s-%d", baseVer, i)
+			if _, cerr := os.Stat(filepath.Join(s.ReleasesDir(), cand)); errors.Is(cerr, os.ErrNotExist) {
+				baseVer = cand
+				break
+			}
+		}
+	}
+
+	tmpDir, err := os.MkdirTemp(s.ReleasesDir(), ".tmp-baseline-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tmpDir != "" {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
+
 	binName := binaryFilename()
-	dstBin := filepath.Join(baseDir, binName)
-	if err := copyFile(binPath, dstBin, 0o755); err != nil {
+	dstBin := filepath.Join(tmpDir, binName)
+	if err := copyFile(srcBin, dstBin, 0o755); err != nil {
 		return err
 	}
 	shaHex, err := SHA256File(dstBin)
 	if err != nil {
 		return err
 	}
-	_ = os.WriteFile(filepath.Join(baseDir, "SHA256SUMS"), []byte(fmt.Sprintf("%s  %s\n", shaHex, binName)), 0o644)
+	if err := os.WriteFile(filepath.Join(tmpDir, "SHA256SUMS"), []byte(fmt.Sprintf("%s  %s\n", shaHex, binName)), 0o644); err != nil {
+		return err
+	}
 	meta := ReleaseMeta{
 		Version:      baseVer,
 		BinarySHA256: shaHex,
 		BuiltAt:      time.Now().UTC().Format(time.RFC3339),
-		Note:         "archived pre-updater baseline",
+		Note:         note,
 	}
 	if mb, err := json.MarshalIndent(meta, "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(baseDir, "RELEASE_META"), append(mb, '\n'), 0o644)
+		if err := os.WriteFile(filepath.Join(tmpDir, "RELEASE_META"), append(mb, '\n'), 0o644); err != nil {
+			return err
+		}
 	}
+
+	baseDir := filepath.Join(s.ReleasesDir(), baseVer)
+	if err := os.Rename(tmpDir, baseDir); err != nil {
+		return err
+	}
+	tmpDir = ""
+
 	relTarget := filepath.Join("..", "releases", baseVer, binName)
-	if err := atomicSwapBinary(binPath, relTarget, dstBin); err != nil {
+	if err := atomicSwapBinary(s.BinLink(), relTarget, filepath.Join(baseDir, binName)); err != nil {
 		return err
 	}
 	return atomicWriteFile(filepath.Join(s.HomeDir, currentVerFileName), []byte(baseVer+"\n"), 0o644)

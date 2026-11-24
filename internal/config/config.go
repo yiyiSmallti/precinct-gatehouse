@@ -62,27 +62,27 @@ type Admin struct {
 
 // Updater configures built-in self-update checking, downloading, verification and cutover.
 type Updater struct {
-	Enabled          bool     `yaml:"enabled,omitempty" json:"enabled"`
-	AutoApply        bool     `yaml:"auto_apply,omitempty" json:"auto_apply"`
-	Source           string   `yaml:"source,omitempty" json:"source,omitempty"` // oci | github
-	Interval         Duration `yaml:"interval,omitempty" json:"interval,omitempty"`
-	DrainTimeout     Duration `yaml:"drain_timeout,omitempty" json:"drain_timeout,omitempty"`
-	HealthTimeout    Duration `yaml:"health_timeout,omitempty" json:"health_timeout,omitempty"`
-	KeepReleases     int      `yaml:"keep_releases,omitempty" json:"keep_releases,omitempty"`
-	HomeDir          string   `yaml:"home_dir,omitempty" json:"home_dir,omitempty"`
-	FallbackDNS      []string `yaml:"fallback_dns,omitempty" json:"fallback_dns,omitempty"`
-	PublicKey        string   `yaml:"public_key,omitempty" json:"public_key,omitempty"`
-	RequireSignature *bool    `yaml:"require_signature,omitempty" json:"require_signature,omitempty"`
-	Image            string   `yaml:"image,omitempty" json:"image,omitempty"`
-	Tag              string   `yaml:"tag,omitempty" json:"tag,omitempty"`
-	Username         string   `yaml:"username,omitempty" json:"username,omitempty"`
-	PasswordRef      string   `yaml:"password_ref,omitempty" json:"password_ref,omitempty"`
-	HasPassword      bool     `yaml:"-" json:"has_password,omitempty"`
-	GitHubRepo       string   `yaml:"github_repo,omitempty" json:"github_repo,omitempty"`
-	GitHubAPIURL     string   `yaml:"github_api_url,omitempty" json:"github_api_url,omitempty"`
-	TokenRef         string   `yaml:"token_ref,omitempty" json:"token_ref,omitempty"`
-	HasToken         bool     `yaml:"-" json:"has_token,omitempty"`
-	Prerelease       bool     `yaml:"prerelease,omitempty" json:"prerelease,omitempty"`
+	Enabled          bool      `yaml:"enabled,omitempty" json:"enabled"`
+	AutoApply        bool      `yaml:"auto_apply,omitempty" json:"auto_apply"`
+	Source           string    `yaml:"source,omitempty" json:"source,omitempty"` // oci | github
+	Interval         Duration  `yaml:"interval,omitempty" json:"interval,omitempty"`
+	DrainTimeout     Duration  `yaml:"drain_timeout,omitempty" json:"drain_timeout,omitempty"`
+	HealthTimeout    Duration  `yaml:"health_timeout,omitempty" json:"health_timeout,omitempty"`
+	KeepReleases     int       `yaml:"keep_releases,omitempty" json:"keep_releases,omitempty"`
+	HomeDir          string    `yaml:"home_dir,omitempty" json:"home_dir,omitempty"`
+	FallbackDNS      *[]string `yaml:"fallback_dns,omitempty" json:"fallback_dns,omitempty"`
+	PublicKey        string    `yaml:"public_key,omitempty" json:"public_key,omitempty"`
+	RequireSignature *bool     `yaml:"require_signature,omitempty" json:"require_signature,omitempty"`
+	Image            string    `yaml:"image,omitempty" json:"image,omitempty"`
+	Tag              string    `yaml:"tag,omitempty" json:"tag,omitempty"`
+	Username         string    `yaml:"username,omitempty" json:"username,omitempty"`
+	PasswordRef      string    `yaml:"password_ref,omitempty" json:"password_ref,omitempty"`
+	HasPassword      bool      `yaml:"-" json:"has_password,omitempty"`
+	GitHubRepo       string    `yaml:"github_repo,omitempty" json:"github_repo,omitempty"`
+	GitHubAPIURL     string    `yaml:"github_api_url,omitempty" json:"github_api_url,omitempty"`
+	TokenRef         string    `yaml:"token_ref,omitempty" json:"token_ref,omitempty"`
+	HasToken         bool      `yaml:"-" json:"has_token,omitempty"`
+	Prerelease       bool      `yaml:"prerelease,omitempty" json:"prerelease,omitempty"`
 }
 
 // EffectiveSource returns "oci" or "github", inferring from Image or GitHubRepo when Source is empty.
@@ -128,7 +128,10 @@ func (u Updater) EffectiveTag() string {
 // empty slice disables fallback DNS.
 func (u Updater) EffectiveFallbackDNS() []string {
 	if u.FallbackDNS != nil {
-		return append([]string(nil), u.FallbackDNS...)
+		if len(*u.FallbackDNS) == 0 {
+			return []string{}
+		}
+		return append([]string(nil), (*u.FallbackDNS)...)
 	}
 	return []string{"223.5.5.5", "119.29.29.29"}
 }
@@ -582,14 +585,14 @@ func (c *Config) applyDefaults() {
 	if c.Updater.HomeDir != "" {
 		c.Updater.HomeDir = ExpandHome(strings.TrimSpace(c.Updater.HomeDir))
 	}
-	if len(c.Updater.FallbackDNS) > 0 {
-		cleaned := make([]string, 0, len(c.Updater.FallbackDNS))
-		for _, d := range c.Updater.FallbackDNS {
+	if c.Updater.FallbackDNS != nil {
+		cleaned := make([]string, 0, len(*c.Updater.FallbackDNS))
+		for _, d := range *c.Updater.FallbackDNS {
 			if s := strings.TrimSpace(d); s != "" {
 				cleaned = append(cleaned, s)
 			}
 		}
-		c.Updater.FallbackDNS = cleaned
+		c.Updater.FallbackDNS = &cleaned
 	}
 }
 

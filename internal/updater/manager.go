@@ -33,11 +33,13 @@ var ErrRestartUnavailable = errors.New("automatic restart requires running under
 // Deps configures a Manager.
 type Deps struct {
 	CurrentVersion  string
+	CurrentBinary   string
 	ConfigPath      string
 	Live            *live.Manager
 	StaticConfig    *config.Updater
 	DB              *sql.DB
 	Inflight        func() int64
+	SetDraining     func(draining bool)
 	ResolveSecret   func(ref string) (string, error)
 	RequestRestart  func()
 	ManualRestartOK bool
@@ -695,6 +697,19 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 		return InstallResult{}, err
 	}
 
+	willRestart := !opts.NoRestart && m.deps.RequestRestart != nil
+	draining := false
+	restarting := false
+	defer func() {
+		if draining && !restarting && m.deps.SetDraining != nil {
+			m.deps.SetDraining(false)
+		}
+	}()
+	if willRestart && m.deps.SetDraining != nil {
+		m.deps.SetDraining(true)
+		draining = true
+	}
+
 	if !opts.Force {
 		drainTimeout := cfg.DrainTimeout.D(5 * time.Minute)
 		if err := m.waitForInflightDrain(ctx, drainTimeout); err != nil {
@@ -703,15 +718,27 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 		}
 	}
 
+	fallbackBin := strings.TrimSpace(m.deps.CurrentBinary)
+	if fallbackBin == "" {
+		if exe, eerr := os.Executable(); eerr == nil {
+			if abs, aerr := filepath.Abs(exe); aerr == nil {
+				fallbackBin = abs
+			} else {
+				fallbackBin = filepath.Clean(exe)
+			}
+		}
+	}
+
 	m.setState(StateApplying, fmt.Sprintf("正在切换版本 %s...", art.Version), "")
 	res, err := st.Install(ctx, InstallRequest{
-		Version:       art.Version,
-		Digest:        art.Remote.Digest,
-		Artifact:      art.Verified,
-		ConfigPath:    m.deps.ConfigPath,
-		KeepReleases:  cfg.KeepCount(),
-		RecordPending: !opts.NoRestart,
-		SkipPreflight: true,
+		Version:            art.Version,
+		Digest:             art.Remote.Digest,
+		Artifact:           art.Verified,
+		ConfigPath:         m.deps.ConfigPath,
+		FallbackBinaryPath: fallbackBin,
+		KeepReleases:       cfg.KeepCount(),
+		RecordPending:      !opts.NoRestart,
+		SkipPreflight:      true,
 	})
 	if err != nil {
 		m.releaseBusyOnError(err, "apply", art.Version, art.Remote.Digest)
@@ -738,6 +765,7 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 		return res, nil
 	}
 
+	restarting = true
 	m.mu.Lock()
 	m.busy = false
 	m.state = StateRestarting
@@ -799,6 +827,19 @@ func (m *Manager) runRollbackLocked(ctx context.Context, opts RollbackOptions) (
 	m.syncStoreHome(cfg)
 	st := m.Store()
 
+	willRestart := !opts.NoRestart && m.deps.RequestRestart != nil
+	draining := false
+	restarting := false
+	defer func() {
+		if draining && !restarting && m.deps.SetDraining != nil {
+			m.deps.SetDraining(false)
+		}
+	}()
+	if willRestart && m.deps.SetDraining != nil {
+		m.deps.SetDraining(true)
+		draining = true
+	}
+
 	if !opts.Force {
 		drainTimeout := cfg.DrainTimeout.D(5 * time.Minute)
 		if err := m.waitForInflightDrain(ctx, drainTimeout); err != nil {
@@ -831,6 +872,7 @@ func (m *Manager) runRollbackLocked(ctx context.Context, opts RollbackOptions) (
 		return res, nil
 	}
 
+	restarting = true
 	m.mu.Lock()
 	m.busy = false
 	m.state = StateRestarting

@@ -207,6 +207,7 @@ func serve(args []string) error {
 		Live:           srv.Live,
 		DB:             srv.DB,
 		Inflight:       srv.Inflight,
+		SetDraining:    srv.SetDraining,
 		ResolveSecret: func(ref string) (string, error) {
 			return api.ResolveUpdaterSecret(srv.DB, ref)
 		},
