@@ -173,6 +173,8 @@ func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("upstream status %d", e.Status)
 }
 
+func (e *UpstreamError) Unwrap() error { return e.Err }
+
 // Chat posts body to <base_url>/chat/completions. On success the caller owns
 // resp.Body. Any non-2xx is returned as *UpstreamError with the body read.
 func (p *Provider) Chat(ctx context.Context, body []byte) (*http.Response, error) {

@@ -4,6 +4,8 @@ package compat
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -169,6 +171,12 @@ func (cw *Writer) Flush() {
 
 // Finish completes buffered JSON/error responses or terminates an SSE stream.
 func (cw *Writer) Finish() {
+	cw.FinishContext(context.Background())
+}
+
+// FinishContext completes buffered JSON/error responses or terminates an SSE stream,
+// skipping synthetic failure events when the client has already canceled ctx.
+func (cw *Writer) FinishContext(ctx context.Context) {
 	if cw.finished {
 		return
 	}
@@ -185,6 +193,9 @@ func (cw *Writer) Finish() {
 		if cw.sseBuf.Len() > 0 {
 			cw.processLine(strings.TrimRight(cw.sseBuf.String(), "\r"))
 			cw.sseBuf.Reset()
+		}
+		if ctx != nil && errors.Is(ctx.Err(), context.Canceled) {
+			return
 		}
 		cw.tr.EndStream(cw.out, !cw.sawError && (cw.sawDone || cw.sawFinish))
 		cw.Flush()

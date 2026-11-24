@@ -394,7 +394,7 @@ func (s *Server) openaiResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		return req, err
 	})
-	cw.Finish()
+	cw.FinishContext(r.Context())
 }
 
 func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -405,7 +405,7 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		tr.Model = model
 		return req, err
 	})
-	cw.Finish()
+	cw.FinishContext(r.Context())
 }
 
 func (s *Server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
