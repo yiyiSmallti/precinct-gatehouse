@@ -550,3 +550,52 @@ func TestSupervisorZeroDowntimeHandoffRollbackKeepsOldServing(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestLoadSupervisorConfigIgnoresUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	raw := `listen: 127.0.0.1:18011
+future_top_level_flag: true
+admin:
+  listen: 127.0.0.1:18002
+  future_admin_option: 42
+tiered:
+  ds:
+    spillover_threshold: 4
+    future_nested_field: enabled
+updater:
+  home_dir: /opt/gatehouse-custom
+  health_timeout: 12s
+  future_updater_knob: yes
+`
+	if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := loadSupervisorConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("loadSupervisorConfig rejected unknown fields: %v", err)
+	}
+	if cfg.Listen != "127.0.0.1:18011" {
+		t.Fatalf("listen = %q, want 127.0.0.1:18011", cfg.Listen)
+	}
+	if cfg.Admin.Listen != "127.0.0.1:18002" {
+		t.Fatalf("admin.listen = %q, want 127.0.0.1:18002", cfg.Admin.Listen)
+	}
+	if cfg.Updater.HomeDir != "/opt/gatehouse-custom" {
+		t.Fatalf("updater.home_dir = %q, want /opt/gatehouse-custom", cfg.Updater.HomeDir)
+	}
+	if cfg.Updater.HealthTimeout.D(0) != 12*time.Second {
+		t.Fatalf("updater.health_timeout = %v, want 12s", cfg.Updater.HealthTimeout.D(0))
+	}
+
+	dataURL, adminURL, timeout := probeTargets(cfgPath, 0)
+	if dataURL != "http://127.0.0.1:18011/healthz" {
+		t.Fatalf("dataURL = %q, want http://127.0.0.1:18011/healthz", dataURL)
+	}
+	if adminURL != "http://127.0.0.1:18002/admin/" {
+		t.Fatalf("adminURL = %q, want http://127.0.0.1:18002/admin/", adminURL)
+	}
+	if timeout != 12*time.Second {
+		t.Fatalf("timeout = %v, want 12s", timeout)
+	}
+}

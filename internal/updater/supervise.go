@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 // SuperviseOptions configures RunSupervisor.
@@ -198,9 +199,38 @@ func absCleanPath(p string) string {
 	return filepath.Clean(p)
 }
 
+type supervisorConfig struct {
+	Listen string `yaml:"listen"`
+	Admin  struct {
+		Listen string `yaml:"listen"`
+	} `yaml:"admin"`
+	Updater struct {
+		HomeDir       string          `yaml:"home_dir"`
+		HealthTimeout config.Duration `yaml:"health_timeout"`
+	} `yaml:"updater"`
+}
+
+func loadSupervisorConfig(path string) (*supervisorConfig, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, os.ErrNotExist
+	}
+	raw, err := os.ReadFile(config.ExpandHome(path))
+	if err != nil {
+		return nil, err
+	}
+	var cfg supervisorConfig
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(cfg.Listen) == "" {
+		cfg.Listen = "127.0.0.1:7788"
+	}
+	return &cfg, nil
+}
+
 func (s *superviseSession) resolveHome() string {
 	if s.configPath != "" {
-		cfg, err := config.Load(s.configPath)
+		cfg, err := loadSupervisorConfig(s.configPath)
 		if err != nil {
 			if s.homeDir != "" {
 				s.log.Warn("supervisor failed loading config while resolving home_dir; keeping previous home", "err", err, "home", s.homeDir)
@@ -244,7 +274,7 @@ func (s *superviseSession) resolveSpec() (workerSpec, *Store) {
 		pending:       pending,
 		healthTimeout: 25 * time.Second,
 	}
-	if cfg, cfgErr := config.Load(s.configPath); cfgErr == nil {
+	if cfg, cfgErr := loadSupervisorConfig(s.configPath); cfgErr == nil {
 		spec.listenAddr = strings.TrimSpace(cfg.Listen)
 		spec.adminAddr = strings.TrimSpace(cfg.Admin.Listen)
 		spec.healthTimeout = cfg.Updater.HealthTimeout.D(25 * time.Second)
@@ -975,7 +1005,7 @@ func probeTargets(configPath string, overrideTimeout time.Duration) (dataURL, ad
 	listen := "127.0.0.1:7788"
 	adminListen := ""
 	timeout = 25 * time.Second
-	if cfg, err := config.Load(configPath); err == nil {
+	if cfg, err := loadSupervisorConfig(configPath); err == nil {
 		if cfg.Listen != "" {
 			listen = cfg.Listen
 		}
