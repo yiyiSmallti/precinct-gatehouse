@@ -117,6 +117,8 @@ type RequestLogEntry struct {
 	CachedTokens     int
 	LatencyMS        int64
 	TTFTMS           int64
+	BodyReadMS       int64
+	RequestBytes     int64
 	Admitted         bool
 	RedactionMode    string
 	RedactionCount   int
@@ -137,13 +139,13 @@ func (m *Meter) LogRequest(e RequestLogEntry) error {
 	m.mu.Lock()
 	_, err := m.db.Exec(`INSERT INTO request_log(
 		request_id,ts,day,key_id,key_name,protocol,client_ip,requested_model,model,
-		status,error_code,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,admitted,
+		status,error_code,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,body_read_ms,request_bytes,admitted,
 		redaction_mode,redaction_count,route_backend,route_reason)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.RequestID, e.Time.Unix(), e.Time.Local().Format("2006-01-02"), e.KeyID, e.KeyName,
 		e.Protocol, e.ClientIP, e.RequestedModel, e.Model,
 		e.Status, e.ErrorCode, stream, e.PromptTokens, e.CompletionTokens, e.CachedTokens,
-		e.LatencyMS, e.TTFTMS, admitted, e.RedactionMode, e.RedactionCount, e.RouteBackend, e.RouteReason)
+		e.LatencyMS, e.TTFTMS, e.BodyReadMS, e.RequestBytes, admitted, e.RedactionMode, e.RedactionCount, e.RouteBackend, e.RouteReason)
 	m.mu.Unlock()
 	return err
 }

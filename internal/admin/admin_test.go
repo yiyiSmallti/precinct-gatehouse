@@ -669,3 +669,119 @@ routing_groups:
 		t.Fatalf("expected 0 checkpoints after clear, got %s", rawAfter)
 	}
 }
+
+func TestAdminLogsExposesBodyReadMetricsAndMigratesLegacyDB(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "gatehouse.db")
+
+	// Seed a legacy gatehouse.db without body_read_ms / request_bytes on request_log.
+	legacyDB, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open seed: %v", err)
+	}
+	legacyDB.Close()
+
+	// Recreate request_log explicitly without body_read_ms and request_bytes to test migration.
+	reopenRaw, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open raw: %v", err)
+	}
+	_, err = reopenRaw.Exec(`DROP TABLE request_log;
+CREATE TABLE request_log (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id        TEXT NOT NULL,
+  ts                INTEGER NOT NULL,
+  day               TEXT NOT NULL,
+  key_id            TEXT NOT NULL DEFAULT '',
+  key_name          TEXT NOT NULL DEFAULT '',
+  protocol          TEXT NOT NULL DEFAULT '',
+  client_ip         TEXT NOT NULL DEFAULT '',
+  requested_model   TEXT NOT NULL DEFAULT '',
+  model             TEXT NOT NULL DEFAULT '',
+  status            INTEGER NOT NULL,
+  error_code        TEXT NOT NULL DEFAULT '',
+  stream            INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens     INTEGER NOT NULL DEFAULT 0,
+  latency_ms        INTEGER NOT NULL DEFAULT 0,
+  ttft_ms           INTEGER NOT NULL DEFAULT 0,
+  admitted          INTEGER NOT NULL DEFAULT 0,
+  redaction_mode    TEXT NOT NULL DEFAULT '',
+  redaction_count   INTEGER NOT NULL DEFAULT 0,
+  route_backend     TEXT NOT NULL DEFAULT '',
+  route_reason      TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO request_log(request_id,ts,day,key_name,protocol,model,status,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,admitted)
+VALUES('req_legacy',1795520000,'2026-11-24','legacy-key','chat','ds/m1',200,1,1000,100,800,5000,1200,1);`)
+	if err != nil {
+		reopenRaw.Close()
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+	reopenRaw.Close()
+
+	// Re-open with store.Open to exercise ensureColumn migration on existing gatehouse.db.
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("expected db file %s: %v", dbPath, err)
+	}
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open migrate: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO request_log(request_id,ts,day,key_name,protocol,model,status,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,body_read_ms,request_bytes,admitted)
+VALUES('req_slow_upload',1795523495,'2026-11-24','prod-key','chat','ds/m1',200,1,268133,1686,266752,148000,7250,112000,94000000,1);`)
+	if err != nil {
+		t.Fatalf("insert new row: %v", err)
+	}
+
+	if err := SetPassword(db, "admin", "password-123"); err != nil {
+		t.Fatalf("SetPassword: %v", err)
+	}
+	srv := New(Deps{DB: db})
+
+	loginReq, _ := http.NewRequest(http.MethodPost, "/admin/api/login", bytes.NewReader([]byte(`{"username":"admin","password":"password-123"}`)))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	srv.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", loginRec.Code, loginRec.Body.String())
+	}
+	var tok string
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == cookieName {
+			tok = c.Value
+		}
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, "/admin/api/logs?limit=10", nil)
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/logs status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var parsed struct {
+		Logs []struct {
+			RequestID    string `json:"request_id"`
+			LatencyMS    int64  `json:"latency_ms"`
+			TTFTMS       int64  `json:"ttft_ms"`
+			BodyReadMS   int64  `json:"body_read_ms"`
+			RequestBytes int64  `json:"request_bytes"`
+		} `json:"logs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("decode logs response: %v", err)
+	}
+	if len(parsed.Logs) != 2 {
+		t.Fatalf("expected 2 log rows, got %d (%s)", len(parsed.Logs), rec.Body.String())
+	}
+	if parsed.Logs[0].RequestID != "req_slow_upload" || parsed.Logs[0].BodyReadMS != 112000 || parsed.Logs[0].RequestBytes != 94000000 || parsed.Logs[0].TTFTMS != 7250 {
+		t.Fatalf("unexpected migrated new row: %+v", parsed.Logs[0])
+	}
+	if parsed.Logs[1].RequestID != "req_legacy" || parsed.Logs[1].BodyReadMS != 0 || parsed.Logs[1].RequestBytes != 0 || parsed.Logs[1].TTFTMS != 1200 {
+		t.Fatalf("unexpected migrated legacy row: %+v", parsed.Logs[1])
+	}
+}

@@ -78,6 +78,16 @@ export function fmtDuration(ms) {
   return `${Math.floor(sec / 3600)}h${String(Math.floor((sec % 3600) / 60)).padStart(2, '0')}m`;
 }
 
+export function fmtBytes(bytes) {
+  if (bytes === undefined || bytes === null || Number.isNaN(Number(bytes))) return '0 B';
+  const n = Math.max(0, Number(bytes));
+  if (!Number.isFinite(n)) return '0 B';
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1).replace(/\.0$/, '')} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')} GB`;
+}
+
 export function fmtTime(secOrMs) {
   if (!secOrMs) return '-';
   const ms = secOrMs > 1e12 ? secOrMs : secOrMs * 1000;

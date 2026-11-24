@@ -170,6 +170,9 @@ type reqState struct {
 	w             http.ResponseWriter
 	written       bool
 	keepaliveOnly bool
+	bodyDone      time.Time
+	bodyRead      time.Duration
+	requestBytes  int64
 	ttft          time.Duration
 	release       func(status int, tokens int64)
 	admitted      bool
@@ -236,6 +239,8 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 		st.release(st.rec.Status, int64(st.rec.PromptTokens+st.rec.CompletionTokens))
 	}
 	st.rec.LatencyMS = time.Since(st.start).Milliseconds()
+	st.rec.BodyReadMS = st.bodyRead.Milliseconds()
+	st.rec.RequestBytes = st.requestBytes
 	if p.Meter != nil {
 		var redMode string
 		var redCount int
@@ -263,6 +268,8 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 			CachedTokens:     st.cachedTokens,
 			LatencyMS:        st.rec.LatencyMS,
 			TTFTMS:           st.ttft.Milliseconds(),
+			BodyReadMS:       st.rec.BodyReadMS,
+			RequestBytes:     st.rec.RequestBytes,
 			Admitted:         st.admitted,
 			RedactionMode:    redMode,
 			RedactionCount:   redCount,
@@ -275,7 +282,7 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 	if err := p.Audit.Write(st.rec); err != nil {
 		p.Log.Error("audit write failed", "err", err)
 	}
-	p.Log.Info("request", "id", st.id, "status", st.rec.Status, "model", st.rec.Model, "rule", st.rec.Rule, "ms", st.rec.LatencyMS)
+	p.Log.Info("request", "id", st.id, "status", st.rec.Status, "model", st.rec.Model, "rule", st.rec.Rule, "ms", st.rec.LatencyMS, "ttft_ms", st.ttft.Milliseconds(), "body_read_ms", st.rec.BodyReadMS, "req_bytes", st.rec.RequestBytes)
 }
 
 // Bearer extracts the gateway credential from Authorization: Bearer or x-api-key.
@@ -492,12 +499,23 @@ func BodyReadError(ctx context.Context, err error) *oai.Error {
 	return oai.Errorf(http.StatusRequestTimeout, "request_body_read_error", "%v", err)
 }
 
+func (st *reqState) ttftOrigin() time.Time {
+	if !st.bodyDone.IsZero() {
+		return st.bodyDone
+	}
+	return st.start
+}
+
 func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error) {
 	rc := r.Body
 	if maxBytes := st.snap.Cfg.MaxBodyBytes(); maxBytes > 0 {
 		rc = http.MaxBytesReader(st.w, r.Body, maxBytes)
 	}
+	readStart := time.Now()
 	body, err := io.ReadAll(rc)
+	st.bodyDone = time.Now()
+	st.bodyRead = st.bodyDone.Sub(readStart)
+	st.requestBytes = int64(len(body))
 	if err != nil {
 		return nil, BodyReadError(r.Context(), err)
 	}
@@ -833,7 +851,7 @@ func (p *Pipeline) relayBuffered(ctx context.Context, st *reqState, resp *http.R
 	alreadyWritten := st.written
 	st.written = true
 	st.keepaliveOnly = false
-	st.ttft = time.Since(st.start)
+	st.ttft = time.Since(st.ttftOrigin())
 	if !clientStream {
 		st.w.Header().Set("Content-Type", "application/json")
 		st.w.WriteHeader(http.StatusOK)
@@ -1014,7 +1032,7 @@ func (p *Pipeline) relayStream(ctx context.Context, st *reqState, resp *http.Res
 				}
 				hasContent, wrote := p.flushEvent(st.w, item.ev, clientUsage, &usage, &done, &sawStreamErr)
 				if hasContent && st.ttft == 0 {
-					st.ttft = time.Since(st.start)
+					st.ttft = time.Since(st.ttftOrigin())
 				}
 				if fl != nil {
 					fl.Flush()

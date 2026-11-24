@@ -4,6 +4,7 @@ import {
   clear,
   closeDrawer,
   el,
+  fmtBytes,
   fmtDateTime,
   fmtDuration,
   fmtNum,
@@ -44,9 +45,11 @@ function outputSpeed(r) {
   const out = Number(r.completion_tokens || 0);
   const total = Number(r.latency_ms || 0);
   if (out <= 0 || total <= 0) return null;
-  const gen = total - Number(r.ttft_ms || 0);
+  const bodyRead = Math.max(0, Number(r.body_read_ms || 0));
+  const serviceMs = total > bodyRead ? total - bodyRead : total;
+  const gen = serviceMs - Number(r.ttft_ms || 0);
   if (r.stream && r.ttft_ms > 0 && gen >= MIN_GEN_MS) return { tps: (out * 1000) / gen, basis: 'gen' };
-  return { tps: (out * 1000) / total, basis: 'e2e' };
+  return { tps: (out * 1000) / serviceMs, basis: 'e2e' };
 }
 
 function fmtTps(v) {
@@ -137,6 +140,7 @@ export function renderLogs(container, ctx) {
           kvRow('缓存命中 Token', fmtTokenDetail(r.cached_tokens)),
           kvRow('缓存命中率', cacheHit(r) === null ? '-' : `${(cacheHit(r) * 100).toFixed(1)}%`),
           kvRow('端到端耗时', fmtDurationDetail(r.latency_ms)),
+          kvRow('请求体读取', r.body_read_ms || r.request_bytes ? `${fmtDurationDetail(r.body_read_ms)}${r.request_bytes ? ` · ${fmtBytes(r.request_bytes)}` : ''}` : '-'),
           kvRow('首字延迟 TTFT', r.ttft_ms ? fmtDurationDetail(r.ttft_ms) : '-'),
           kvRow('输出速度', (() => {
             const sp = outputSpeed(r);
@@ -333,7 +337,7 @@ export function renderLogs(container, ctx) {
                   el('td', {
                     className: 'td-right num',
                     style: { whiteSpace: 'nowrap' },
-                    title: `耗时 ${fmtNum(r.latency_ms)} ms${r.ttft_ms ? ` / TTFT ${fmtNum(r.ttft_ms)} ms` : ''}`,
+                    title: `耗时 ${fmtNum(r.latency_ms)} ms${r.body_read_ms ? ` / 上传 ${fmtNum(r.body_read_ms)} ms` : ''}${r.request_bytes ? ` (${fmtBytes(r.request_bytes)})` : ''}${r.ttft_ms ? ` / TTFT ${fmtNum(r.ttft_ms)} ms` : ''}`,
                   },
                     `${fmtDuration(r.latency_ms)}${r.ttft_ms ? ` / ${fmtDuration(r.ttft_ms)}` : ''}`
                   ),

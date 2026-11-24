@@ -2050,3 +2050,232 @@ routing_groups:
 		assertLatestLogsAndAudit(t, srvEOF, 502, "upstream_unavailable")
 	})
 }
+
+type slowSplitBodyReader struct {
+	ctx     context.Context
+	first   []byte
+	second  []byte
+	delay   time.Duration
+	onFirst func()
+	stage   int
+	offset  int
+}
+
+func newSlowSplitBodyReader(ctx context.Context, payload []byte, splitAt int, delay time.Duration, onFirst func()) *slowSplitBodyReader {
+	if splitAt <= 0 || splitAt >= len(payload) {
+		splitAt = len(payload) / 2
+	}
+	return &slowSplitBodyReader{
+		ctx:     ctx,
+		first:   payload[:splitAt],
+		second:  payload[splitAt:],
+		delay:   delay,
+		onFirst: onFirst,
+	}
+}
+
+func (r *slowSplitBodyReader) Read(p []byte) (int, error) {
+	if r.stage == 0 {
+		n := copy(p, r.first[r.offset:])
+		r.offset += n
+		if r.offset >= len(r.first) {
+			r.stage = 1
+			r.offset = 0
+			if r.onFirst != nil {
+				r.onFirst()
+			}
+		}
+		return n, nil
+	}
+	if r.stage == 1 {
+		if r.ctx != nil {
+			select {
+			case <-time.After(r.delay):
+			case <-r.ctx.Done():
+				return 0, r.ctx.Err()
+			}
+		} else {
+			time.Sleep(r.delay)
+		}
+		r.stage = 2
+	}
+	if r.offset >= len(r.second) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.second[r.offset:])
+	r.offset += n
+	return n, nil
+}
+
+func TestTTFTExcludesSlowRequestBodyUpload(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		stream, _ := req["stream"].(bool)
+
+		time.Sleep(25 * time.Millisecond)
+		if !stream {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"c1","object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)
+			return
+		}
+
+		fl, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		time.Sleep(70 * time.Millisecond)
+		_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	}))
+	defer up.Close()
+
+	srv, tok := newMidStreamTestServer(t, up.URL, 0)
+	srv.Pipeline.SSEKeepaliveInitDelay = -1
+	srv.Pipeline.SSEKeepaliveInterval = -1
+
+	queryLatestMetrics := func(t *testing.T) (status int, errCode string, ttftMS, bodyReadMS, latMS, reqBytes int64) {
+		t.Helper()
+		if err := srv.DB.QueryRow(`SELECT status, error_code, ttft_ms, body_read_ms, latency_ms, request_bytes FROM request_log ORDER BY id DESC LIMIT 1`).
+			Scan(&status, &errCode, &ttftMS, &bodyReadMS, &latMS, &reqBytes); err != nil {
+			t.Fatalf("query request_log: %v", err)
+		}
+		return
+	}
+
+	assertLatestAuditUpload := func(t *testing.T, minBodyReadMS, wantReqBytes int64) {
+		t.Helper()
+		auditDir := filepath.Join(srv.Live.Current().Cfg.DataDir, "audit")
+		files, err := filepath.Glob(filepath.Join(auditDir, "*.jsonl"))
+		if err != nil || len(files) == 0 {
+			t.Fatalf("expected audit files in %s: %v", auditDir, err)
+		}
+		raw, err := os.ReadFile(files[len(files)-1])
+		if err != nil {
+			t.Fatalf("read audit: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		var rec struct {
+			LatencyMS    int64 `json:"latency_ms"`
+			BodyReadMS   int64 `json:"body_read_ms"`
+			RequestBytes int64 `json:"request_bytes"`
+		}
+		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &rec); err != nil {
+			t.Fatalf("unmarshal audit: %v", err)
+		}
+		if rec.BodyReadMS < minBodyReadMS || rec.RequestBytes != wantReqBytes || rec.LatencyMS < rec.BodyReadMS {
+			t.Fatalf("unexpected audit upload fields: %+v (want body_read_ms>=%d req_bytes=%d)", rec, minBodyReadMS, wantReqBytes)
+		}
+	}
+
+	t.Run("streaming_chat", func(t *testing.T) {
+		payload := []byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hello slow upload"}]}`)
+		req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions",
+			newSlowSplitBodyReader(context.Background(), payload, len(payload)/2, 140*time.Millisecond, nil))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+		}
+		st, _, ttftMS, bodyReadMS, latMS, reqBytes := queryLatestMetrics(t)
+		if st != http.StatusOK || bodyReadMS < 110 || reqBytes != int64(len(payload)) {
+			t.Fatalf("unexpected upload metrics: status=%d bodyRead=%dms reqBytes=%d", st, bodyReadMS, reqBytes)
+		}
+		if ttftMS < 15 || ttftMS >= 95 {
+			t.Fatalf("expected ttft_ms in [15,95) excluding 140ms upload, got ttft=%dms (bodyRead=%dms latency=%dms)", ttftMS, bodyReadMS, latMS)
+		}
+		if latMS < bodyReadMS+ttftMS || latMS-bodyReadMS-ttftMS < 50 {
+			t.Fatalf("expected latency_ms >= body_read_ms + ttft_ms + ~70ms decode, got lat=%dms bodyRead=%dms ttft=%dms", latMS, bodyReadMS, ttftMS)
+		}
+		assertLatestAuditUpload(t, 110, int64(len(payload)))
+	})
+
+	t.Run("non_streaming_chat", func(t *testing.T) {
+		payload := []byte(`{"model":"p/m1","stream":false,"messages":[{"role":"user","content":"hello buffered slow upload"}]}`)
+		req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions",
+			newSlowSplitBodyReader(context.Background(), payload, len(payload)/2, 130*time.Millisecond, nil))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+		}
+		st, _, ttftMS, bodyReadMS, latMS, reqBytes := queryLatestMetrics(t)
+		if st != http.StatusOK || bodyReadMS < 100 || reqBytes != int64(len(payload)) {
+			t.Fatalf("unexpected buffered metrics: status=%d bodyRead=%dms reqBytes=%d", st, bodyReadMS, reqBytes)
+		}
+		if ttftMS < 15 || ttftMS >= 95 || latMS < bodyReadMS+ttftMS {
+			t.Fatalf("expected buffered ttft_ms in [15,95) and lat>=bodyRead+ttft, got ttft=%dms bodyRead=%dms lat=%dms", ttftMS, bodyReadMS, latMS)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "responses", path: "/v1/responses", body: `{"model":"p/m1","stream":true,"input":"slow responses upload"}`},
+		{name: "messages", path: "/v1/messages", body: `{"model":"p/m1","stream":true,"max_tokens":32,"messages":[{"role":"user","content":"slow messages upload"}]}`},
+	} {
+		t.Run("compat_"+tc.name, func(t *testing.T) {
+			payload := []byte(tc.body)
+			req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local"+tc.path,
+				newSlowSplitBodyReader(context.Background(), payload, len(payload)/2, 130*time.Millisecond, nil))
+			req.Header.Set("Authorization", "Bearer "+tok)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			srv.HTTP.Handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s status=%d body=%q", tc.name, rec.Code, rec.Body.String())
+			}
+			st, _, ttftMS, bodyReadMS, latMS, reqBytes := queryLatestMetrics(t)
+			if st != http.StatusOK || bodyReadMS < 100 || reqBytes != int64(len(payload)) {
+				t.Fatalf("%s unexpected metrics: status=%d bodyRead=%dms reqBytes=%d", tc.name, st, bodyReadMS, reqBytes)
+			}
+			if ttftMS < 15 || ttftMS >= 95 || latMS < bodyReadMS+ttftMS {
+				t.Fatalf("%s expected ttft_ms in [15,95) excluding upload, got ttft=%dms bodyRead=%dms lat=%dms", tc.name, ttftMS, bodyReadMS, latMS)
+			}
+		})
+	}
+
+	t.Run("client_disconnect_mid_upload_499", func(t *testing.T) {
+		payload := []byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"aborted mid upload"}]}`)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		firstChunkRead := make(chan struct{})
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://gatehouse.local/v1/chat/completions",
+			newSlowSplitBodyReader(ctx, payload, 16, 2*time.Second, func() { close(firstChunkRead) }))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			srv.HTTP.Handler.ServeHTTP(rec, req)
+		}()
+
+		<-firstChunkRead
+		time.Sleep(60 * time.Millisecond)
+		cancel()
+		<-done
+
+		if rec.Code != 499 {
+			t.Fatalf("expected 499 on mid-upload cancel, got %d body=%q", rec.Code, rec.Body.String())
+		}
+		st, errCode, ttftMS, bodyReadMS, _, reqBytes := queryLatestMetrics(t)
+		if st != 499 || errCode != "client_disconnected" || ttftMS != 0 || bodyReadMS < 40 || reqBytes != 16 {
+			t.Fatalf("unexpected 499 upload metrics: st=%d err=%q ttft=%d bodyRead=%d reqBytes=%d", st, errCode, ttftMS, bodyReadMS, reqBytes)
+		}
+	})
+}
