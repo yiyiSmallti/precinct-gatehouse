@@ -1668,20 +1668,17 @@ providers:
 }
 
 type syncStreamWriter struct {
-	mu       sync.Mutex
-	header   http.Header
-	code     int
-	buf      bytes.Buffer
-	onWrite  func([]byte)
-	wroteCh  chan struct{}
-	onceBody sync.Once
+	mu      sync.Mutex
+	header  http.Header
+	code    int
+	buf     bytes.Buffer
+	onWrite func([]byte)
 }
 
 func newSyncStreamWriter(onWrite func([]byte)) *syncStreamWriter {
 	return &syncStreamWriter{
 		header:  make(http.Header),
 		onWrite: onWrite,
-		wroteCh: make(chan struct{}),
 	}
 }
 
@@ -1764,14 +1761,22 @@ func assertLatestLogsAndAudit(t *testing.T, srv *Server, wantStatus int, wantErr
 func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
 	t.Run("header_wait_canceled", func(t *testing.T) {
 		started := make(chan struct{})
+		var startedOnce sync.Once
+		release := make(chan struct{})
 		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			close(started)
-			<-r.Context().Done()
+			_, _ = io.Copy(io.Discard, r.Body)
+			startedOnce.Do(func() { close(started) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
 		}))
 		defer up.Close()
+		defer close(release)
 
 		srv, tok := newMidStreamTestServer(t, up.URL, 0)
 		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://gatehouse.local/v1/chat/completions",
 			bytes.NewReader([]byte(`{"model":"p/m1","messages":[{"role":"user","content":"hi"}]}`)))
 		req.Header.Set("Authorization", "Bearer "+tok)
@@ -1798,11 +1803,18 @@ func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
 
 	t.Run("header_wait_canceled_after_keepalive_responses", func(t *testing.T) {
 		started := make(chan struct{})
+		var startedOnce sync.Once
+		release := make(chan struct{})
 		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			close(started)
-			<-r.Context().Done()
+			_, _ = io.Copy(io.Discard, r.Body)
+			startedOnce.Do(func() { close(started) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
 		}))
 		defer up.Close()
+		defer close(release)
 
 		srv, tok := newMidStreamTestServer(t, up.URL, 0)
 		srv.Pipeline.SSEKeepaliveInitDelay = 15 * time.Millisecond
@@ -1817,6 +1829,7 @@ func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
 		})
 
 		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://gatehouse.local/v1/responses",
 			bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"input":"hi"}`)))
 		req.Header.Set("Authorization", "Bearer "+tok)
@@ -1844,6 +1857,8 @@ func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
 
 	t.Run("mid_stream_canceled", func(t *testing.T) {
 		firstSent := make(chan struct{})
+		var firstSentOnce sync.Once
+		release := make(chan struct{})
 		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.Copy(io.Discard, r.Body)
 			fl, _ := w.(http.Flusher)
@@ -1853,10 +1868,14 @@ func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
 			if fl != nil {
 				fl.Flush()
 			}
-			close(firstSent)
-			<-r.Context().Done()
+			firstSentOnce.Do(func() { close(firstSent) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
 		}))
 		defer up.Close()
+		defer close(release)
 
 		srv, tok := newMidStreamTestServer(t, up.URL, 0)
 		srv.Pipeline.SSEKeepaliveInitDelay = 0
@@ -1871,6 +1890,7 @@ func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
 		})
 
 		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://gatehouse.local/v1/chat/completions",
 			bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
 		req.Header.Set("Authorization", "Bearer "+tok)
@@ -1891,6 +1911,8 @@ func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
 
 	t.Run("buffered_body_read_canceled", func(t *testing.T) {
 		bodyStarted := make(chan struct{})
+		var bodyStartedOnce sync.Once
+		release := make(chan struct{})
 		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.Copy(io.Discard, r.Body)
 			fl, _ := w.(http.Flusher)
@@ -1900,13 +1922,18 @@ func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
 			if fl != nil {
 				fl.Flush()
 			}
-			close(bodyStarted)
-			<-r.Context().Done()
+			bodyStartedOnce.Do(func() { close(bodyStarted) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
 		}))
 		defer up.Close()
+		defer close(release)
 
 		srv, tok := newMidStreamTestServer(t, up.URL, 0)
 		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://gatehouse.local/v1/chat/completions",
 			bytes.NewReader([]byte(`{"model":"p/m1","stream":false,"messages":[{"role":"user","content":"hi"}]}`)))
 		req.Header.Set("Authorization", "Bearer "+tok)
@@ -1951,13 +1978,17 @@ func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
 		assertLatestLogsAndAudit(t, srvEOF, 502, "upstream_stream_interrupted")
 
 		// 2. Upstream provider timeout (context.DeadlineExceeded, client ctx intact) -> 502 upstream_unavailable.
+		slowRelease := make(chan struct{})
 		slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
 			select {
 			case <-time.After(200 * time.Millisecond):
 			case <-r.Context().Done():
+			case <-slowRelease:
 			}
 		}))
 		defer slowSrv.Close()
+		defer close(slowRelease)
 
 		dir := t.TempDir()
 		cfgRaw := fmt.Sprintf(`
