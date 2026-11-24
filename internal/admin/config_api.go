@@ -194,6 +194,7 @@ func (s *Server) writeApplyOK(w http.ResponseWriter, res live.ApplyResult) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":               true,
 		"version":          res.Version,
+		"hash":             res.Hash,
 		"restart_required": rr,
 		"warnings":         []string{},
 	})

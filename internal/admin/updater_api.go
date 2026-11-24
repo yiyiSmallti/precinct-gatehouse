@@ -60,6 +60,13 @@ func (s *Server) applyUpdater(w http.ResponseWriter, r *http.Request, _ string) 
 		Tag:   strings.TrimSpace(req.Tag),
 		Force: req.Force,
 	}); err != nil {
+		if errors.Is(err, updater.ErrRestartUnavailable) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":   "restart_unavailable",
+				"message": "当前网关未运行在 gatehouse supervise 托管模式下，无法执行在线重启切换；请改用 gatehouse supervise 启动，或在命令行执行 gatehouse update apply 后手动重启。",
+			})
+			return
+		}
 		if errors.Is(err, updater.ErrBusy) {
 			writeJSONError(w, http.StatusConflict, err.Error())
 			return
@@ -89,6 +96,13 @@ func (s *Server) rollbackUpdater(w http.ResponseWriter, r *http.Request, _ strin
 		TargetVersion: strings.TrimSpace(req.Version),
 		Force:         req.Force,
 	}); err != nil {
+		if errors.Is(err, updater.ErrRestartUnavailable) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":   "restart_unavailable",
+				"message": "当前网关未运行在 gatehouse supervise 托管模式下，无法执行在线重启切换；请改用 gatehouse supervise 启动，或在命令行执行 gatehouse update rollback 后手动重启。",
+			})
+			return
+		}
 		if errors.Is(err, updater.ErrBusy) {
 			writeJSONError(w, http.StatusConflict, err.Error())
 			return

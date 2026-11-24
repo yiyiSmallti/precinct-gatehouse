@@ -29,8 +29,12 @@ const (
 // Priority: explicit config updater.home_dir -> parent of bin/ or releases/<ver>/
 // from exePath -> directory of configPath.
 func ResolveHomeDir(cfgHomeDir, configPath, exePath string) string {
-	if strings.TrimSpace(cfgHomeDir) != "" {
-		return filepath.Clean(cfgHomeDir)
+	if raw := strings.TrimSpace(cfgHomeDir); raw != "" {
+		clean := filepath.Clean(raw)
+		if !filepath.IsAbs(clean) && strings.TrimSpace(configPath) != "" {
+			clean = filepath.Join(filepath.Dir(filepath.Clean(configPath)), clean)
+		}
+		return filepath.Clean(clean)
 	}
 	if exePath != "" {
 		if home := inferHomeFromBinary(exePath); home != "" {
@@ -274,9 +278,8 @@ func (s *Store) Install(ctx context.Context, req InstallRequest) (InstallResult,
 	prevVer := s.CurrentVersion()
 	prevDigest := s.CurrentDigest()
 
-	tmpDir := filepath.Join(s.ReleasesDir(), fmt.Sprintf(".tmp-%s-%d", req.Version, os.Getpid()))
-	_ = os.RemoveAll(tmpDir)
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+	tmpDir, err := os.MkdirTemp(s.ReleasesDir(), fmt.Sprintf(".tmp-%s-*", req.Version))
+	if err != nil {
 		return InstallResult{}, err
 	}
 	defer func() {
@@ -330,10 +333,8 @@ func (s *Store) Install(ctx context.Context, req InstallRequest) (InstallResult,
 		}
 	}
 
-	targetDir := filepath.Join(s.ReleasesDir(), req.Version)
-	if err := os.RemoveAll(targetDir); err != nil {
-		return InstallResult{}, err
-	}
+	releaseID := s.allocateReleaseID(req.Version, req.Digest, shaHex, prevVer)
+	targetDir := filepath.Join(s.ReleasesDir(), releaseID)
 	if err := os.Rename(tmpDir, targetDir); err != nil {
 		return InstallResult{}, err
 	}
@@ -341,7 +342,7 @@ func (s *Store) Install(ctx context.Context, req InstallRequest) (InstallResult,
 
 	if req.RecordPending {
 		if err := s.WritePending(&PendingUpdate{
-			TargetVersion:   req.Version,
+			TargetVersion:   releaseID,
 			TargetDigest:    strings.TrimSpace(req.Digest),
 			PreviousVersion: prevVer,
 			PreviousDigest:  prevDigest,
@@ -351,18 +352,21 @@ func (s *Store) Install(ctx context.Context, req InstallRequest) (InstallResult,
 		}
 	}
 
-	relTarget := filepath.Join("..", "releases", req.Version, binName)
+	relTarget := filepath.Join("..", "releases", releaseID, binName)
 	if err := atomicSwapBinary(s.BinLink(), relTarget, filepath.Join(targetDir, binName)); err != nil {
+		if req.RecordPending {
+			_ = s.ClearPending()
+		}
 		return InstallResult{}, err
 	}
 
-	if prevVer != "" && prevVer != req.Version {
+	if prevVer != "" && prevVer != releaseID {
 		_ = atomicWriteFile(filepath.Join(s.HomeDir, prevVerFileName), []byte(prevVer+"\n"), 0o644)
 		if prevDigest != "" {
 			_ = atomicWriteFile(filepath.Join(s.HomeDir, prevDigestFile), []byte(prevDigest+"\n"), 0o644)
 		}
 	}
-	if err := atomicWriteFile(filepath.Join(s.HomeDir, currentVerFileName), []byte(req.Version+"\n"), 0o644); err != nil {
+	if err := atomicWriteFile(filepath.Join(s.HomeDir, currentVerFileName), []byte(releaseID+"\n"), 0o644); err != nil {
 		return InstallResult{}, err
 	}
 	if strings.TrimSpace(req.Digest) != "" {
@@ -373,13 +377,71 @@ func (s *Store) Install(ctx context.Context, req InstallRequest) (InstallResult,
 	if keep <= 0 {
 		keep = defaultKeepReleases
 	}
-	s.pruneReleases(keep, req.Version, prevVer)
+	s.pruneReleases(keep, releaseID, prevVer)
 
 	return InstallResult{
-		Version:         req.Version,
+		Version:         releaseID,
 		PreviousVersion: prevVer,
 		BinarySHA256:    shaHex,
 	}, nil
+}
+
+func (s *Store) allocateReleaseID(ver, digest, shaHex, prevVer string) string {
+	relExists := func(id string) bool {
+		_, err := os.Stat(filepath.Join(s.ReleasesDir(), id))
+		return !errors.Is(err, os.ErrNotExist)
+	}
+	if ver != prevVer && !relExists(ver) {
+		return ver
+	}
+	suffix := shortHexSuffix(digest, shaHex)
+	cand := fmt.Sprintf("%s-%s", ver, suffix)
+	if cand != prevVer && !relExists(cand) {
+		return cand
+	}
+	tsBase := fmt.Sprintf("%s-%s-%s", ver, suffix, time.Now().UTC().Format("20060102150405"))
+	if tsBase != prevVer && !relExists(tsBase) {
+		return tsBase
+	}
+	for i := 2; ; i++ {
+		numbered := fmt.Sprintf("%s-%d", tsBase, i)
+		if numbered != prevVer && !relExists(numbered) {
+			return numbered
+		}
+	}
+}
+
+func shortHexSuffix(digest, shaHex string) string {
+	cand := strings.TrimSpace(digest)
+	if _, after, ok := strings.Cut(cand, ":"); ok {
+		cand = after
+	}
+	if s := leadingHex8(cand); s != "" {
+		return s
+	}
+	if s := leadingHex8(strings.TrimSpace(shaHex)); s != "" {
+		return s
+	}
+	return "r"
+}
+
+func leadingHex8(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s) && b.Len() < 8; i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+			b.WriteByte(c)
+		case c >= 'A' && c <= 'F':
+			b.WriteByte(c + ('a' - 'A'))
+		default:
+			return ""
+		}
+	}
+	if b.Len() == 8 {
+		return b.String()
+	}
+	return ""
 }
 
 // Rollback switches bin/gatehouse back to targetVersion (or .previous_version /

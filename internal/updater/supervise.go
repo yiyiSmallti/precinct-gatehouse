@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
@@ -41,12 +43,45 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
-	exePath, _ := os.Executable()
-	homeDir := ResolveHomeDir(opts.HomeDir, opts.ConfigPath, exePath)
-	if cfg, err := config.Load(opts.ConfigPath); err == nil && cfg.Updater.HomeDir != "" {
-		homeDir = ResolveHomeDir(cfg.Updater.HomeDir, opts.ConfigPath, exePath)
+	absPath := func(p string) string {
+		if abs, err := filepath.Abs(p); err == nil {
+			return abs
+		}
+		return filepath.Clean(p)
 	}
-	store := NewStore(homeDir)
+	configPath := strings.TrimSpace(opts.ConfigPath)
+	if configPath != "" {
+		configPath = absPath(config.ExpandHome(configPath))
+	}
+	optHome := strings.TrimSpace(opts.HomeDir)
+	if optHome != "" {
+		optHome = absPath(config.ExpandHome(optHome))
+	}
+	optBin := strings.TrimSpace(opts.BinaryPath)
+	if optBin != "" {
+		optBin = absPath(optBin)
+	}
+	exePath, _ := os.Executable()
+	if exePath != "" {
+		exePath = absPath(exePath)
+	}
+	resolveHome := func(prev string) string {
+		if configPath != "" {
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				if prev != "" {
+					log.Warn("supervisor failed loading config while resolving home_dir; keeping previous home", "err", err, "home", prev)
+					return prev
+				}
+			} else if strings.TrimSpace(cfg.Updater.HomeDir) != "" {
+				return absPath(ResolveHomeDir(cfg.Updater.HomeDir, configPath, exePath))
+			}
+		}
+		if optHome != "" {
+			return optHome
+		}
+		return absPath(ResolveHomeDir("", configPath, exePath))
+	}
 
 	probeInterval := opts.ProbeInterval
 	if probeInterval <= 0 {
@@ -56,13 +91,17 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 	hupCh := notifyReloadSignals()
 	defer stopReloadSignals(hupCh)
 
+	homeDir := ""
 	backoff := time.Duration(0)
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		binPath := opts.BinaryPath
+		homeDir = resolveHome(homeDir)
+		store := NewStore(homeDir)
+
+		binPath := optBin
 		if binPath == "" {
 			cand := store.BinLink()
 			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
@@ -81,11 +120,22 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 		}
 
 		args := []string{"serve"}
-		if opts.ConfigPath != "" {
-			args = append(args, "--config", opts.ConfigPath)
+		if configPath != "" {
+			args = append(args, "--config", configPath)
 		}
 		cmd := exec.Command(binPath, args...)
-		cmd.Env = append(os.Environ(), EnvSupervised+"=1")
+		env := make([]string, 0, len(os.Environ())+2)
+		for _, kv := range os.Environ() {
+			if strings.HasPrefix(kv, EnvSupervised+"=") || strings.HasPrefix(kv, EnvHomeDir+"=") {
+				continue
+			}
+			env = append(env, kv)
+		}
+		env = append(env, EnvSupervised+"=1")
+		if optHome != "" {
+			env = append(env, EnvHomeDir+"="+optHome)
+		}
+		cmd.Env = env
 		if opts.Stdout != nil {
 			cmd.Stdout = opts.Stdout
 		} else {
@@ -137,7 +187,7 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 			healthStop  context.CancelFunc
 		)
 		if pending != nil {
-			dataURL, adminURL, hTimeout := probeTargets(opts.ConfigPath, opts.HealthTimeout)
+			dataURL, adminURL, hTimeout := probeTargets(configPath, opts.HealthTimeout)
 			healthCtx, healthStop = context.WithCancel(ctx)
 			healthErrCh = make(chan error, 1)
 			go func() {

@@ -192,12 +192,18 @@ export function renderUpdater(container, ctx) {
         }
         saveBtn.disabled = true;
         try {
-          await api.putUpdaterSecret(kind, val, store.server?.hash || '');
+          const res = await api.putUpdaterSecret(kind, val, store.baseHash || store.server?.hash || '');
           closeModal();
-          await store.refresh();
+          await store.syncAfterUpdaterSecret(kind, `db:${kind}`, res?.hash || '');
           await loadStatus(false);
           toast(`${label}已安全保存并热重载生效`, 'ok');
         } catch (e) {
+          if (e.status === 409) {
+            store.markConflict(e.currentHash);
+            closeModal();
+            toast('配置在您编辑期间已被其他操作修改，请先处理页面底部的冲突提示后再试', 'warn', 5500);
+            return;
+          }
           toast(`保存失败: ${e.message}`, 'err');
         } finally {
           saveBtn.disabled = false;
@@ -274,9 +280,27 @@ export function renderUpdater(container, ctx) {
     const sm = stateMeta(st.state);
     const avail = st.available;
     const isBusy = ACTIVE_STATES.has(st.state) || reconnecting;
+    const canRestart = Boolean(status && (status.can_restart ?? status.supervised));
+    const restartDisabled = isBusy || !canRestart;
+    const restartTitle = canRestart ? '' : '需要以 gatehouse supervise 托管模式运行';
 
     // 1. Status & Actions Sheet
     const banners = [];
+    if (status && !canRestart) {
+      banners.push(
+        el('div', { className: 'banner banner-warn' },
+          el('div', { className: 'banner-main' },
+            icon('alert', 16),
+            el('div', null,
+              el('strong', null, '当前为直接 serve 模式，仅支持检查更新'),
+              el('div', { style: { fontSize: '12px', marginTop: '2px' } },
+                '在线升级、自动应用 (auto_apply) 与版本回滚必须由 `gatehouse supervise` 托管进程执行，以免服务退出后无法自动拉起；如需手动升级，请执行 `gatehouse update apply` 后重启服务。'
+              )
+            )
+          )
+        )
+      );
+    }
     if (reconnecting) {
       banners.push(
         el('div', { className: 'banner banner-warn' },
@@ -333,13 +357,15 @@ export function renderUpdater(container, ctx) {
             el('button', {
               type: 'button',
               className: 'btn btn-primary btn-sm',
-              disabled: isBusy,
+              disabled: restartDisabled,
+              title: restartTitle,
               onClick: () => triggerApply(false),
             }, '等待空闲并升级'),
             el('button', {
               type: 'button',
               className: 'btn btn-sm',
-              disabled: isBusy,
+              disabled: restartDisabled,
+              title: restartTitle,
               onClick: () => triggerApply(true),
             }, '立即强制升级')
           )
@@ -362,7 +388,8 @@ export function renderUpdater(container, ctx) {
             ? el('button', {
               type: 'button',
               className: 'btn btn-sm',
-              disabled: isBusy,
+              disabled: restartDisabled,
+              title: restartTitle,
               onClick: () => triggerRollback(''),
             }, icon('history', 14), `回滚到 ${st.previous_release}`)
             : null,
@@ -468,11 +495,16 @@ export function renderUpdater(container, ctx) {
                 className: 'btn btn-danger btn-sm',
                 onClick: async () => {
                   try {
-                    await api.deleteUpdaterSecret('password', store.server?.hash || '');
-                    await store.refresh();
+                    const res = await api.deleteUpdaterSecret('password', store.baseHash || store.server?.hash || '');
+                    await store.syncAfterUpdaterSecret('password', '', res?.hash || '');
                     await loadStatus(false);
                     toast('已清除仓库密码', 'ok');
                   } catch (e) {
+                    if (e.status === 409) {
+                      store.markConflict(e.currentHash);
+                      toast('配置在您编辑期间已被其他操作修改，请先处理页面底部的冲突提示后再试', 'warn', 5500);
+                      return;
+                    }
                     toast(`清除失败: ${e.message}`, 'err');
                   }
                 },
@@ -536,11 +568,16 @@ export function renderUpdater(container, ctx) {
                 className: 'btn btn-danger btn-sm',
                 onClick: async () => {
                   try {
-                    await api.deleteUpdaterSecret('token', store.server?.hash || '');
-                    await store.refresh();
+                    const res = await api.deleteUpdaterSecret('token', store.baseHash || store.server?.hash || '');
+                    await store.syncAfterUpdaterSecret('token', '', res?.hash || '');
                     await loadStatus(false);
                     toast('已清除 GitHub 令牌', 'ok');
                   } catch (e) {
+                    if (e.status === 409) {
+                      store.markConflict(e.currentHash);
+                      toast('配置在您编辑期间已被其他操作修改，请先处理页面底部的冲突提示后再试', 'warn', 5500);
+                      return;
+                    }
                     toast(`清除失败: ${e.message}`, 'err');
                   }
                 },
@@ -707,7 +744,8 @@ export function renderUpdater(container, ctx) {
                       : el('button', {
                         type: 'button',
                         className: 'btn btn-sm',
-                        disabled: isBusy,
+                        disabled: restartDisabled,
+                        title: restartTitle,
                         onClick: () => triggerRollback(r.version),
                       }, '切换到此版本')
                   )

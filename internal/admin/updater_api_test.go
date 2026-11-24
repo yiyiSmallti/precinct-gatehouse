@@ -142,7 +142,7 @@ func TestAdminUpdaterEndpointsAndSecretHandling(t *testing.T) {
 	}
 	baseHash, _ := cfgPayload["hash"].(string)
 
-	// 2. PUT /admin/api/updater/secret stores secret in DB and sets password_ref=db:password.
+	// 2. PUT /admin/api/updater/secret stores secret in DB, sets password_ref=db:password, and returns updated hash.
 	secRec := doReq(http.MethodPut, "/admin/api/updater/secret", map[string]string{
 		"kind":      "password",
 		"value":     "super-secret-oci-pass",
@@ -151,15 +151,26 @@ func TestAdminUpdaterEndpointsAndSecretHandling(t *testing.T) {
 	if secRec.Code != http.StatusOK {
 		t.Fatalf("putUpdaterSecret failed: %d %s", secRec.Code, secRec.Body.String())
 	}
+	var secPayload map[string]any
+	if err := json.Unmarshal(secRec.Body.Bytes(), &secPayload); err != nil {
+		t.Fatal(err)
+	}
+	putHash, _ := secPayload["hash"].(string)
+	if putHash == "" {
+		t.Fatalf("expected non-empty hash from putUpdaterSecret, got %s", secRec.Body.String())
+	}
 
-	// 3. Hot-reload updater section via PUT /admin/api/config/sections/updater without losing password_ref.
+	// 3. Hot-reload updater section via PUT /admin/api/config/sections/updater using returned hash directly.
 	cfgRec2 := doReq(http.MethodGet, "/admin/api/config", nil)
 	var cfgPayload2 map[string]any
 	_ = json.Unmarshal(cfgRec2.Body.Bytes(), &cfgPayload2)
 	hash2, _ := cfgPayload2["hash"].(string)
+	if putHash != hash2 {
+		t.Fatalf("expected putUpdaterSecret hash %q to match GET /admin/api/config hash %q", putHash, hash2)
+	}
 
 	putSecRec := doReq(http.MethodPut, "/admin/api/config/sections/updater", map[string]any{
-		"base_hash": hash2,
+		"base_hash": putHash,
 		"data": map[string]any{
 			"enabled":  true,
 			"source":   "oci",
@@ -199,14 +210,50 @@ func TestAdminUpdaterEndpointsAndSecretHandling(t *testing.T) {
 	if !chkSt.Config.HasPassword {
 		t.Fatal("expected has_password=true")
 	}
+	if chkSt.CanRestart {
+		t.Fatal("expected can_restart=false when RequestRestart is nil")
+	}
 
-	// 5. DELETE /admin/api/updater/secret/password clears DB secret and password_ref.
+	// 5. Online apply & rollback return HTTP 409 restart_unavailable when unsupervised.
+	applyRec := doReq(http.MethodPost, "/admin/api/updater/apply", map[string]any{})
+	if applyRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 from unsupervised applyUpdater, got %d %s", applyRec.Code, applyRec.Body.String())
+	}
+	var applyErr map[string]any
+	_ = json.Unmarshal(applyRec.Body.Bytes(), &applyErr)
+	if applyErr["error"] != "restart_unavailable" {
+		t.Fatalf("expected error=restart_unavailable from applyUpdater, got %+v", applyErr)
+	}
+
+	rbRec := doReq(http.MethodPost, "/admin/api/updater/rollback", map[string]any{})
+	if rbRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 from unsupervised rollbackUpdater, got %d %s", rbRec.Code, rbRec.Body.String())
+	}
+	var rbErr map[string]any
+	_ = json.Unmarshal(rbRec.Body.Bytes(), &rbErr)
+	if rbErr["error"] != "restart_unavailable" {
+		t.Fatalf("expected error=restart_unavailable from rollbackUpdater, got %+v", rbErr)
+	}
+
+	// 6. DELETE /admin/api/updater/secret/password clears DB secret, password_ref, and returns updated hash.
 	var cfgPayload3 map[string]any
 	_ = json.Unmarshal(cfgRec3.Body.Bytes(), &cfgPayload3)
 	hash3, _ := cfgPayload3["hash"].(string)
 	delRec := doReq(http.MethodDelete, "/admin/api/updater/secret/password", map[string]string{"base_hash": hash3})
 	if delRec.Code != http.StatusOK {
 		t.Fatalf("deleteUpdaterSecret failed: %d %s", delRec.Code, delRec.Body.String())
+	}
+	var delPayload map[string]any
+	_ = json.Unmarshal(delRec.Body.Bytes(), &delPayload)
+	delHash, _ := delPayload["hash"].(string)
+	if delHash == "" || delHash == hash3 {
+		t.Fatalf("expected new non-empty hash from deleteUpdaterSecret, got %q (prev %q)", delHash, hash3)
+	}
+	cfgRec4 := doReq(http.MethodGet, "/admin/api/config", nil)
+	var cfgPayload4 map[string]any
+	_ = json.Unmarshal(cfgRec4.Body.Bytes(), &cfgPayload4)
+	if hash4, _ := cfgPayload4["hash"].(string); hash4 != delHash {
+		t.Fatalf("expected deleteUpdaterSecret hash %q to match config hash %q", delHash, hash4)
 	}
 	if _, err := api.ResolveUpdaterSecret(db, "db:password"); err == nil {
 		t.Fatal("expected db:password secret deleted")

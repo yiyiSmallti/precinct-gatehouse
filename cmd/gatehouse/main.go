@@ -192,6 +192,15 @@ func serve(args []string) error {
 		log.Warn("required detectors unavailable; requests that need redaction will get 503", "detectors", srv.Missing)
 	}
 	restartCh := make(chan struct{}, 1)
+	var requestRestart func()
+	if updater.IsSupervised() {
+		requestRestart = func() {
+			select {
+			case restartCh <- struct{}{}:
+			default:
+			}
+		}
+	}
 	updMgr := updater.NewManager(updater.Deps{
 		CurrentVersion: version,
 		ConfigPath:     *cfgPath,
@@ -201,13 +210,8 @@ func serve(args []string) error {
 		ResolveSecret: func(ref string) (string, error) {
 			return api.ResolveUpdaterSecret(srv.DB, ref)
 		},
-		RequestRestart: func() {
-			select {
-			case restartCh <- struct{}{}:
-			default:
-			}
-		},
-		Log: log,
+		RequestRestart: requestRestart,
+		Log:            log,
 	})
 	srv.Live.AddOnSwap(func(_ *live.Snapshot) {
 		updMgr.NotifyConfigChange()
@@ -297,10 +301,7 @@ loop:
 	srv.Shutdown(ctx)
 	log.Info("gatehouse stopped", "restart_requested", restartRequested)
 	if restartRequested {
-		if updater.IsSupervised() {
-			return exitErr(updater.ExitRestart)
-		}
-		log.Info("exiting for external service manager restart")
+		return exitErr(updater.ExitRestart)
 	}
 	return nil
 }
@@ -1025,10 +1026,11 @@ func updateCmd(args []string) error {
 			defer db.Close()
 		}
 		mgr := updater.NewManager(updater.Deps{
-			CurrentVersion: version,
-			ConfigPath:     *cfgPath,
-			StaticConfig:   &cfg.Updater,
-			DB:             db,
+			CurrentVersion:  version,
+			ConfigPath:      *cfgPath,
+			StaticConfig:    &cfg.Updater,
+			DB:              db,
+			ManualRestartOK: true,
 			ResolveSecret: func(ref string) (string, error) {
 				return api.ResolveUpdaterSecret(db, ref)
 			},

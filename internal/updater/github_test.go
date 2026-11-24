@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -111,5 +112,106 @@ func TestGitHubSourceCheckAndDownload(t *testing.T) {
 	}
 	if art.Version != "v0.3.0" || !art.Verified.Signed || art.Verified.BinarySHA256 != binHex {
 		t.Fatalf("unexpected downloaded artifact: %+v", art)
+	}
+}
+
+func TestGitHubSourceExplicitTag(t *testing.T) {
+	binName := binaryFilename()
+	buildTarFor := func(ver string) ([]byte, string) {
+		binBytes := []byte("gatehouse-gh-" + ver)
+		binSum := sha256.Sum256(binBytes)
+		binHex := hex.EncodeToString(binSum[:])
+		sumsBytes := []byte(binHex + "  " + binName + "\n")
+		metaBytes, _ := json.Marshal(ReleaseMeta{Version: ver, BinarySHA256: binHex})
+		return buildTestTar(t, true, map[string][]byte{
+			binName:        binBytes,
+			"SHA256SUMS":   sumsBytes,
+			"RELEASE_META": metaBytes,
+		}), binHex
+	}
+
+	tar012, hex012 := buildTarFor("v0.1.2")
+	tarLatest, _ := buildTarFor("v0.9.9")
+
+	var hitPaths []string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitPaths = append(hitPaths, r.URL.Path)
+		switch r.URL.Path {
+		case "/repos/yiyiSmallti/precinct-gatehouse/releases/tags/v0.1.2":
+			_ = json.NewEncoder(w).Encode(ghRelease{
+				TagName: "v0.1.2",
+				Assets: []ghAsset{{
+					ID:                 201,
+					Name:               fmt.Sprintf("gatehouse_v0.1.2_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH),
+					BrowserDownloadURL: srv.URL + "/dl/v0.1.2.tar.gz",
+				}},
+			})
+		case "/repos/yiyiSmallti/precinct-gatehouse/releases/latest":
+			_ = json.NewEncoder(w).Encode(ghRelease{
+				TagName: "v0.9.9",
+				Assets: []ghAsset{{
+					ID:                 299,
+					Name:               fmt.Sprintf("gatehouse_v0.9.9_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH),
+					BrowserDownloadURL: srv.URL + "/dl/v0.9.9.tar.gz",
+				}},
+			})
+		case "/dl/v0.1.2.tar.gz":
+			_, _ = w.Write(tar012)
+		case "/dl/v0.9.9.tar.gz":
+			_, _ = w.Write(tarLatest)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// 1. Explicit tag on GitHubSource hits /releases/tags/v0.1.2, not /releases/latest.
+	src := &GitHubSource{
+		Repo:       "yiyiSmallti/precinct-gatehouse",
+		Tag:        "v0.1.2",
+		APIURL:     srv.URL,
+		HTTPClient: NewHTTPClient(0, nil),
+	}
+	art, err := src.Download(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("explicit tag Download failed: %v", err)
+	}
+	if art.Version != "v0.1.2" || art.Verified.BinarySHA256 != hex012 {
+		t.Fatalf("expected v0.1.2 artifact, got %+v", art)
+	}
+
+	// 2. Manager.buildSource propagates tagOverride "v0.1.2" and treats "latest" as default latest lookup.
+	mgr := NewManager(Deps{
+		CurrentVersion: "v0.1.0",
+		StaticConfig: &config.Updater{
+			Source:       "github",
+			GitHubRepo:   "yiyiSmallti/precinct-gatehouse",
+			GitHubAPIURL: srv.URL,
+		},
+	})
+	builtExplicit, err := mgr.buildSource(mgr.currentConfig(), "v0.1.2")
+	if err != nil {
+		t.Fatalf("buildSource(v0.1.2) failed: %v", err)
+	}
+	gsExplicit, ok := builtExplicit.(*GitHubSource)
+	if !ok || gsExplicit.Tag != "v0.1.2" {
+		t.Fatalf("expected GitHubSource with Tag=v0.1.2, got %+v", builtExplicit)
+	}
+
+	builtLatest, err := mgr.buildSource(mgr.currentConfig(), "latest")
+	if err != nil {
+		t.Fatalf("buildSource(latest) failed: %v", err)
+	}
+	gsLatest := builtLatest.(*GitHubSource)
+	if gsLatest.Tag != "" {
+		t.Fatalf("expected GitHubSource Tag='' for latest override, got %q", gsLatest.Tag)
+	}
+	remLatest, err := gsLatest.Check(context.Background())
+	if err != nil {
+		t.Fatalf("gsLatest.Check failed: %v", err)
+	}
+	if remLatest.Version != "v0.9.9" {
+		t.Fatalf("expected v0.9.9 for latest, got %q", remLatest.Version)
 	}
 }

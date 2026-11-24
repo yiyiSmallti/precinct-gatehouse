@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -25,17 +26,22 @@ const (
 // ErrBusy is returned when an update apply or rollback is already in progress.
 var ErrBusy = errors.New("an update operation is already in progress")
 
+// ErrRestartUnavailable is returned when an online update or rollback requires
+// restarting the service, but the gateway is not running under `gatehouse supervise`.
+var ErrRestartUnavailable = errors.New("automatic restart requires running under `gatehouse supervise`")
+
 // Deps configures a Manager.
 type Deps struct {
-	CurrentVersion string
-	ConfigPath     string
-	Live           *live.Manager
-	StaticConfig   *config.Updater
-	DB             *sql.DB
-	Inflight       func() int64
-	ResolveSecret  func(ref string) (string, error)
-	RequestRestart func()
-	Log            *slog.Logger
+	CurrentVersion  string
+	ConfigPath      string
+	Live            *live.Manager
+	StaticConfig    *config.Updater
+	DB              *sql.DB
+	Inflight        func() int64
+	ResolveSecret   func(ref string) (string, error)
+	RequestRestart  func()
+	ManualRestartOK bool
+	Log             *slog.Logger
 
 	// Optional test hooks.
 	NewSource   func(cfg config.Updater, secret string) (ArtifactSource, error)
@@ -83,9 +89,23 @@ func NewManager(d Deps) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
+	if strings.TrimSpace(d.ConfigPath) != "" {
+		cfgPath := config.ExpandHome(strings.TrimSpace(d.ConfigPath))
+		if abs, err := filepath.Abs(cfgPath); err == nil {
+			cfgPath = abs
+		} else {
+			cfgPath = filepath.Clean(cfgPath)
+		}
+		d.ConfigPath = cfgPath
+	}
 	exePath, _ := os.Executable()
+	if exePath != "" {
+		if abs, err := filepath.Abs(exePath); err == nil {
+			exePath = abs
+		}
+	}
 	cfg := currentUpdaterConfig(d)
-	home := ResolveHomeDir(cfg.HomeDir, d.ConfigPath, exePath)
+	home := resolveManagerHome(cfg.HomeDir, d.ConfigPath, exePath)
 	m := &Manager{
 		deps:     d,
 		store:    NewStore(home),
@@ -96,6 +116,18 @@ func NewManager(d Deps) *Manager {
 	}
 	m.loadHistory()
 	return m
+}
+
+func resolveManagerHome(cfgHomeDir, configPath, exePath string) string {
+	effective := strings.TrimSpace(cfgHomeDir)
+	if effective == "" {
+		effective = strings.TrimSpace(os.Getenv(EnvHomeDir))
+	}
+	home := ResolveHomeDir(effective, configPath, exePath)
+	if abs, err := filepath.Abs(home); err == nil {
+		return abs
+	}
+	return home
 }
 
 func currentUpdaterConfig(d Deps) config.Updater {
@@ -116,7 +148,12 @@ func (m *Manager) currentConfig() config.Updater {
 
 func (m *Manager) syncStoreHome(cfg config.Updater) {
 	exePath, _ := os.Executable()
-	home := ResolveHomeDir(cfg.HomeDir, m.deps.ConfigPath, exePath)
+	if exePath != "" {
+		if abs, err := filepath.Abs(exePath); err == nil {
+			exePath = abs
+		}
+	}
+	home := resolveManagerHome(cfg.HomeDir, m.deps.ConfigPath, exePath)
 	m.mu.Lock()
 	if m.store.HomeDir != home {
 		m.store = NewStore(home)
@@ -249,10 +286,18 @@ func (m *Manager) runBackgroundCycle(ctx context.Context) {
 	if st.Available == nil || !st.Available.UpdateAvailable || !cfg.AutoApply {
 		return
 	}
+	if !m.CanRestart() {
+		m.log.Warn("skipping background auto-apply: gateway is not running under `gatehouse supervise`")
+		return
+	}
 	if failed, _ := m.Store().ReadFailed(); failed != nil {
-		sameDigest := failed.Digest != "" && st.Available.Digest != "" && failed.Digest == st.Available.Digest
-		sameVersion := failed.Version != "" && st.Available.Version != "" && failed.Version == st.Available.Version
-		if sameDigest || sameVersion {
+		var matched bool
+		if failed.Digest != "" && st.Available.Digest != "" {
+			matched = failed.Digest == st.Available.Digest
+		} else {
+			matched = failed.Version != "" && st.Available.Version != "" && failed.Version == st.Available.Version
+		}
+		if matched {
 			m.log.Warn("skipping auto-apply for previously failed update",
 				"version", st.Available.Version, "digest", st.Available.Digest, "reason", failed.Reason)
 			return
@@ -308,6 +353,7 @@ func (m *Manager) Status() Status {
 		CurrentDigest:   st.CurrentDigest(),
 		HomeDir:         st.HomeDir,
 		Supervised:      IsSupervised(),
+		CanRestart:      m.CanRestart(),
 		State:           state,
 		Message:         msg,
 		Inflight:        inflight,
@@ -424,8 +470,16 @@ func (m *Manager) buildSource(cfg config.Updater, tagOverride string) (ArtifactS
 		if strings.TrimSpace(cfg.GitHubRepo) == "" {
 			return nil, errors.New("updater.github_repo is required for github source")
 		}
+		ghTag := strings.TrimSpace(tagOverride)
+		if ghTag == "" {
+			ghTag = strings.TrimSpace(cfg.Tag)
+		}
+		if ghTag == "latest" {
+			ghTag = ""
+		}
 		return &GitHubSource{
 			Repo:       cfg.GitHubRepo,
+			Tag:        ghTag,
 			APIURL:     cfg.GitHubAPIURL,
 			Token:      secret,
 			Prerelease: cfg.Prerelease,
@@ -536,8 +590,18 @@ func (m *Manager) Check(ctx context.Context) (Status, error) {
 	return m.Status(), nil
 }
 
-// ApplyAsync begins an update in the background, returning ErrBusy if one is active.
+// CanRestart reports whether the Manager can trigger an automatic process restart
+// after switching releases (i.e. when running under `gatehouse supervise`).
+func (m *Manager) CanRestart() bool {
+	return m.deps.RequestRestart != nil
+}
+
+// ApplyAsync begins an update in the background, returning ErrBusy if one is active
+// or ErrRestartUnavailable if a restart is required without supervisor support.
 func (m *Manager) ApplyAsync(opts ApplyOptions) error {
+	if !opts.NoRestart && !m.CanRestart() && !m.deps.ManualRestartOK {
+		return ErrRestartUnavailable
+	}
 	m.mu.Lock()
 	if m.busy {
 		m.mu.Unlock()
@@ -562,6 +626,9 @@ func (m *Manager) ApplyAsync(opts ApplyOptions) error {
 // Apply downloads, verifies, preflights, drains in-flight requests, installs,
 // and triggers a restart (unless opts.NoRestart is set).
 func (m *Manager) Apply(ctx context.Context, opts ApplyOptions) (InstallResult, error) {
+	if !opts.NoRestart && !m.CanRestart() && !m.deps.ManualRestartOK {
+		return InstallResult{}, ErrRestartUnavailable
+	}
 	m.mu.Lock()
 	if m.busy {
 		m.mu.Unlock()
@@ -684,6 +751,9 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 
 // RollbackAsync starts an asynchronous rollback to opts.TargetVersion (or previous).
 func (m *Manager) RollbackAsync(opts RollbackOptions) error {
+	if !opts.NoRestart && !m.CanRestart() && !m.deps.ManualRestartOK {
+		return ErrRestartUnavailable
+	}
 	m.mu.Lock()
 	if m.busy {
 		m.mu.Unlock()
@@ -707,6 +777,9 @@ func (m *Manager) RollbackAsync(opts RollbackOptions) error {
 
 // Rollback switches to opts.TargetVersion (or previous) and triggers restart.
 func (m *Manager) Rollback(ctx context.Context, opts RollbackOptions) (InstallResult, error) {
+	if !opts.NoRestart && !m.CanRestart() && !m.deps.ManualRestartOK {
+		return InstallResult{}, ErrRestartUnavailable
+	}
 	m.mu.Lock()
 	if m.busy {
 		m.mu.Unlock()

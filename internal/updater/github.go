@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,6 +21,7 @@ const defaultGitHubAPIURL = "https://api.github.com"
 // GitHubSource checks and downloads Gatehouse release tarballs from GitHub Releases.
 type GitHubSource struct {
 	Repo       string
+	Tag        string
 	APIURL     string
 	Token      string
 	Prerelease bool
@@ -99,6 +101,29 @@ func (g *GitHubSource) fetchRelease(ctx context.Context) (*ghRelease, error) {
 		return nil, fmt.Errorf("invalid github_repo %q", g.Repo)
 	}
 	base := g.apiBase()
+	if tag := strings.TrimSpace(g.Tag); tag != "" && tag != "latest" {
+		u := fmt.Sprintf("%s/repos/%s/%s/releases/tags/%s", base, owner, name, url.PathEscape(tag))
+		resp, err := g.doGet(ctx, u, "application/vnd.github+json")
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("github releases/tags/%s HTTP %d: %s", tag, resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		var rel ghRelease
+		if err := json.Unmarshal(body, &rel); err != nil {
+			return nil, err
+		}
+		if rel.Draft {
+			return nil, fmt.Errorf("github release %q is a draft", tag)
+		}
+		return &rel, nil
+	}
 	if !g.Prerelease {
 		u := fmt.Sprintf("%s/repos/%s/%s/releases/latest", base, owner, name)
 		resp, err := g.doGet(ctx, u, "application/vnd.github+json")

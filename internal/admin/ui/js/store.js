@@ -178,6 +178,49 @@ export const store = {
     toast('已重新加载最新生效配置', 'ok');
   },
 
+  markConflict(currentHash) {
+    this.conflict = {
+      currentHash: currentHash || '',
+      message: '配置在您编辑期间已被其他操作修改，请重新加载后再应用。',
+    };
+    this.notify();
+  },
+
+  async syncAfterUpdaterSecret(kind, newRef, appliedHash = '') {
+    const fresh = await api.getConfig();
+    this.latestServer = fresh;
+    if (appliedHash && fresh?.hash && fresh.hash !== appliedHash) {
+      if (this.isDirty()) {
+        this.baseHash = appliedHash;
+        this.conflict = {
+          currentHash: fresh.hash,
+          message: '配置在您编辑期间已被其他操作修改，请重新加载后再应用。',
+        };
+      } else {
+        this.server = fresh;
+        this.baseHash = fresh?.hash || '';
+        this.conflict = null;
+      }
+      this.notify();
+      return fresh;
+    }
+
+    this.server = fresh;
+    this.baseHash = fresh?.hash || '';
+    this.conflict = null;
+    if ('updater' in this.drafts && this.drafts.updater && typeof this.drafts.updater === 'object') {
+      const field = kind === 'password' ? 'password_ref' : 'token_ref';
+      const serverRef = fresh?.raw?.updater?.[field];
+      this.drafts.updater[field] = serverRef !== undefined ? serverRef : (newRef || '');
+      const base = this.getServerSection('updater');
+      if (stableStringify(base) === stableStringify(this.drafts.updater)) {
+        delete this.drafts.updater;
+      }
+    }
+    this.notify();
+    return fresh;
+  },
+
   orderedDirtySections() {
     const keys = this.dirtySections();
     const order = ['providers', 'routing', 'aliases', 'redaction', 'general', 'updater'];

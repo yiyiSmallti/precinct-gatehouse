@@ -12,6 +12,9 @@ const ExitRestart = 75
 // EnvSupervised is set to "1" by `gatehouse supervise` for child processes.
 const EnvSupervised = "GATEHOUSE_SUPERVISED"
 
+// EnvHomeDir passes the supervisor's resolved --home directory to child processes.
+const EnvHomeDir = "GATEHOUSE_HOME"
+
 // Update state constants reported via Manager.Status() and Admin API.
 const (
 	StateIdle        = "idle"
@@ -128,6 +131,7 @@ type Status struct {
 	CurrentDigest   string         `json:"current_digest,omitempty"`
 	HomeDir         string         `json:"home_dir"`
 	Supervised      bool           `json:"supervised"`
+	CanRestart      bool           `json:"can_restart"`
 	State           string         `json:"state"`
 	Message         string         `json:"message,omitempty"`
 	Inflight        int64          `json:"inflight"`

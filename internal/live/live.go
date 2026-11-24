@@ -59,6 +59,7 @@ type LastError struct {
 // ApplyResult is returned after a successful Apply, Rollback or Reload.
 type ApplyResult struct {
 	Version         int64    `json:"version"`
+	Hash            string   `json:"hash,omitempty"`
 	RestartRequired []string `json:"restart_required"`
 }
 
@@ -294,7 +295,7 @@ func (m *Manager) applyLocked(prev *Snapshot, newBytes []byte, source string) (A
 	if restart == nil {
 		restart = []string{}
 	}
-	return ApplyResult{Version: snap.Version, RestartRequired: restart}, nil
+	return ApplyResult{Version: snap.Version, Hash: snap.Cfg.Hash(), RestartRequired: restart}, nil
 }
 
 // ReloadFromDisk reads the config file from disk and reloads if its hash changed.
@@ -322,7 +323,7 @@ func (m *Manager) reloadFromDiskLocked(source string) (ApplyResult, bool, error)
 		if rr == nil {
 			rr = []string{}
 		}
-		return ApplyResult{Version: prev.Version, RestartRequired: rr}, false, nil
+		return ApplyResult{Version: prev.Version, Hash: prev.Cfg.Hash(), RestartRequired: rr}, false, nil
 	}
 
 	newCfg, err := config.Parse(b, m.path)
@@ -356,7 +357,7 @@ func (m *Manager) reloadFromDiskLocked(source string) (ApplyResult, bool, error)
 	if restart == nil {
 		restart = []string{}
 	}
-	return ApplyResult{Version: snap.Version, RestartRequired: restart}, true, nil
+	return ApplyResult{Version: snap.Version, Hash: snap.Cfg.Hash(), RestartRequired: restart}, true, nil
 }
 
 func (m *Manager) recordError(err error) {

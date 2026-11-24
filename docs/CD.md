@@ -189,6 +189,7 @@ systemctl disable --now dsv41-gatehouse-pull.timer
 2. **在管理台「系统更新」配置自动更新**（全部参数支持热重载）：
    - 选择制品源（国内 OCI 镜像或 GitHub Releases），填好镜像地址/仓库与密码或 Token（加密保存在本地 SQLite `settings` 表，不以明文回传前端）。
    - 开启「启用定时自动检查」与「发现新版后自动排空并升级」。网关拉取新包并完成 `config check` 预检后，会等待活跃流式请求数归零（或达到 `drain_timeout` 上限）再原子切换并重启。
+   - **在线升级、版本回滚与 `auto_apply` 必须运行在 `gatehouse supervise` 托管模式下**；直接以 `gatehouse serve` 启动的独立实例仅支持检查更新，控制台和后台会自动拒绝会触发进程退出/重启的在线切换请求（如需命令行升级可运行 `gatehouse update apply` 后手动重启）。
 3. **从旧版 `dsv41-gatehouse-pull.timer` 迁移到内置更新（`gpu1`）**：
    - 将 `dsv41-gatehouse.service` 的 `ExecStart` 更新为 `gatehouse supervise --config ...`（参见 [dsv41-gatehouse.service](../deploy/systemd/dsv41-gatehouse.service)）并执行 `systemctl daemon-reload && systemctl restart dsv41-gatehouse`。
    - 停用旧的外部定时器避免双边拉取冲突：

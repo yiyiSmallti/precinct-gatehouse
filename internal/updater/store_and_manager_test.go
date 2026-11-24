@@ -34,7 +34,17 @@ func TestMain(m *testing.M) {
 }
 
 func runSuperviseHelper(cfgPath string) {
-	home := os.Getenv("GATEHOUSE_SUPERVISE_HOME")
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		os.Exit(2)
+	}
+	home := strings.TrimSpace(cfg.Updater.HomeDir)
+	if home == "" {
+		home = os.Getenv("GATEHOUSE_SUPERVISE_HOME")
+	}
+	if home == "" {
+		home = ResolveHomeDir("", cfgPath, "")
+	}
 	st := NewStore(home)
 	ver := st.CurrentVersion()
 
@@ -43,10 +53,6 @@ func runSuperviseHelper(cfgPath string) {
 		_ = f.Close()
 	}
 
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		os.Exit(2)
-	}
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		os.Exit(3)
@@ -64,6 +70,37 @@ func runSuperviseHelper(cfgPath string) {
 	})
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
+
+	// Optional hot-reload-home test trigger: rewrite config.yaml to point updater.home_dir
+	// to nextHome, stage pending update in nextHome, and exit with ExitRestart.
+	hotHomePath := filepath.Join(home, "hot_reload_home")
+	didHotPath := filepath.Join(home, "did_hot_reload_home")
+	if b, err := os.ReadFile(hotHomePath); err == nil {
+		if _, statErr := os.Stat(didHotPath); errors.Is(statErr, os.ErrNotExist) {
+			nextHome := strings.TrimSpace(string(b))
+			_ = os.WriteFile(didHotPath, []byte(nextHome), 0o644)
+			cfgBytes, _ := os.ReadFile(cfgPath)
+			updatedCfg := strings.ReplaceAll(string(cfgBytes), "home_dir: "+home, "home_dir: "+nextHome)
+			_ = os.WriteFile(cfgPath, []byte(updatedCfg), 0o600)
+
+			nextSt := NewStore(nextHome)
+			_ = nextSt.WritePending(&PendingUpdate{
+				TargetVersion:   "v2",
+				TargetDigest:    "sha256:v2-hot",
+				PreviousVersion: ver,
+				PreviousDigest:  "sha256:v1-hot",
+				RequestedAt:     time.Now().UTC(),
+			})
+			binName := binaryFilename()
+			relTarget := filepath.Join("..", "releases", "v2", binName)
+			absTarget := filepath.Join(nextHome, "releases", "v2", binName)
+			_ = atomicSwapBinary(nextSt.BinLink(), relTarget, absTarget)
+			_ = atomicWriteFile(filepath.Join(nextHome, currentVerFileName), []byte("v2\n"), 0o644)
+			_ = atomicWriteFile(filepath.Join(nextHome, prevVerFileName), []byte(ver+"\n"), 0o644)
+			_ = srv.Close()
+			os.Exit(ExitRestart)
+		}
+	}
 
 	// If v1 sees a trigger file, simulate applying an update to target version and exiting 75.
 	trigPath := filepath.Join(home, "trigger_target")
@@ -522,4 +559,351 @@ func TestSupervisorPlannedRestartAndAutoRollback(t *testing.T) {
 			t.Fatalf("expected .update_pending cleared after rollback, got %+v", pending)
 		}
 	})
+}
+
+func makeStagedArtifactWithData(t *testing.T, ver, payload string) VerifiedArtifact {
+	t.Helper()
+	dir := t.TempDir()
+	binName := binaryFilename()
+	binPath := filepath.Join(dir, binName)
+	data := []byte(payload)
+	if err := os.WriteFile(binPath, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	shaHex := hex.EncodeToString(sum[:])
+	sumsPath := filepath.Join(dir, "SHA256SUMS")
+	_ = os.WriteFile(sumsPath, []byte(shaHex+"  "+binName+"\n"), 0o644)
+	metaBytes, _ := json.Marshal(ReleaseMeta{Version: ver, BinarySHA256: shaHex})
+	metaPath := filepath.Join(dir, "RELEASE_META")
+	_ = os.WriteFile(metaPath, metaBytes, 0o644)
+	return VerifiedArtifact{
+		Version:      ver,
+		BinaryPath:   binPath,
+		BinarySHA256: shaHex,
+		SumsPath:     sumsPath,
+		MetaPath:     metaPath,
+	}
+}
+
+func TestStoreReinstallSameVersionPreservesRollback(t *testing.T) {
+	home := t.TempDir()
+	st := NewStore(home)
+	st.PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+	ctx := context.Background()
+
+	res1, err := st.Install(ctx, InstallRequest{
+		Version:       "v0.1.2",
+		Digest:        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Artifact:      makeStagedArtifactWithData(t, "v0.1.2", "build-one"),
+		KeepReleases:  5,
+		RecordPending: true,
+	})
+	if err != nil {
+		t.Fatalf("first Install v0.1.2: %v", err)
+	}
+	if res1.Version != "v0.1.2" {
+		t.Fatalf("expected first release ID v0.1.2, got %q", res1.Version)
+	}
+	_ = st.ClearPending()
+
+	// Reinstall the same version label with a rebuilt digest ("bbbbbbbb...").
+	res2, err := st.Install(ctx, InstallRequest{
+		Version:       "v0.1.2",
+		Digest:        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Artifact:      makeStagedArtifactWithData(t, "v0.1.2", "build-two"),
+		KeepReleases:  5,
+		RecordPending: true,
+	})
+	if err != nil {
+		t.Fatalf("second Install v0.1.2: %v", err)
+	}
+	if res2.Version == "v0.1.2" || res2.Version == res1.Version {
+		t.Fatalf("expected distinct release ID on same-version reinstall, got %q", res2.Version)
+	}
+	if res2.PreviousVersion != "v0.1.2" {
+		t.Fatalf("expected previous version v0.1.2, got %q", res2.PreviousVersion)
+	}
+	// Verify original build-one binary is preserved intact under releases/v0.1.2.
+	origBin, err := os.ReadFile(filepath.Join(st.ReleasesDir(), "v0.1.2", binaryFilename()))
+	if err != nil || string(origBin) != "build-one" {
+		t.Fatalf("expected preserved original binary 'build-one', got %q err=%v", string(origBin), err)
+	}
+
+	pending, err := st.ReadPending()
+	if err != nil || pending == nil {
+		t.Fatalf("expected pending update, got %+v err=%v", pending, err)
+	}
+	if pending.PreviousVersion == "" || pending.PreviousVersion == pending.TargetVersion {
+		t.Fatalf("expected distinct PreviousVersion and TargetVersion in pending update: %+v", pending)
+	}
+
+	if err := st.EmergencyRollback(pending.PreviousVersion, pending.PreviousDigest); err != nil {
+		t.Fatalf("EmergencyRollback failed: %v", err)
+	}
+	if st.CurrentVersion() != "v0.1.2" || st.CurrentDigest() != "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("unexpected state after EmergencyRollback: ver=%q digest=%q", st.CurrentVersion(), st.CurrentDigest())
+	}
+}
+
+func TestManagerRejectsRestartWhenUnsupervised(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(home, "data")
+	db, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	liveMgr, cfgPath := newTestLiveManager(t, fmt.Sprintf(`listen: 127.0.0.1:17788
+mode: personal
+data_dir: %s
+updater:
+  enabled: true
+  auto_apply: true
+  source: oci
+  image: registry.example.com/smallti/gatehouse
+  home_dir: %s
+`, dataDir, home))
+
+	var downloads atomic.Int32
+	src := &fakeSource{
+		remote: &RemoteInfo{Source: "oci", Version: "v0.2.0", Digest: "sha256:newdigest"},
+		artifact: &DownloadedArtifact{
+			Version: "v0.2.0",
+			Remote:  RemoteInfo{Source: "oci", Version: "v0.2.0", Digest: "sha256:newdigest"},
+		},
+	}
+
+	mgr := NewManager(Deps{
+		CurrentVersion: "v0.1.1",
+		ConfigPath:     cfgPath,
+		Live:           liveMgr,
+		DB:             db,
+		RequestRestart: nil, // standalone `gatehouse serve` mode
+		NewSource: func(_ config.Updater, _ string) (ArtifactSource, error) {
+			return &countingSource{inner: src, downloads: &downloads}, nil
+		},
+	})
+	mgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+
+	if mgr.CanRestart() || mgr.Status().CanRestart {
+		t.Fatal("expected CanRestart=false when RequestRestart is nil")
+	}
+
+	ctx := context.Background()
+	if _, err := mgr.Apply(ctx, ApplyOptions{}); !errors.Is(err, ErrRestartUnavailable) {
+		t.Fatalf("expected ErrRestartUnavailable from Apply, got %v", err)
+	}
+	if err := mgr.ApplyAsync(ApplyOptions{}); !errors.Is(err, ErrRestartUnavailable) {
+		t.Fatalf("expected ErrRestartUnavailable from ApplyAsync, got %v", err)
+	}
+	if _, err := mgr.Rollback(ctx, RollbackOptions{}); !errors.Is(err, ErrRestartUnavailable) {
+		t.Fatalf("expected ErrRestartUnavailable from Rollback, got %v", err)
+	}
+	if err := mgr.RollbackAsync(RollbackOptions{}); !errors.Is(err, ErrRestartUnavailable) {
+		t.Fatalf("expected ErrRestartUnavailable from RollbackAsync, got %v", err)
+	}
+
+	// Background auto-apply must also skip downloading/installing when RequestRestart == nil.
+	mgr.runBackgroundCycle(ctx)
+	if downloads.Load() != 0 {
+		t.Fatalf("expected 0 downloads during unsupervised background auto-apply, got %d", downloads.Load())
+	}
+
+	// Manual CLI invocation with ManualRestartOK=true should be allowed even without RequestRestart.
+	cliMgr := NewManager(Deps{
+		CurrentVersion:  "v0.1.1",
+		ConfigPath:      cfgPath,
+		StaticConfig:    &liveMgr.Current().Cfg.Updater,
+		DB:              db,
+		ManualRestartOK: true,
+		NewSource:       func(_ config.Updater, _ string) (ArtifactSource, error) { return src, nil },
+	})
+	cliMgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+	res, err := cliMgr.Apply(ctx, ApplyOptions{})
+	if err != nil {
+		t.Fatalf("expected ManualRestartOK Apply to succeed, got %v", err)
+	}
+	if res.Version != "v0.2.0" {
+		t.Fatalf("expected v0.2.0 installed, got %q", res.Version)
+	}
+}
+
+type countingSource struct {
+	inner     *fakeSource
+	downloads *atomic.Int32
+}
+
+func (c *countingSource) Check(ctx context.Context) (*RemoteInfo, error) {
+	return c.inner.Check(ctx)
+}
+
+func (c *countingSource) Download(ctx context.Context, outDir string) (*DownloadedArtifact, error) {
+	c.downloads.Add(1)
+	return c.inner.Download(ctx, outDir)
+}
+
+func TestSupervisorRelativeConfigPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink-based test helper uses unix symlinks")
+	}
+	t.Setenv("GATEHOUSE_SUPERVISE_HELPER", "1")
+	t.Setenv("GATEHOUSE_SUPERVISE_HOME", "")
+
+	base := t.TempDir()
+	confDir := filepath.Join(base, "conf")
+	home := filepath.Join(base, "home")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st := NewStore(home)
+	if err := os.MkdirAll(st.BinDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relDir := filepath.Join(st.ReleasesDir(), "v1")
+	if err := os.MkdirAll(relDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(exe, filepath.Join(relDir, binaryFilename())); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "releases", "v1", binaryFilename()), st.BinLink()); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := freeTCPAddr(t)
+	absCfgPath := filepath.Join(confDir, "config.yaml")
+	cfgYAML := fmt.Sprintf("listen: %s\nmode: personal\ndata_dir: %s\nupdater:\n  home_dir: %s\n", addr, filepath.Join(base, "data"), home)
+	if err := os.WriteFile(absCfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(base); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(origWD)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RunSupervisor(ctx, SuperviseOptions{
+			ConfigPath:    filepath.Join("conf", "config.yaml"),
+			ProbeInterval: 50 * time.Millisecond,
+		})
+	}()
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(filepath.Join(home, "boot_log.txt"))
+		if strings.Contains(string(b), "v1\n") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RunSupervisor returned error: %v", err)
+	}
+
+	b, _ := os.ReadFile(filepath.Join(home, "boot_log.txt"))
+	if !strings.Contains(string(b), "v1\n") {
+		t.Fatalf("expected child to boot with relative config resolved, boot_log=%q", string(b))
+	}
+	if _, err := os.Stat(filepath.Join(home, "conf", "conf", "config.yaml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected nested relative config file created inside homeDir (err=%v)", err)
+	}
+}
+
+func TestSupervisorSyncsHomeDirOnHotReload(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink-based test helper uses unix symlinks")
+	}
+	t.Setenv("GATEHOUSE_SUPERVISE_HELPER", "1")
+	t.Setenv("GATEHOUSE_SUPERVISE_HOME", "")
+
+	base := t.TempDir()
+	homeA := filepath.Join(base, "homeA")
+	homeB := filepath.Join(base, "homeB")
+	stA := NewStore(homeA)
+	stB := NewStore(homeB)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stage v1 only in homeA, and v2 only in homeB.
+	for _, spec := range []struct {
+		st  *Store
+		ver string
+	}{
+		{stA, "v1"},
+		{stB, "v2"},
+	} {
+		if err := os.MkdirAll(spec.st.BinDir(), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		relDir := filepath.Join(spec.st.ReleasesDir(), spec.ver)
+		if err := os.MkdirAll(relDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(exe, filepath.Join(relDir, binaryFilename())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join("..", "releases", "v1", binaryFilename()), stA.BinLink()); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(homeA, currentVerFileName), []byte("v1\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(homeA, "hot_reload_home"), []byte(homeB+"\n"), 0o644)
+
+	addr := freeTCPAddr(t)
+	cfgPath := filepath.Join(base, "config.yaml")
+	cfgYAML := fmt.Sprintf("listen: %s\nmode: personal\ndata_dir: %s\nupdater:\n  home_dir: %s\n  health_timeout: 2s\n", addr, filepath.Join(base, "data"), homeA)
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RunSupervisor(ctx, SuperviseOptions{
+			ConfigPath:    cfgPath,
+			ProbeInterval: 50 * time.Millisecond,
+			HealthTimeout: 3 * time.Second,
+		})
+	}()
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(filepath.Join(homeB, "boot_log.txt"))
+		pending, _ := stB.ReadPending()
+		if strings.Contains(string(b), "v2\n") && pending == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RunSupervisor returned error: %v", err)
+	}
+
+	bA, _ := os.ReadFile(filepath.Join(homeA, "boot_log.txt"))
+	bB, _ := os.ReadFile(filepath.Join(homeB, "boot_log.txt"))
+	if !strings.Contains(string(bA), "v1\n") || !strings.Contains(string(bB), "v2\n") {
+		t.Fatalf("expected homeA boot v1 and homeB boot v2; got homeA=%q homeB=%q", string(bA), string(bB))
+	}
+	if pending, _ := stB.ReadPending(); pending != nil {
+		t.Fatalf("expected homeB .update_pending cleared after health check, got %+v", pending)
+	}
 }
