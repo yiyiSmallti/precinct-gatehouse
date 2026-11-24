@@ -1287,3 +1287,78 @@ updater:
 		})
 	}
 }
+
+func TestManagerConfirmBootVerifiesRunningBinary(t *testing.T) {
+	t.Setenv(EnvSupervised, "")
+
+	home := t.TempDir()
+	st := NewStore(home)
+	st.PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+	ctx := context.Background()
+
+	if _, err := st.Install(ctx, InstallRequest{
+		Version:       "v0.2.0",
+		Digest:        "sha256:confirmboot",
+		Artifact:      makeStagedArtifactWithData(t, "v0.2.0", "release-v020-binary"),
+		KeepReleases:  5,
+		RecordPending: true,
+	}); err != nil {
+		t.Fatalf("Install v0.2.0: %v", err)
+	}
+
+	// Standalone old executable outside the newly installed release.
+	oldBinPath := filepath.Join(t.TempDir(), binaryFilename())
+	if err := os.WriteFile(oldBinPath, []byte("old-standalone-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Launching old standalone binary must NOT clear .update_pending or record activation.
+	oldMgr := NewManager(Deps{
+		CurrentVersion: "v0.1.0",
+		CurrentBinary:  oldBinPath,
+		StaticConfig:   &config.Updater{HomeDir: home},
+	})
+	oldMgr.ConfirmBoot()
+	if p, err := st.ReadPending(); err != nil || p == nil {
+		t.Fatalf("expected .update_pending preserved when running old executable, got %+v err=%v", p, err)
+	}
+	if len(oldMgr.Status().History) != 0 {
+		t.Fatalf("expected no activation history recorded for old binary, got %+v", oldMgr.Status().History)
+	}
+
+	// 2. Launching the newly installed bin/gatehouse clears .update_pending and records activation.
+	newMgr := NewManager(Deps{
+		CurrentVersion: "v0.2.0",
+		CurrentBinary:  st.BinLink(),
+		StaticConfig:   &config.Updater{HomeDir: home},
+	})
+	newMgr.ConfirmBoot()
+	if p, err := st.ReadPending(); err != nil || p != nil {
+		t.Fatalf("expected .update_pending cleared when running installed binary, got %+v err=%v", p, err)
+	}
+	if hist := newMgr.Status().History; len(hist) != 1 || hist[0].Action != "apply" || hist[0].Status != "ok" || hist[0].Version != "v0.2.0" {
+		t.Fatalf("expected apply/ok history event for v0.2.0, got %+v", hist)
+	}
+
+	// 3. Windows-style regular file copy at bin/gatehouse also confirms by SHA-256 match.
+	if err := st.WritePending(&PendingUpdate{
+		TargetVersion: "v0.2.0",
+		TargetDigest:  "sha256:confirmboot",
+		RequestedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(st.BinLink())
+	if err := os.WriteFile(st.BinLink(), []byte("release-v020-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	copyMgr := NewManager(Deps{
+		CurrentVersion: "v0.2.0",
+		CurrentBinary:  st.BinLink(),
+		StaticConfig:   &config.Updater{HomeDir: home},
+	})
+	copyMgr.ConfirmBoot()
+	if p, err := st.ReadPending(); err != nil || p != nil {
+		t.Fatalf("expected .update_pending cleared for matching regular-file copy, got %+v err=%v", p, err)
+	}
+}

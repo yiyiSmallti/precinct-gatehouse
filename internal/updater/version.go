@@ -166,5 +166,10 @@ func IsNewerVersion(remote, current string) bool {
 	if c == "" || c == "dev" || strings.HasSuffix(c, "-dev") {
 		return r != c
 	}
+	// Manual, local, and archived baseline builds can upgrade onto any SemVer release.
+	if strings.HasPrefix(c, "manual-") || strings.HasPrefix(c, "local-") || strings.HasPrefix(c, "baseline-") {
+		_, ok := parseSemver(r)
+		return ok
+	}
 	return false
 }

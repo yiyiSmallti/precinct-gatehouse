@@ -178,7 +178,7 @@ func (m *Manager) ConfirmBoot() {
 	st := m.Store()
 	if !IsSupervised() {
 		if pending, err := st.ReadPending(); err == nil && pending != nil {
-			if pending.TargetVersion == m.deps.CurrentVersion || st.CurrentVersion() == pending.TargetVersion {
+			if m.runningMatchesRelease(st, pending.TargetVersion) {
 				_ = st.ClearPending()
 				m.recordEvent(UpdateEvent{
 					At:      time.Now().UTC(),
@@ -194,6 +194,42 @@ func (m *Manager) ConfirmBoot() {
 	if failed, err := st.ReadFailed(); err == nil && failed != nil {
 		m.recordFailedOnce(failed)
 	}
+}
+
+func (m *Manager) runningMatchesRelease(st *Store, targetVersion string) bool {
+	targetBin := st.releaseBinaryPath(targetVersion)
+	if targetBin == "" {
+		return false
+	}
+	exe := strings.TrimSpace(m.deps.CurrentBinary)
+	if exe == "" {
+		var err error
+		exe, err = os.Executable()
+		if err != nil || strings.TrimSpace(exe) == "" {
+			return false
+		}
+	}
+	exeInfo, err := os.Stat(exe)
+	if err != nil || exeInfo.IsDir() {
+		return false
+	}
+	targetInfo, err := os.Stat(targetBin)
+	if err != nil || targetInfo.IsDir() {
+		return false
+	}
+	if os.SameFile(exeInfo, targetInfo) {
+		return true
+	}
+	// On Windows, bin/gatehouse.exe is a regular file copy of releases/<target>/gatehouse.exe:
+	// confirm the running executable IS bin/gatehouse.exe AND matches targetBin's SHA-256.
+	if binInfo, err := os.Stat(st.BinLink()); err == nil && !binInfo.IsDir() && os.SameFile(exeInfo, binInfo) {
+		exeSHA, err1 := SHA256File(exe)
+		targetSHA, err2 := SHA256File(targetBin)
+		if err1 == nil && err2 == nil && exeSHA != "" && strings.EqualFold(exeSHA, targetSHA) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) recordFailedOnce(failed *FailedUpdate) {
