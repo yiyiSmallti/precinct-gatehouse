@@ -150,6 +150,7 @@ type ProviderStatus struct {
 	Mode               string          `json:"mode"`
 	HeavyMissThreshold int             `json:"heavy_miss_threshold"`
 	HeavyStickySec     int             `json:"heavy_sticky_sec"`
+	SpilloverThreshold int             `json:"spillover_threshold"`
 	SSEKeepaliveSec    int             `json:"sse_keepalive_sec"`
 	HealthIntervalSec  int             `json:"health_interval_sec"`
 	ZhThinkAnchor      bool            `json:"zh_think_anchor"`
@@ -228,6 +229,9 @@ func normalizeRouterConfig(cfg RouterConfig, defaultPersist string) RouterConfig
 	if cfg.HeavyStickySec == 0 {
 		cfg.HeavyStickySec = 12
 	}
+	if cfg.SpilloverThreshold == 0 {
+		cfg.SpilloverThreshold = 4
+	}
 	if cfg.SSEKeepaliveSec == 0 {
 		cfg.SSEKeepaliveSec = 15
 	}
@@ -263,6 +267,16 @@ func heavyStickyDuration(cfg RouterConfig) time.Duration {
 		return 12 * time.Second
 	}
 	return time.Duration(cfg.HeavyStickySec) * time.Second
+}
+
+func spilloverThreshold(cfg RouterConfig) int {
+	if cfg.SpilloverThreshold < 0 {
+		return 0
+	}
+	if cfg.SpilloverThreshold == 0 {
+		return 4
+	}
+	return cfg.SpilloverThreshold
 }
 
 func sseKeepaliveInterval(sec int) time.Duration {
@@ -398,7 +412,7 @@ func (r *Router) rebuildBackends(list []BackendConfig) error {
 		nextByID[bc.ID] = bs
 		toProbe = append(toProbe, bs)
 	}
-	sort.Slice(nextList, func(i, j int) bool {
+	sort.SliceStable(nextList, func(i, j int) bool {
 		return nextList[i].config().Tier < nextList[j].config().Tier
 	})
 	r.backends = nextList
@@ -974,6 +988,13 @@ type resolvedBackend struct {
 	state  *BackendState
 }
 
+func backendLoad(s *BackendState) (heavy, reqs, total int64) {
+	if s == nil {
+		return 0, 0, 0
+	}
+	return s.activeHeavy.Load(), s.activeReqs.Load(), s.totalRouted.Load()
+}
+
 func (r *Router) selectBackend(an *RequestAnalysis, exclude map[string]bool) (*BackendState, string, bool) {
 	backends := r.getBackends()
 	resolved := make([]resolvedBackend, len(backends))
@@ -982,14 +1003,17 @@ func (r *Router) selectBackend(an *RequestAnalysis, exclude map[string]bool) (*B
 		resolved[i] = resolvedBackend{cfg: cfg, target: target, state: b}
 	}
 	cfg := r.getConfig()
-	rb, reason, heavy := selectResolvedBackend(r, resolved, cfg.HeavyMissThreshold, heavyStickyDuration(cfg), an, exclude)
+	rb, reason, heavy := selectResolvedBackend(r, resolved, cfg.HeavyMissThreshold, spilloverThreshold(cfg), heavyStickyDuration(cfg), an, exclude)
 	if rb == nil {
 		return nil, reason, heavy
 	}
 	return rb.state, reason, heavy
 }
 
-func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh int, stickyDur time.Duration, an *RequestAnalysis, exclude map[string]bool) (*resolvedBackend, string, bool) {
+func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh, spillThresh int, stickyDur time.Duration, an *RequestAnalysis, exclude map[string]bool) (*resolvedBackend, string, bool) {
+	if len(backends) == 0 {
+		return nil, "no-backends", false
+	}
 	if heavyThresh <= 0 {
 		heavyThresh = 24000
 	}
@@ -1015,7 +1039,25 @@ func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh in
 			}
 			return nil, "no-backends", false
 		}
-		return allHealthy[len(allHealthy)-1], "fallback-largest", an.MissEst >= heavyThresh
+		topTier := allHealthy[len(allHealthy)-1].cfg.Tier
+		var topCands []*resolvedBackend
+		for _, rb := range allHealthy {
+			if rb.cfg.Tier == topTier {
+				topCands = append(topCands, rb)
+			}
+		}
+		sort.SliceStable(topCands, func(i, j int) bool {
+			hi, ri, ti := backendLoad(topCands[i].state)
+			hj, rj, tj := backendLoad(topCands[j].state)
+			if hi != hj {
+				return hi < hj
+			}
+			if ri != rj {
+				return ri < rj
+			}
+			return ti < tj
+		})
+		return topCands[0], "fallback-largest", an.MissEst >= heavyThresh
 	}
 
 	isHeavyMiss := an.MissEst >= heavyThresh
@@ -1028,36 +1070,39 @@ func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh in
 			}
 		}
 		if len(idle) > 0 {
-			sort.Slice(idle, func(i, j int) bool {
+			sort.SliceStable(idle, func(i, j int) bool {
 				ci, cj := idle[i].cfg, idle[j].cfg
 				if ci.SpeedScore != cj.SpeedScore {
 					return ci.SpeedScore > cj.SpeedScore
 				}
-				return ci.Tier > cj.Tier
+				if ci.Tier != cj.Tier {
+					return ci.Tier > cj.Tier
+				}
+				_, _, ti := backendLoad(idle[i].state)
+				_, _, tj := backendLoad(idle[j].state)
+				return ti < tj
 			})
 			return idle[0], fmt.Sprintf("heavy-miss-idle(miss=%d)", an.MissEst), true
 		}
 
-		sort.Slice(eligible, func(i, j int) bool {
-			var hi, hj, ri, rj int64
-			if eligible[i].state != nil {
-				hi, ri = eligible[i].state.activeHeavy.Load(), eligible[i].state.activeReqs.Load()
-			}
-			if eligible[j].state != nil {
-				hj, rj = eligible[j].state.activeHeavy.Load(), eligible[j].state.activeReqs.Load()
-			}
+		sort.SliceStable(eligible, func(i, j int) bool {
+			hi, ri, ti := backendLoad(eligible[i].state)
+			hj, rj, tj := backendLoad(eligible[j].state)
 			if hi != hj {
 				return hi < hj
 			}
 			if ri != rj {
 				return ri < rj
 			}
-			return eligible[i].cfg.Tier < eligible[j].cfg.Tier
+			if eligible[i].cfg.Tier != eligible[j].cfg.Tier {
+				return eligible[i].cfg.Tier < eligible[j].cfg.Tier
+			}
+			return ti < tj
 		})
 		return eligible[0], fmt.Sprintf("heavy-miss-least-busy(miss=%d)", an.MissEst), true
 	}
 
-	targetTier := 1
+	targetTier := backends[0].cfg.Tier
 	for _, rb := range backends {
 		if an.TotalEst < rb.cfg.PromoteAt {
 			targetTier = rb.cfg.Tier
@@ -1067,13 +1112,14 @@ func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh in
 	}
 
 	var sessTier int
-	var heavyWriteBackend string
+	var lastBackend, heavyWriteBackend string
 	var heavyWriteAt time.Time
 	var hasSess bool
 	if r != nil {
 		r.mu.RLock()
 		if sess, ok := r.sessions[an.SessionKey]; ok {
 			sessTier = sess.Tier
+			lastBackend = sess.LastBackend
 			heavyWriteBackend = sess.HeavyWriteBackend
 			heavyWriteAt = sess.HeavyWriteAt
 			hasSess = true
@@ -1110,20 +1156,96 @@ func selectResolvedBackend(r *Router, backends []resolvedBackend, heavyThresh in
 		reason = fmt.Sprintf("tier%d-promoted(%d)", targetTier, an.TotalEst)
 	}
 
+	pickLeastActive := func(cands []*resolvedBackend) *resolvedBackend {
+		sort.SliceStable(cands, func(i, j int) bool {
+			hi, ri, ti := backendLoad(cands[i].state)
+			hj, rj, tj := backendLoad(cands[j].state)
+			if hi != hj {
+				return hi < hj
+			}
+			if ri != rj {
+				return ri < rj
+			}
+			// Prefer the session's previous backend on load ties for direct L1 VRAM hit.
+			if hasSess && lastBackend != "" {
+				li := cands[i].cfg.ID == lastBackend
+				lj := cands[j].cfg.ID == lastBackend
+				if li != lj {
+					return li
+				}
+			}
+			return ti < tj
+		})
+		return cands[0]
+	}
+
+	var sameTier, upperTier []*resolvedBackend
 	for _, rb := range eligible {
 		if rb.cfg.Tier == targetTier {
-			return rb, reason, false
+			sameTier = append(sameTier, rb)
+		} else if rb.cfg.Tier > targetTier {
+			upperTier = append(upperTier, rb)
 		}
 	}
-	for _, rb := range eligible {
-		if rb.cfg.Tier > targetTier {
-			return rb, reason + "-failover-up", false
+
+	if len(sameTier) > 0 {
+		bestSame := pickLeastActive(sameTier)
+		bestHeavy, bestReqs, _ := backendLoad(bestSame.state)
+		sameBusy := (spillThresh > 0 && bestReqs >= int64(spillThresh)) || bestHeavy > 0
+		if sameBusy && len(upperTier) > 0 {
+			var spillCands []*resolvedBackend
+			for _, ub := range upperTier {
+				uh, ur, _ := backendLoad(ub.state)
+				if uh > 0 {
+					continue
+				}
+				if ur == 0 || ur+2 <= bestReqs {
+					spillCands = append(spillCands, ub)
+				}
+			}
+			if len(spillCands) > 0 {
+				sort.SliceStable(spillCands, func(i, j int) bool {
+					_, ri, ti := backendLoad(spillCands[i].state)
+					_, rj, tj := backendLoad(spillCands[j].state)
+					// Prefer truly idle upper-tier backends first; then lower tiers to protect top tier.
+					if (ri == 0) != (rj == 0) {
+						return ri == 0
+					}
+					if spillCands[i].cfg.Tier != spillCands[j].cfg.Tier {
+						return spillCands[i].cfg.Tier < spillCands[j].cfg.Tier
+					}
+					if ri != rj {
+						return ri < rj
+					}
+					return ti < tj
+				})
+				return spillCands[0], fmt.Sprintf("%s-spillover(t%d_busy=%d)", reason, targetTier, bestReqs), false
+			}
 		}
+		return bestSame, reason, false
+	}
+
+	if len(upperTier) > 0 {
+		sort.SliceStable(upperTier, func(i, j int) bool {
+			if upperTier[i].cfg.Tier != upperTier[j].cfg.Tier {
+				return upperTier[i].cfg.Tier < upperTier[j].cfg.Tier
+			}
+			hi, ri, ti := backendLoad(upperTier[i].state)
+			hj, rj, tj := backendLoad(upperTier[j].state)
+			if hi != hj {
+				return hi < hj
+			}
+			if ri != rj {
+				return ri < rj
+			}
+			return ti < tj
+		})
+		return upperTier[0], reason + "-failover-up", false
 	}
 	return eligible[len(eligible)-1], reason + "-failover", false
 }
 
-func (r *Router) recordCompletion(backends []resolvedBackend, an *RequestAnalysis, backendID string, backendTier int, isHeavyWriter, isStickyWrite bool, heavyMissThreshold int, actualPrompt, actualCached int) {
+func (r *Router) recordCompletion(backends []resolvedBackend, an *RequestAnalysis, backendID string, backendTier int, isHeavyWriter, isTemporaryTier bool, heavyMissThreshold int, actualPrompt, actualCached int) {
 	if r == nil || an == nil || len(an.Hashes) == 0 {
 		return
 	}
@@ -1193,7 +1315,7 @@ func (r *Router) recordCompletion(backends []resolvedBackend, an *RequestAnalysi
 			homeTier = prev.Tier
 		}
 	}
-	if !isHeavyWriter && !isStickyWrite && backendTier > homeTier {
+	if !isHeavyWriter && !isTemporaryTier && backendTier > homeTier {
 		homeTier = backendTier
 	}
 	var heavyWriteBackend string
@@ -1445,6 +1567,7 @@ func (r *Router) Status() ProviderStatus {
 		Mode:               cfg.Mode,
 		HeavyMissThreshold: cfg.HeavyMissThreshold,
 		HeavyStickySec:     cfg.HeavyStickySec,
+		SpilloverThreshold: cfg.SpilloverThreshold,
 		SSEKeepaliveSec:    cfg.SSEKeepaliveSec,
 		HealthIntervalSec:  cfg.HealthIntervalSec,
 		ZhThinkAnchor:      zhAnchorEnabled(cfg),

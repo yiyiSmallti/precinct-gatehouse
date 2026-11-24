@@ -731,7 +731,7 @@ VALUES('req_legacy',1795520000,'2026-11-24','legacy-key','chat','ds/m1',200,1,10
 	defer db.Close()
 
 	_, err = db.Exec(`INSERT INTO request_log(request_id,ts,day,key_name,protocol,model,status,stream,prompt_tokens,completion_tokens,cached_tokens,latency_ms,ttft_ms,body_read_ms,request_bytes,admitted)
-VALUES('req_slow_upload',1795523495,'2026-11-24','prod-key','chat','ds/m1',200,1,268133,1686,266752,148000,7250,112000,94000000,1);`)
+VALUES('req_slow_upload',1795523495,'2026-11-24','prod-key','chat','ds/m1',200,1,268133,1686,266752,36000,7250,112000,94000000,1);`)
 	if err != nil {
 		t.Fatalf("insert new row: %v", err)
 	}

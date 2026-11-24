@@ -238,7 +238,7 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 	if st.release != nil {
 		st.release(st.rec.Status, int64(st.rec.PromptTokens+st.rec.CompletionTokens))
 	}
-	st.rec.LatencyMS = time.Since(st.start).Milliseconds()
+	st.rec.LatencyMS = time.Since(st.serviceOrigin()).Milliseconds()
 	st.rec.BodyReadMS = st.bodyRead.Milliseconds()
 	st.rec.RequestBytes = st.requestBytes
 	if p.Meter != nil {
@@ -499,7 +499,10 @@ func BodyReadError(ctx context.Context, err error) *oai.Error {
 	return oai.Errorf(http.StatusRequestTimeout, "request_body_read_error", "%v", err)
 }
 
-func (st *reqState) ttftOrigin() time.Time {
+// serviceOrigin returns the timestamp after the full request body was read,
+// so both latency_ms and ttft_ms exclude slow client uploads while mid-upload
+// failures (where bodyDone remains zero) fall back to request start.
+func (st *reqState) serviceOrigin() time.Time {
 	if !st.bodyDone.IsZero() {
 		return st.bodyDone
 	}
@@ -513,12 +516,13 @@ func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error
 	}
 	readStart := time.Now()
 	body, err := io.ReadAll(rc)
-	st.bodyDone = time.Now()
-	st.bodyRead = st.bodyDone.Sub(readStart)
+	readEnd := time.Now()
+	st.bodyRead = readEnd.Sub(readStart)
 	st.requestBytes = int64(len(body))
 	if err != nil {
 		return nil, BodyReadError(r.Context(), err)
 	}
+	st.bodyDone = readEnd
 	req, err := st.decode(body)
 	if err != nil {
 		var oe *oai.Error
@@ -851,7 +855,7 @@ func (p *Pipeline) relayBuffered(ctx context.Context, st *reqState, resp *http.R
 	alreadyWritten := st.written
 	st.written = true
 	st.keepaliveOnly = false
-	st.ttft = time.Since(st.ttftOrigin())
+	st.ttft = time.Since(st.serviceOrigin())
 	if !clientStream {
 		st.w.Header().Set("Content-Type", "application/json")
 		st.w.WriteHeader(http.StatusOK)
@@ -1032,7 +1036,7 @@ func (p *Pipeline) relayStream(ctx context.Context, st *reqState, resp *http.Res
 				}
 				hasContent, wrote := p.flushEvent(st.w, item.ev, clientUsage, &usage, &done, &sawStreamErr)
 				if hasContent && st.ttft == 0 {
-					st.ttft = time.Since(st.ttftOrigin())
+					st.ttft = time.Since(st.serviceOrigin())
 				}
 				if fl != nil {
 					fl.Flush()

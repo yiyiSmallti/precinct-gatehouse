@@ -193,7 +193,7 @@ func newSnapshotPlan(provider, target string, tc config.TieredConfig, defaultPer
 			fallback: fb,
 		})
 	}
-	sort.Slice(backends, func(i, j int) bool {
+	sort.SliceStable(backends, func(i, j int) bool {
 		return backends[i].cfg.Tier < backends[j].cfg.Tier
 	})
 	return &snapshotPlan{
@@ -568,7 +568,7 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 			if cerr := req.Context().Err(); cerr != nil {
 				return nil, false, cerr
 			}
-			rb, reason, isHeavy := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, stickyDur, an, exclude)
+			rb, reason, isHeavy := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, spilloverThreshold(t.plan.cfg), stickyDur, an, exclude)
 			if rb == nil {
 				return nil, true, nil
 			}
@@ -616,8 +616,8 @@ func (t *hubTransport) roundTripActive(req *http.Request, r *Router) (*http.Resp
 				releaseActive()
 				actualPrompt, actualCached := extractUsageFromTail(tail)
 				if r != nil && completed && statusCode >= 200 && statusCode < 300 {
-					isStickyWrite := strings.HasPrefix(reason, "heavy-write-sticky(")
-					r.recordCompletion(resolved, an, bCfg.ID, bCfg.Tier, isHeavy, isStickyWrite, t.plan.cfg.HeavyMissThreshold, actualPrompt, actualCached)
+					isTemporaryTier := strings.Contains(reason, "-spillover(") || strings.HasPrefix(reason, "heavy-write-sticky(")
+					r.recordCompletion(resolved, an, bCfg.ID, bCfg.Tier, isHeavy, isTemporaryTier, t.plan.cfg.HeavyMissThreshold, actualPrompt, actualCached)
 					if starterTmpl != nil {
 						r.starters.Observe(starterTmpl)
 					}
@@ -800,7 +800,7 @@ func (t *hubTransport) roundTripShadow(req *http.Request, r *Router) (*http.Resp
 	resolved := t.plan.resolve(r)
 	var predID, predReason string
 	if ok {
-		if pb, pr, _ := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, heavyStickyDuration(t.plan.cfg), an, nil); pb != nil {
+		if pb, pr, _ := selectResolvedBackend(r, resolved, t.plan.cfg.HeavyMissThreshold, spilloverThreshold(t.plan.cfg), heavyStickyDuration(t.plan.cfg), an, nil); pb != nil {
 			predID = pb.cfg.ID
 			predReason = pr
 		}
@@ -873,8 +873,8 @@ func (t *hubTransport) roundTripShadow(req *http.Request, r *Router) (*http.Resp
 			actualPrompt, actualCached := extractUsageFromTail(tail)
 			if r != nil && completed && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				if actualID != "" {
-					isStickyWrite := strings.HasPrefix(actualReason, "heavy-write-sticky(")
-					r.recordCompletion(resolved, an, actualID, actualTier, actualHeavy, isStickyWrite, t.plan.cfg.HeavyMissThreshold, actualPrompt, actualCached)
+					isTemporaryTier := strings.Contains(actualReason, "-spillover(") || strings.HasPrefix(actualReason, "heavy-write-sticky(")
+					r.recordCompletion(resolved, an, actualID, actualTier, actualHeavy, isTemporaryTier, t.plan.cfg.HeavyMissThreshold, actualPrompt, actualCached)
 				}
 				if starterTmpl != nil {
 					r.starters.Observe(starterTmpl)

@@ -253,3 +253,100 @@ updater:
 		})
 	}
 }
+
+func TestTieredMultiNodeSameTierValidation(t *testing.T) {
+	dir := t.TempDir()
+	validYAML := `
+providers:
+  - name: ds
+    base_url: http://127.0.0.1:29999/v1
+    models: [DeepSeek-V4.1-Flash-1017]
+    tiered:
+      mode: shadow
+      heavy_miss_threshold: 24000
+      spillover_threshold: 4
+      health_interval_sec: 5
+      backends:
+        - id: gpu2-200k
+          url: http://198.18.200.11:30010
+          tier: 1
+          max_context_tokens: 204800
+          max_safe_input: 185000
+          promote_at: 150000
+          speed_score: 55
+        - id: gpu3-200k
+          url: http://198.18.200.12:30020
+          tier: 1
+          max_context_tokens: 204800
+          max_safe_input: 185000
+          promote_at: 150000
+          speed_score: 55
+        - id: gpu3-512k
+          url: http://198.18.200.12:30010
+          tier: 2
+          max_context_tokens: 524288
+          max_safe_input: 495000
+          promote_at: 450000
+          demote_below: 100000
+          speed_score: 55
+        - id: gpu2-512k
+          url: http://198.18.200.11:30020
+          tier: 2
+          max_context_tokens: 524288
+          max_safe_input: 495000
+          promote_at: 450000
+          demote_below: 100000
+          speed_score: 55
+        - id: gpu1-1m
+          url: http://127.0.0.1:30000
+          tier: 3
+          max_context_tokens: 1048576
+          max_safe_input: 1048576
+          promote_at: 1048576
+          demote_below: 350000
+          speed_score: 110
+`
+	cfg, err := Parse([]byte(validYAML), filepath.Join(dir, "multi-node.yaml"))
+	if err != nil {
+		t.Fatalf("Parse 5-backend same-tier config failed: %v", err)
+	}
+	tc := cfg.Providers[0].Tiered
+	if tc == nil || len(tc.Backends) != 5 || tc.SpilloverThreshold != 4 {
+		t.Fatalf("unexpected tiered config after Parse: %+v", tc)
+	}
+
+	rawYAML, err := MarshalRaw(cfg.RawCopy())
+	if err != nil {
+		t.Fatalf("MarshalRaw failed: %v", err)
+	}
+	reloaded, err := Parse(rawYAML, filepath.Join(dir, "multi-node-roundtrip.yaml"))
+	if err != nil {
+		t.Fatalf("re-Parse failed: %v", err)
+	}
+	if len(reloaded.Providers[0].Tiered.Backends) != 5 || reloaded.Providers[0].Tiered.SpilloverThreshold != 4 {
+		t.Fatalf("round-trip lost backends or spillover_threshold: %+v", reloaded.Providers[0].Tiered)
+	}
+
+	dupIDYAML := `
+providers:
+  - name: ds
+    base_url: http://127.0.0.1:29999/v1
+    models: [m1]
+    tiered:
+      mode: shadow
+      backends:
+        - id: node-a
+          url: http://127.0.0.1:30010
+          tier: 1
+          max_safe_input: 1000
+          promote_at: 500
+        - id: node-a
+          url: http://127.0.0.1:30020
+          tier: 2
+          max_safe_input: 2000
+          promote_at: 1500
+`
+	if _, err := Parse([]byte(dupIDYAML), filepath.Join(dir, "dup-id.yaml")); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("expected duplicate id validation error, got %v", err)
+	}
+}
