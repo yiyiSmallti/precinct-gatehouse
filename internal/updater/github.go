@@ -3,6 +3,8 @@ package updater
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -215,21 +217,39 @@ func (g *GitHubSource) downloadAsset(ctx context.Context, asset *ghAsset, destPa
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("download asset %s HTTP %d: %s", asset.Name, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	if resp.ContentLength > maxSize {
+		return fmt.Errorf("asset %s content-length %d exceeds maximum size (%d)", asset.Name, resp.ContentLength, maxSize)
+	}
 
 	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-	written, copyErr := io.Copy(f, io.LimitReader(resp.Body, maxSize+1))
+	h := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxSize+1))
 	closeErr := f.Close()
 	if copyErr != nil {
+		_ = os.Remove(destPath)
 		return copyErr
 	}
 	if closeErr != nil {
+		_ = os.Remove(destPath)
 		return closeErr
 	}
 	if written > maxSize {
+		_ = os.Remove(destPath)
 		return fmt.Errorf("asset %s exceeds maximum size (%d)", asset.Name, maxSize)
+	}
+	if advertised := strings.TrimSpace(asset.Digest); advertised != "" {
+		computed := "sha256:" + hex.EncodeToString(h.Sum(nil))
+		if !strings.HasPrefix(advertised, "sha256:") {
+			_ = os.Remove(destPath)
+			return fmt.Errorf("asset %s uses unsupported digest algorithm: %q", asset.Name, advertised)
+		}
+		if !strings.EqualFold(computed, advertised) {
+			_ = os.Remove(destPath)
+			return fmt.Errorf("asset %s digest mismatch: expected %s, got %s", asset.Name, advertised, computed)
+		}
 	}
 	return nil
 }

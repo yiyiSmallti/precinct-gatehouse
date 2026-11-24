@@ -567,8 +567,14 @@ func (s *Store) EmergencyRollback(targetVersion, restoreDigest string) error {
 	if err := atomicWriteFile(filepath.Join(s.HomeDir, currentVerFileName), []byte(targetVersion+"\n"), 0o644); err != nil {
 		return err
 	}
-	if strings.TrimSpace(restoreDigest) != "" {
-		_ = atomicWriteFile(filepath.Join(s.HomeDir, currentDigestFile), []byte(strings.TrimSpace(restoreDigest)+"\n"), 0o644)
+	effDigest := strings.TrimSpace(restoreDigest)
+	if effDigest == "" {
+		effDigest = s.releaseDigest(targetVersion)
+	}
+	if effDigest != "" {
+		_ = atomicWriteFile(filepath.Join(s.HomeDir, currentDigestFile), []byte(effDigest+"\n"), 0o644)
+	} else {
+		_ = os.Remove(filepath.Join(s.HomeDir, currentDigestFile))
 	}
 	return nil
 }

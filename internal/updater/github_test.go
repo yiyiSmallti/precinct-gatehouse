@@ -9,7 +9,9 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -213,5 +215,77 @@ func TestGitHubSourceExplicitTag(t *testing.T) {
 	}
 	if remLatest.Version != "v0.9.9" {
 		t.Fatalf("expected v0.9.9 for latest, got %q", remLatest.Version)
+	}
+}
+
+func TestGitHubSourceRejectsMismatchedAssetDigest(t *testing.T) {
+	binName := binaryFilename()
+	binBytes := []byte("gatehouse-gh-digest-test")
+	binSum := sha256.Sum256(binBytes)
+	binHex := hex.EncodeToString(binSum[:])
+	sumsBytes := []byte(binHex + "  " + binName + "\n")
+	metaBytes, _ := json.Marshal(ReleaseMeta{Version: "v0.4.0", BinarySHA256: binHex})
+	tarBytes := buildTestTar(t, true, map[string][]byte{
+		binName:        binBytes,
+		"SHA256SUMS":   sumsBytes,
+		"RELEASE_META": metaBytes,
+	})
+	tarSum := sha256.Sum256(tarBytes)
+	tarDigest := "sha256:" + hex.EncodeToString(tarSum[:])
+	assetName := fmt.Sprintf("gatehouse_v0.4.0_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+
+	var currentDigest string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/yiyiSmallti/precinct-gatehouse/releases/latest":
+			_ = json.NewEncoder(w).Encode(ghRelease{
+				TagName: "v0.4.0",
+				Assets: []ghAsset{{
+					ID:                 301,
+					Name:               assetName,
+					Digest:             currentDigest,
+					BrowserDownloadURL: srv.URL + "/dl/" + assetName,
+				}},
+			})
+		case "/dl/" + assetName:
+			_, _ = w.Write(tarBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	src := &GitHubSource{
+		Repo:       "yiyiSmallti/precinct-gatehouse",
+		APIURL:     srv.URL,
+		HTTPClient: NewHTTPClient(0, nil),
+	}
+
+	// 1. Mismatched sha256 digest advertised by API must fail before extraction.
+	currentDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	out1 := t.TempDir()
+	if _, err := src.Download(context.Background(), out1); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("expected asset digest mismatch error, got: %v", err)
+	}
+	if entries, _ := os.ReadDir(out1); len(entries) != 0 {
+		t.Fatalf("expected clean outDir after digest mismatch, got %d entries", len(entries))
+	}
+
+	// 2. Unsupported digest algorithm must fail cleanly.
+	currentDigest = "sha512:deadbeef"
+	out2 := t.TempDir()
+	if _, err := src.Download(context.Background(), out2); err == nil || !strings.Contains(err.Error(), "unsupported digest algorithm") {
+		t.Fatalf("expected unsupported digest algorithm error, got: %v", err)
+	}
+
+	// 3. Matching sha256 digest succeeds and reports the digest.
+	currentDigest = tarDigest
+	art, err := src.Download(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("Download with matching asset digest failed: %v", err)
+	}
+	if art.Version != "v0.4.0" || art.Remote.Digest != tarDigest {
+		t.Fatalf("unexpected artifact with matching asset digest: %+v", art)
 	}
 }

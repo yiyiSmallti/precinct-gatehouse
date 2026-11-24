@@ -152,6 +152,17 @@ func (m *Manager) currentConfig() config.Updater {
 	return currentUpdaterConfig(m.deps)
 }
 
+func (m *Manager) currentResolvedHome() string {
+	cfg := m.currentConfig()
+	exePath, _ := os.Executable()
+	if exePath != "" {
+		if abs, err := filepath.Abs(exePath); err == nil {
+			exePath = abs
+		}
+	}
+	return resolveManagerHome(cfg.HomeDir, m.deps.ConfigPath, exePath)
+}
+
 func (m *Manager) syncStoreHome(cfg config.Updater) {
 	exePath, _ := os.Executable()
 	if exePath != "" {
@@ -756,6 +767,7 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 	cfg := m.currentConfig()
 	m.syncStoreHome(cfg)
 	st := m.Store()
+	initialHome := st.HomeDir
 
 	if opts.Auto {
 		if !cfg.Enabled || !cfg.AutoApply {
@@ -831,15 +843,23 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 			return InstallResult{}, nil
 		}
 	}
+	if curHome := m.currentResolvedHome(); curHome != initialHome {
+		m.syncStoreHome(m.currentConfig())
+		err := fmt.Errorf("updater.home_dir changed during update (%s -> %s); aborting cutover", initialHome, curHome)
+		m.releaseBusyOnError(err, "apply", art.Version, art.Remote.Digest)
+		return InstallResult{}, err
+	}
 
 	willRestart := !opts.NoRestart && m.deps.RequestRestart != nil
 	draining := false
 	restarting := false
-	defer func() {
+	stopDraining := func() {
 		if draining && !restarting && m.deps.SetDraining != nil {
 			m.deps.SetDraining(false)
 		}
-	}()
+		draining = false
+	}
+	defer stopDraining()
 	if willRestart && m.deps.SetDraining != nil {
 		m.deps.SetDraining(true)
 		draining = true
@@ -848,9 +868,17 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 	if !opts.Force {
 		drainTimeout := cfg.DrainTimeout.D(5 * time.Minute)
 		if err := m.waitForInflightDrain(ctx, drainTimeout); err != nil {
+			stopDraining()
 			m.releaseBusyOnError(err, "apply", art.Version, art.Remote.Digest)
 			return InstallResult{}, err
 		}
+	}
+	if curHome := m.currentResolvedHome(); curHome != initialHome {
+		stopDraining()
+		m.syncStoreHome(m.currentConfig())
+		err := fmt.Errorf("updater.home_dir changed during update (%s -> %s); aborting cutover", initialHome, curHome)
+		m.releaseBusyOnError(err, "apply", art.Version, art.Remote.Digest)
+		return InstallResult{}, err
 	}
 
 	fallbackBin := strings.TrimSpace(m.deps.CurrentBinary)
@@ -876,6 +904,7 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 		SkipPreflight:      true,
 	})
 	if err != nil {
+		stopDraining()
 		m.releaseBusyOnError(err, "apply", art.Version, art.Remote.Digest)
 		return InstallResult{}, err
 	}
@@ -961,15 +990,18 @@ func (m *Manager) runRollbackLocked(ctx context.Context, opts RollbackOptions) (
 	cfg := m.currentConfig()
 	m.syncStoreHome(cfg)
 	st := m.Store()
+	initialHome := st.HomeDir
 
 	willRestart := !opts.NoRestart && m.deps.RequestRestart != nil
 	draining := false
 	restarting := false
-	defer func() {
+	stopDraining := func() {
 		if draining && !restarting && m.deps.SetDraining != nil {
 			m.deps.SetDraining(false)
 		}
-	}()
+		draining = false
+	}
+	defer stopDraining()
 	if willRestart && m.deps.SetDraining != nil {
 		m.deps.SetDraining(true)
 		draining = true
@@ -978,14 +1010,23 @@ func (m *Manager) runRollbackLocked(ctx context.Context, opts RollbackOptions) (
 	if !opts.Force {
 		drainTimeout := cfg.DrainTimeout.D(5 * time.Minute)
 		if err := m.waitForInflightDrain(ctx, drainTimeout); err != nil {
+			stopDraining()
 			m.releaseBusyOnError(err, "rollback", opts.TargetVersion, "")
 			return InstallResult{}, err
 		}
+	}
+	if curHome := m.currentResolvedHome(); curHome != initialHome {
+		stopDraining()
+		m.syncStoreHome(m.currentConfig())
+		err := fmt.Errorf("updater.home_dir changed during rollback (%s -> %s); aborting cutover", initialHome, curHome)
+		m.releaseBusyOnError(err, "rollback", opts.TargetVersion, "")
+		return InstallResult{}, err
 	}
 
 	m.setState(StateApplying, "正在回滚发布目录...", "")
 	res, err := st.Rollback(ctx, opts.TargetVersion, m.deps.ConfigPath, !opts.NoRestart)
 	if err != nil {
+		stopDraining()
 		m.releaseBusyOnError(err, "rollback", opts.TargetVersion, "")
 		return InstallResult{}, err
 	}

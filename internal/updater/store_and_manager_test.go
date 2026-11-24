@@ -1644,6 +1644,17 @@ func TestCheckEndpointHealthCorrelatesReleaseAndBootNonce(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "previous release") {
 		t.Fatalf("expected baseline rollback to reject previous release response, got: %v", err)
 	}
+
+	// 6. Degraded status with missing required detectors must fail readiness check even with matching version & ack.
+	body = `{"status":"degraded","version":"v0.2.0","detectors_unavailable":["ner"]}`
+	ackHeader = BootAck("nonce-3")
+	if err := checkEndpointHealth(context.Background(), client, dataURL, "", healthExpectation{
+		ExpectedVersion: "v0.2.0",
+		BootNonce:       "nonce-3",
+		RequireBootAck:  true,
+	}); err == nil || !strings.Contains(err.Error(), "degraded") || !strings.Contains(err.Error(), "ner") {
+		t.Fatalf("expected degraded healthz with ner missing to fail, got: %v", err)
+	}
 }
 
 func TestSupervisorRejectsStrayInstanceOccupyingPortAndRollsBack(t *testing.T) {
@@ -2038,5 +2049,243 @@ func TestStoreListReleasesDistinguishesVerifiedVsUnverifiedSignature(t *testing.
 	}
 	if !byVer["v2.0.0"].Signed || !byVer["v2.0.0"].HasSignature {
 		t.Fatalf("unexpected v2.0.0 signature flags: %+v", byVer["v2.0.0"])
+	}
+}
+
+func TestManagerAbortsCutoverWhenHomeDirChangesMidOperation(t *testing.T) {
+	ctx := context.Background()
+
+	mkYAML := func(dataDir, home string) string {
+		return fmt.Sprintf(`listen: 127.0.0.1:17788
+mode: personal
+data_dir: %s
+updater:
+  enabled: true
+  auto_apply: false
+  drain_timeout: 30s
+  source: oci
+  image: registry.example.com/smallti/gatehouse
+  home_dir: %s
+`, dataDir, home)
+	}
+
+	t.Run("apply_home_dir_changed_during_drain", func(t *testing.T) {
+		homeA := filepath.Join(t.TempDir(), "homeA")
+		homeB := filepath.Join(t.TempDir(), "homeB")
+		dataDir := t.TempDir()
+		db, err := store.Open(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		liveMgr, cfgPath := newTestLiveManager(t, mkYAML(dataDir, homeA))
+		var inflight atomic.Int64
+		inflight.Store(1)
+		var draining atomic.Bool
+		var restarts atomic.Int32
+
+		src := &fakeSource{
+			remote:   &RemoteInfo{Source: "oci", Version: "v0.2.0", Digest: "sha256:homedir-apply"},
+			artifact: &DownloadedArtifact{Version: "v0.2.0", Remote: RemoteInfo{Source: "oci", Version: "v0.2.0", Digest: "sha256:homedir-apply"}},
+		}
+		mgr := NewManager(Deps{
+			CurrentVersion: "v0.1.0",
+			ConfigPath:     cfgPath,
+			Live:           liveMgr,
+			DB:             db,
+			Inflight:       inflight.Load,
+			SetDraining:    func(d bool) { draining.Store(d) },
+			RequestRestart: func() { restarts.Add(1) },
+			NewSource:      func(_ config.Updater, _ string) (ArtifactSource, error) { return src, nil },
+		})
+		mgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+
+		if err := mgr.ApplyAsync(ApplyOptions{Force: false}); err != nil {
+			t.Fatalf("ApplyAsync: %v", err)
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && mgr.Status().State != StateDraining {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if mgr.Status().State != StateDraining || !draining.Load() {
+			t.Fatalf("expected StateDraining with draining=true, got state=%s draining=%v", mgr.Status().State, draining.Load())
+		}
+
+		// Hot-reload home_dir while apply is draining.
+		if _, err := liveMgr.Apply([]byte(mkYAML(dataDir, homeB)), "web", liveMgr.Current().Cfg.Hash()); err != nil {
+			t.Fatalf("hot-reload home_dir: %v", err)
+		}
+		inflight.Store(0)
+
+		deadline = time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && mgr.Status().State == StateDraining {
+			time.Sleep(20 * time.Millisecond)
+		}
+		stSnap := mgr.Status()
+		if stSnap.State != StateError || !strings.Contains(stSnap.LastError, "home_dir changed") {
+			t.Fatalf("expected error mentioning home_dir changed, got state=%s err=%q", stSnap.State, stSnap.LastError)
+		}
+		if draining.Load() {
+			t.Fatal("expected draining restored to false after aborted cutover")
+		}
+		if restarts.Load() != 0 {
+			t.Fatalf("expected 0 restarts, got %d", restarts.Load())
+		}
+		if p, _ := NewStore(homeA).ReadPending(); p != nil {
+			t.Fatalf("expected no pending marker in old homeA, got %+v", p)
+		}
+		if got := NewStore(homeA).CurrentVersion(); got != "" {
+			t.Fatalf("expected no release installed in homeA, got %q", got)
+		}
+		if mgr.Store().HomeDir != homeB {
+			t.Fatalf("expected manager store synced to homeB %q, got %q", homeB, mgr.Store().HomeDir)
+		}
+	})
+
+	t.Run("rollback_home_dir_changed_during_drain", func(t *testing.T) {
+		homeA := filepath.Join(t.TempDir(), "homeA")
+		homeB := filepath.Join(t.TempDir(), "homeB")
+		dataDir := t.TempDir()
+		db, err := store.Open(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		stA := NewStore(homeA)
+		stA.PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+		for _, ver := range []string{"v0.1.0", "v0.2.0"} {
+			if _, err := stA.Install(ctx, InstallRequest{
+				Version:      ver,
+				Digest:       "sha256:" + ver,
+				Artifact:     makeStagedArtifact(t, ver),
+				KeepReleases: 5,
+			}); err != nil {
+				t.Fatalf("Install %s: %v", ver, err)
+			}
+		}
+
+		liveMgr, cfgPath := newTestLiveManager(t, mkYAML(dataDir, homeA))
+		var inflight atomic.Int64
+		inflight.Store(1)
+		var draining atomic.Bool
+		var restarts atomic.Int32
+
+		mgr := NewManager(Deps{
+			CurrentVersion: "v0.2.0",
+			ConfigPath:     cfgPath,
+			Live:           liveMgr,
+			DB:             db,
+			Inflight:       inflight.Load,
+			SetDraining:    func(d bool) { draining.Store(d) },
+			RequestRestart: func() { restarts.Add(1) },
+		})
+		mgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+
+		if err := mgr.RollbackAsync(RollbackOptions{TargetVersion: "v0.1.0", Force: false}); err != nil {
+			t.Fatalf("RollbackAsync: %v", err)
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && mgr.Status().State != StateDraining {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if mgr.Status().State != StateDraining || !draining.Load() {
+			t.Fatalf("expected StateDraining with draining=true, got state=%s draining=%v", mgr.Status().State, draining.Load())
+		}
+
+		if _, err := liveMgr.Apply([]byte(mkYAML(dataDir, homeB)), "web", liveMgr.Current().Cfg.Hash()); err != nil {
+			t.Fatalf("hot-reload home_dir: %v", err)
+		}
+		inflight.Store(0)
+
+		deadline = time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && mgr.Status().State == StateDraining {
+			time.Sleep(20 * time.Millisecond)
+		}
+		stSnap := mgr.Status()
+		if stSnap.State != StateError || !strings.Contains(stSnap.LastError, "home_dir changed") {
+			t.Fatalf("expected error mentioning home_dir changed, got state=%s err=%q", stSnap.State, stSnap.LastError)
+		}
+		if draining.Load() {
+			t.Fatal("expected draining restored to false after aborted rollback")
+		}
+		if restarts.Load() != 0 {
+			t.Fatalf("expected 0 restarts, got %d", restarts.Load())
+		}
+		if p, _ := NewStore(homeA).ReadPending(); p != nil {
+			t.Fatalf("expected no pending marker in old homeA, got %+v", p)
+		}
+		if got := NewStore(homeA).CurrentVersion(); got != "v0.2.0" {
+			t.Fatalf("expected homeA to remain on v0.2.0, got %q", got)
+		}
+		if mgr.Store().HomeDir != homeB {
+			t.Fatalf("expected manager store synced to homeB %q, got %q", homeB, mgr.Store().HomeDir)
+		}
+	})
+}
+
+func TestStoreEmergencyRollbackClearsStaleDigestForBaseline(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Baseline without a digest clears failed release's .current_digest.
+	home := t.TempDir()
+	st := NewStore(home)
+	st.PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+	fbBin := filepath.Join(t.TempDir(), binaryFilename())
+	if err := os.WriteFile(fbBin, []byte("pre-updater-baseline"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.Install(ctx, InstallRequest{
+		Version:            "v0.2.0",
+		Digest:             "sha256:failed-v020",
+		Artifact:           makeStagedArtifact(t, "v0.2.0"),
+		FallbackBinaryPath: fbBin,
+		KeepReleases:       5,
+		RecordPending:      true,
+	})
+	if err != nil {
+		t.Fatalf("Install v0.2.0: %v", err)
+	}
+	baselineVer := res.PreviousVersion
+	if !strings.HasPrefix(baselineVer, "baseline-") {
+		t.Fatalf("expected baseline previous version, got %q", baselineVer)
+	}
+	if got := st.CurrentDigest(); got != "sha256:failed-v020" {
+		t.Fatalf("expected CurrentDigest=sha256:failed-v020 before rollback, got %q", got)
+	}
+
+	if err := st.EmergencyRollback(baselineVer, ""); err != nil {
+		t.Fatalf("EmergencyRollback to baseline: %v", err)
+	}
+	if got := st.CurrentVersion(); got != baselineVer {
+		t.Fatalf("expected CurrentVersion=%q, got %q", baselineVer, got)
+	}
+	if got := st.CurrentDigest(); got != "" {
+		t.Fatalf("expected empty CurrentDigest after baseline emergency rollback, got %q", got)
+	}
+
+	// 2. Restoring a release with a stored .digest populates .current_digest even if restoreDigest param is empty.
+	if _, err := st.Install(ctx, InstallRequest{
+		Version:      "v0.1.0",
+		Digest:       "sha256:good-v010",
+		Artifact:     makeStagedArtifact(t, "v0.1.0"),
+		KeepReleases: 5,
+	}); err != nil {
+		t.Fatalf("Install v0.1.0: %v", err)
+	}
+	if _, err := st.Install(ctx, InstallRequest{
+		Version:      "v0.3.0",
+		Digest:       "sha256:bad-v030",
+		Artifact:     makeStagedArtifact(t, "v0.3.0"),
+		KeepReleases: 5,
+	}); err != nil {
+		t.Fatalf("Install v0.3.0: %v", err)
+	}
+	if err := st.EmergencyRollback("v0.1.0", ""); err != nil {
+		t.Fatalf("EmergencyRollback to v0.1.0: %v", err)
+	}
+	if got := st.CurrentDigest(); got != "sha256:good-v010" {
+		t.Fatalf("expected CurrentDigest restored to sha256:good-v010, got %q", got)
 	}
 }

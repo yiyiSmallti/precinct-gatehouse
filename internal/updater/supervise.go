@@ -473,13 +473,17 @@ func checkEndpointHealth(ctx context.Context, client *http.Client, dataURL, admi
 		return fmt.Errorf("%s returned HTTP %d", dataURL, resp.StatusCode)
 	}
 	var payload struct {
-		Status  string `json:"status"`
-		Version string `json:"version"`
+		Status               string   `json:"status"`
+		Version              string   `json:"version"`
+		DetectorsUnavailable []string `json:"detectors_unavailable"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return fmt.Errorf("invalid healthz json: %w", err)
 	}
-	if payload.Status != "ok" && payload.Status != "degraded" {
+	if payload.Status != "ok" {
+		if len(payload.DetectorsUnavailable) > 0 {
+			return fmt.Errorf("healthz status=%q (detectors_unavailable=%v)", payload.Status, payload.DetectorsUnavailable)
+		}
 		return fmt.Errorf("healthz status=%q", payload.Status)
 	}
 	ack := strings.TrimSpace(resp.Header.Get(HeaderBootAck))
