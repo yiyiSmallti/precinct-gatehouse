@@ -55,6 +55,7 @@ type ApplyOptions struct {
 	Tag       string
 	Force     bool
 	NoRestart bool
+	Auto      bool
 }
 
 // RollbackOptions controls Rollback / RollbackAsync behavior.
@@ -285,7 +286,9 @@ func (m *Manager) runBackgroundCycle(ctx context.Context) {
 		m.log.Warn("background update check failed", "err", err)
 		return
 	}
-	if st.Available == nil || !st.Available.UpdateAvailable || !cfg.AutoApply {
+	// Reload policy after the remote check so disabling auto-update mid-check stops auto-apply.
+	cfg = m.currentConfig()
+	if !cfg.Enabled || !cfg.AutoApply || st.Available == nil || !st.Available.UpdateAvailable {
 		return
 	}
 	if !m.CanRestart() {
@@ -305,7 +308,7 @@ func (m *Manager) runBackgroundCycle(ctx context.Context) {
 			return
 		}
 	}
-	if _, err := m.Apply(ctx, ApplyOptions{Force: false}); err != nil && !errors.Is(err, ErrBusy) {
+	if _, err := m.Apply(ctx, ApplyOptions{Force: false, Auto: true}); err != nil && !errors.Is(err, ErrBusy) {
 		m.log.Warn("background auto-update failed", "err", err)
 	}
 }
@@ -695,6 +698,20 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 	if err := st.Preflight(ctx, art.Verified.BinaryPath, m.deps.ConfigPath); err != nil {
 		m.releaseBusyOnError(err, "apply", art.Version, art.Remote.Digest)
 		return InstallResult{}, err
+	}
+
+	if opts.Auto {
+		latestCfg := m.currentConfig()
+		if !latestCfg.Enabled || !latestCfg.AutoApply {
+			m.log.Info("aborting background auto-apply: policy disabled before cutover",
+				"enabled", latestCfg.Enabled, "auto_apply", latestCfg.AutoApply)
+			m.mu.Lock()
+			m.busy = false
+			m.state = StateIdle
+			m.message = "已取消自动更新（策略已关闭）"
+			m.mu.Unlock()
+			return InstallResult{}, nil
+		}
 	}
 
 	willRestart := !opts.NoRestart && m.deps.RequestRestart != nil

@@ -154,16 +154,15 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 		if err := cmd.Start(); err != nil {
 			if pending != nil && pending.PreviousVersion != "" && pending.PreviousVersion != pending.TargetVersion {
 				log.Error("new release failed to start; rolling back", "target", pending.TargetVersion, "previous", pending.PreviousVersion, "err", err)
-				_ = store.EmergencyRollback(pending.PreviousVersion, pending.PreviousDigest)
-				_ = store.WriteFailed(&FailedUpdate{
-					Version: pending.TargetVersion,
-					Digest:  pending.TargetDigest,
-					Reason:  fmt.Sprintf("start failed: %v", err),
-					At:      time.Now().UTC(),
-				})
-				_ = store.ClearPending()
-				backoff = 0
+				var ok bool
+				backoff, ok = handlePendingFailure(ctx, store, pending, fmt.Sprintf("start failed: %v", err), backoff, log)
+				if !ok {
+					return nil
+				}
 				continue
+			}
+			if pending != nil {
+				_ = store.ClearPending()
 			}
 			log.Error("supervisor failed to start gatehouse", "bin", binPath, "err", err)
 			backoff = nextBackoff(backoff)
@@ -264,21 +263,11 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 			}
 			log.Error("updated release failed verification; initiating automatic rollback",
 				"target", pending.TargetVersion, "previous", pending.PreviousVersion, "reason", rollbackReason)
-			if pending.PreviousVersion != "" && pending.PreviousVersion != pending.TargetVersion {
-				if rerr := store.EmergencyRollback(pending.PreviousVersion, pending.PreviousDigest); rerr != nil {
-					log.Error("automatic rollback failed", "err", rerr)
-				} else {
-					log.Info("automatically rolled back to previous release", "version", pending.PreviousVersion)
-				}
-				_ = store.WriteFailed(&FailedUpdate{
-					Version: pending.TargetVersion,
-					Digest:  pending.TargetDigest,
-					Reason:  rollbackReason,
-					At:      time.Now().UTC(),
-				})
+			var ok bool
+			backoff, ok = handlePendingFailure(ctx, store, pending, rollbackReason, backoff, log)
+			if !ok {
+				return nil
 			}
-			_ = store.ClearPending()
-			backoff = 0
 			continue
 		}
 
@@ -297,6 +286,35 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 			return nil
 		}
 	}
+}
+
+func handlePendingFailure(ctx context.Context, store *Store, pending *PendingUpdate, reason string, backoff time.Duration, log *slog.Logger) (time.Duration, bool) {
+	if pending.PreviousVersion != "" && pending.PreviousVersion != pending.TargetVersion {
+		if rerr := store.EmergencyRollback(pending.PreviousVersion, pending.PreviousDigest); rerr != nil {
+			log.Error("automatic rollback failed; keeping .update_pending for retry",
+				"target", pending.TargetVersion, "previous", pending.PreviousVersion, "err", rerr)
+			next := nextBackoff(backoff)
+			if !sleepCtx(ctx, next) {
+				return next, false
+			}
+			return next, true
+		}
+		log.Info("automatically rolled back to previous release", "version", pending.PreviousVersion)
+		_ = store.WriteFailed(&FailedUpdate{
+			Version: pending.TargetVersion,
+			Digest:  pending.TargetDigest,
+			Reason:  reason,
+			At:      time.Now().UTC(),
+		})
+		_ = store.ClearPending()
+		return 0, true
+	}
+	_ = store.ClearPending()
+	next := nextBackoff(backoff)
+	if !sleepCtx(ctx, next) {
+		return next, false
+	}
+	return next, true
 }
 
 func probeTargets(configPath string, overrideTimeout time.Duration) (dataURL, adminURL string, timeout time.Duration) {

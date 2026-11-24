@@ -1096,3 +1096,194 @@ updater:
 		}
 	})
 }
+
+func TestSupervisorRetainsPendingWhenRollbackLocked(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink-based test helper uses unix symlinks")
+	}
+	t.Setenv("GATEHOUSE_SUPERVISE_HELPER", "1")
+
+	home, cfgPath, st := setupSupervisorFixture(t, "v_bad")
+	t.Setenv("GATEHOUSE_SUPERVISE_HOME", home)
+
+	// Hold the deployment lock so EmergencyRollback fails transiently at first.
+	unlock, err := acquireFileLock(st.LockPath())
+	if err != nil {
+		t.Fatalf("acquireFileLock: %v", err)
+	}
+	var unlockOnce sync.Once
+	releaseLock := func() { unlockOnce.Do(unlock) }
+	defer releaseLock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RunSupervisor(ctx, SuperviseOptions{
+			ConfigPath:    cfgPath,
+			HomeDir:       home,
+			ProbeInterval: 40 * time.Millisecond,
+			HealthTimeout: 300 * time.Millisecond,
+		})
+	}()
+
+	// Wait until v_bad has booted at least twice while the lock is held, proving the supervisor
+	// kept .update_pending and backed off instead of clearing recovery markers on EmergencyRollback error.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(filepath.Join(home, "boot_log.txt"))
+		if strings.Count(string(b), "v_bad\n") >= 2 {
+			break
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	bLocked, _ := os.ReadFile(filepath.Join(home, "boot_log.txt"))
+	if strings.Count(string(bLocked), "v_bad\n") < 2 {
+		cancel()
+		<-done
+		t.Fatalf("expected >=2 v_bad boots while rollback locked, got:\n%s", string(bLocked))
+	}
+	pendingWhileLocked, perr := st.ReadPending()
+	if perr != nil || pendingWhileLocked == nil {
+		cancel()
+		<-done
+		t.Fatalf("expected .update_pending retained when EmergencyRollback fails, got %+v err=%v", pendingWhileLocked, perr)
+	}
+
+	// Release the deployment lock; next verification failure must roll back cleanly to v1.
+	releaseLock()
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		failed, _ := st.ReadFailed()
+		if failed != nil && st.CurrentVersion() == "v1" {
+			pendingNow, _ := st.ReadPending()
+			if pendingNow == nil {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RunSupervisor returned error: %v", err)
+	}
+
+	if st.CurrentVersion() != "v1" {
+		t.Fatalf("expected rollback to v1 once lock released, got %q", st.CurrentVersion())
+	}
+	if p, _ := st.ReadPending(); p != nil {
+		t.Fatalf("expected .update_pending cleared after successful rollback, got %+v", p)
+	}
+	if failed, _ := st.ReadFailed(); failed == nil || failed.Version != "v_bad" {
+		t.Fatalf("expected .failed_update for v_bad after successful rollback, got %+v", failed)
+	}
+}
+
+type hookCheckSource struct {
+	remote   *RemoteInfo
+	artifact *DownloadedArtifact
+	onCheck  func()
+	dlCount  *atomic.Int32
+}
+
+func (h *hookCheckSource) Check(_ context.Context) (*RemoteInfo, error) {
+	if h.onCheck != nil {
+		h.onCheck()
+	}
+	cp := *h.remote
+	return &cp, nil
+}
+
+func (h *hookCheckSource) Download(ctx context.Context, outDir string) (*DownloadedArtifact, error) {
+	h.dlCount.Add(1)
+	return (&fakeSource{remote: h.remote, artifact: h.artifact}).Download(ctx, outDir)
+}
+
+func TestManagerBackgroundCycleRechecksPolicyAfterCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		nextCfg   func(dataDir, home string) string
+		wantApply bool
+	}{
+		{
+			name: "auto_apply_disabled_during_check",
+			nextCfg: func(dataDir, home string) string {
+				return fmt.Sprintf(`listen: 127.0.0.1:17788
+mode: personal
+data_dir: %s
+updater:
+  enabled: true
+  auto_apply: false
+  source: oci
+  image: registry.example.com/smallti/gatehouse
+  home_dir: %s
+`, dataDir, home)
+			},
+		},
+		{
+			name: "enabled_disabled_during_check",
+			nextCfg: func(dataDir, home string) string {
+				return fmt.Sprintf(`listen: 127.0.0.1:17788
+mode: personal
+data_dir: %s
+updater:
+  enabled: false
+  auto_apply: false
+  source: oci
+  image: registry.example.com/smallti/gatehouse
+  home_dir: %s
+`, dataDir, home)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			dataDir := filepath.Join(home, "data")
+			db, err := store.Open(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+
+			liveMgr, cfgPath := newTestLiveManager(t, fmt.Sprintf(`listen: 127.0.0.1:17788
+mode: personal
+data_dir: %s
+updater:
+  enabled: true
+  auto_apply: true
+  source: oci
+  image: registry.example.com/smallti/gatehouse
+  home_dir: %s
+`, dataDir, home))
+
+			var dlCount, restartCount atomic.Int32
+			remote := &RemoteInfo{Source: "oci", Version: "v0.2.0", Digest: "sha256:policytest"}
+			src := &hookCheckSource{
+				remote:   remote,
+				artifact: &DownloadedArtifact{Version: "v0.2.0", Remote: *remote},
+				dlCount:  &dlCount,
+				onCheck: func() {
+					_, aerr := liveMgr.Apply([]byte(tc.nextCfg(dataDir, home)), "web", liveMgr.Current().Cfg.Hash())
+					if aerr != nil {
+						t.Fatalf("hot reload inside Check: %v", aerr)
+					}
+				},
+			}
+
+			mgr := NewManager(Deps{
+				CurrentVersion: "v0.1.1",
+				ConfigPath:     cfgPath,
+				Live:           liveMgr,
+				DB:             db,
+				RequestRestart: func() { restartCount.Add(1) },
+				NewSource:      func(_ config.Updater, _ string) (ArtifactSource, error) { return src, nil },
+			})
+			mgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+
+			mgr.runBackgroundCycle(context.Background())
+			if dlCount.Load() != 0 || restartCount.Load() != 0 {
+				t.Fatalf("expected background cycle to abort apply after policy disabled, got downloads=%d restarts=%d",
+					dlCount.Load(), restartCount.Load())
+			}
+		})
+	}
+}
