@@ -2,6 +2,9 @@ package updater
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -128,9 +131,9 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 			args = append(args, "--config", configPath)
 		}
 		cmd := exec.Command(binPath, args...)
-		env := make([]string, 0, len(os.Environ())+2)
+		env := make([]string, 0, len(os.Environ())+3)
 		for _, kv := range os.Environ() {
-			if strings.HasPrefix(kv, EnvSupervised+"=") || strings.HasPrefix(kv, EnvHomeDir+"=") {
+			if strings.HasPrefix(kv, EnvSupervised+"=") || strings.HasPrefix(kv, EnvHomeDir+"=") || strings.HasPrefix(kv, EnvBootNonce+"=") {
 				continue
 			}
 			env = append(env, kv)
@@ -138,6 +141,13 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 		env = append(env, EnvSupervised+"=1")
 		if optHome != "" {
 			env = append(env, EnvHomeDir+"="+optHome)
+		}
+		var bootNonce string
+		if pending != nil {
+			bootNonce = newBootNonce()
+			if bootNonce != "" {
+				env = append(env, EnvBootNonce+"="+bootNonce)
+			}
 		}
 		cmd.Env = env
 		if opts.Stdout != nil {
@@ -191,10 +201,11 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 		)
 		if pending != nil {
 			dataURL, adminURL, hTimeout := probeTargets(configPath, opts.HealthTimeout)
+			expect := buildHealthExpectation(store, pending, bootNonce)
 			healthCtx, healthStop = context.WithCancel(ctx)
 			healthErrCh = make(chan error, 1)
 			go func() {
-				healthErrCh <- waitForHealth(healthCtx, dataURL, adminURL, hTimeout, probeInterval)
+				healthErrCh <- waitForHealth(healthCtx, dataURL, adminURL, hTimeout, probeInterval, expect)
 			}()
 		}
 
@@ -356,12 +367,78 @@ func probeURL(listenAddr, path string) string {
 	return "http://" + net.JoinHostPort(host, port) + path
 }
 
-func waitForHealth(ctx context.Context, dataURL, adminURL string, timeout, interval time.Duration) error {
+type healthExpectation struct {
+	ExpectedVersion string
+	RejectVersion   string
+	BootNonce       string
+	RequireBootAck  bool
+}
+
+// BootAck returns the expected X-Gatehouse-Boot-Ack header value for a boot nonce.
+func BootAck(nonce string) string {
+	sum := sha256.Sum256([]byte("gatehouse-boot-ack:" + nonce))
+	return hex.EncodeToString(sum[:])
+}
+
+func newBootNonce() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func buildHealthExpectation(store *Store, pending *PendingUpdate, bootNonce string) healthExpectation {
+	expect := healthExpectation{
+		BootNonce: bootNonce,
+	}
+	if pending == nil {
+		return expect
+	}
+	if strings.HasPrefix(pending.TargetVersion, "baseline-") {
+		// Archived baseline binaries may predate boot-nonce support; still correlate
+		// nonces if supported and reject responses matching the replaced release.
+		expect.RejectVersion = releaseAppVersion(store, pending.PreviousVersion)
+		return expect
+	}
+	expect.ExpectedVersion = releaseAppVersion(store, pending.TargetVersion)
+	expect.RequireBootAck = bootNonce != ""
+	return expect
+}
+
+func releaseAppVersion(store *Store, relID string) string {
+	relID = strings.TrimSpace(relID)
+	if relID == "" || store == nil {
+		return ""
+	}
+	if err := ValidateVersion(relID); err == nil {
+		if mb, err := os.ReadFile(filepath.Join(store.ReleasesDir(), relID, "RELEASE_META")); err == nil {
+			var meta ReleaseMeta
+			if json.Unmarshal(mb, &meta) == nil {
+				if v := strings.TrimSpace(meta.Version); v != "" && !strings.HasPrefix(v, "baseline-") {
+					return v
+				}
+			}
+		}
+	}
+	if !strings.HasPrefix(relID, "baseline-") {
+		return relID
+	}
+	return ""
+}
+
+func versionsEqual(a, b string) bool {
+	na := strings.TrimPrefix(strings.TrimSpace(a), "v")
+	nb := strings.TrimPrefix(strings.TrimSpace(b), "v")
+	return na != "" && nb != "" && na == nb
+}
+
+func waitForHealth(ctx context.Context, dataURL, adminURL string, timeout, interval time.Duration, expect healthExpectation) error {
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 3 * time.Second}
 	lastErr := errors.New("health check timed out")
 	for {
-		if err := checkEndpointHealth(ctx, client, dataURL, adminURL); err == nil {
+		if err := checkEndpointHealth(ctx, client, dataURL, adminURL, expect); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -375,10 +452,13 @@ func waitForHealth(ctx context.Context, dataURL, adminURL string, timeout, inter
 	}
 }
 
-func checkEndpointHealth(ctx context.Context, client *http.Client, dataURL, adminURL string) error {
+func checkEndpointHealth(ctx context.Context, client *http.Client, dataURL, adminURL string, expect healthExpectation) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dataURL, nil)
 	if err != nil {
 		return err
+	}
+	if expect.BootNonce != "" {
+		req.Header.Set(HeaderBootProbe, expect.BootNonce)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -393,13 +473,35 @@ func checkEndpointHealth(ctx context.Context, client *http.Client, dataURL, admi
 		return fmt.Errorf("%s returned HTTP %d", dataURL, resp.StatusCode)
 	}
 	var payload struct {
-		Status string `json:"status"`
+		Status  string `json:"status"`
+		Version string `json:"version"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return fmt.Errorf("invalid healthz json: %w", err)
 	}
 	if payload.Status != "ok" && payload.Status != "degraded" {
 		return fmt.Errorf("healthz status=%q", payload.Status)
+	}
+	ack := strings.TrimSpace(resp.Header.Get(HeaderBootAck))
+	if expect.BootNonce != "" {
+		wantAck := BootAck(expect.BootNonce)
+		if ack != "" && ack != wantAck {
+			return fmt.Errorf("healthz boot ack mismatch (response from another instance)")
+		}
+		if expect.RequireBootAck && ack != wantAck {
+			return fmt.Errorf("healthz missing matching boot ack for launched child")
+		}
+	}
+	gotVer := strings.TrimSpace(payload.Version)
+	if expect.ExpectedVersion != "" {
+		if gotVer == "" {
+			return fmt.Errorf("healthz missing version field (expected %q)", expect.ExpectedVersion)
+		}
+		if !versionsEqual(gotVer, expect.ExpectedVersion) {
+			return fmt.Errorf("healthz version %q does not match expected release %q", gotVer, expect.ExpectedVersion)
+		}
+	} else if expect.RejectVersion != "" && gotVer != "" && versionsEqual(gotVer, expect.RejectVersion) && ack == "" {
+		return fmt.Errorf("healthz responded with previous release %q instead of rollback target", gotVer)
 	}
 
 	if adminURL != "" {

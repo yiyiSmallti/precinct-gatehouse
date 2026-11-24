@@ -15,6 +15,15 @@ const EnvSupervised = "GATEHOUSE_SUPERVISED"
 // EnvHomeDir passes the supervisor's resolved --home directory to child processes.
 const EnvHomeDir = "GATEHOUSE_HOME"
 
+// EnvBootNonce, HeaderBootProbe, and HeaderBootAck bind each supervised child boot
+// to its supervisor's post-update /healthz verification probe so an unrelated process
+// listening on the same address cannot forge readiness.
+const (
+	EnvBootNonce    = "GATEHOUSE_BOOT_NONCE"
+	HeaderBootProbe = "X-Gatehouse-Boot-Probe"
+	HeaderBootAck   = "X-Gatehouse-Boot-Ack"
+)
+
 // Update state constants reported via Manager.Status() and Admin API.
 const (
 	StateIdle        = "idle"
@@ -82,6 +91,7 @@ type ReleaseInfo struct {
 	ShortSHA     string `json:"short_sha,omitempty"`
 	BuiltAt      string `json:"built_at,omitempty"`
 	Signed       bool   `json:"signed,omitempty"`
+	HasSignature bool   `json:"has_signature,omitempty"`
 	Note         string `json:"note,omitempty"`
 	Current      bool   `json:"current"`
 	Previous     bool   `json:"previous"`

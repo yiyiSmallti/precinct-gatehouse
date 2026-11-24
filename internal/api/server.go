@@ -4,7 +4,10 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -655,7 +658,13 @@ func computeMissingDetectors(required []string, running []redact.ExternalDetecto
 	return missing
 }
 
-func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	if nonce := os.Getenv("GATEHOUSE_BOOT_NONCE"); nonce != "" {
+		if probe := r.Header.Get("X-Gatehouse-Boot-Probe"); len(probe) == len(nonce) && subtle.ConstantTimeCompare([]byte(probe), []byte(nonce)) == 1 {
+			sum := sha256.Sum256([]byte("gatehouse-boot-ack:" + nonce))
+			w.Header().Set("X-Gatehouse-Boot-Ack", hex.EncodeToString(sum[:]))
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	snap := s.Live.Current()
 	var missing []string

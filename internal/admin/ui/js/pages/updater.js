@@ -366,7 +366,7 @@ export function renderUpdater(container, ctx) {
                 [
                   avail.digest ? `Digest ${avail.digest.slice(0, 19)}` : '',
                   avail.published_at ? `发布于 ${fmtDateTime(avail.published_at)}` : '',
-                  avail.signed ? '已签名' : '',
+                  avail.signed ? '附带签名' : '',
                 ].filter(Boolean).join(' · ')
               )
             )
@@ -774,7 +774,11 @@ export function renderUpdater(container, ctx) {
                           : el('span', { className: 'muted' }, '历史版本')
                   ),
                   el('td', { className: 'nowrap' },
-                    r.signed ? el('span', { className: 'pill pill-ok' }, '已验签') : el('span', { className: 'muted' }, '-')
+                    r.signed
+                      ? el('span', { className: 'pill pill-ok' }, '已验签')
+                      : r.has_signature
+                        ? el('span', { className: 'pill', title: '安装包附带 SIGNATURE 文件，但安装时未配置公钥完成验签' }, '未验签')
+                        : el('span', { className: 'muted' }, '-')
                   ),
                   el('td', { className: 'mono muted', title: r.binary_sha256 || '' }, r.binary_sha256 ? r.binary_sha256.slice(0, 12) : '-'),
                   el('td', { className: 'num muted nowrap' }, fmtDateTime(r.built_at || r.modified_at)),

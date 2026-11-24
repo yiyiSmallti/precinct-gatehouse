@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -67,10 +68,13 @@ func runSuperviseHelper(cfgPath string) {
 	defer ln.Close()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if ver == "v_bad" {
 			http.Error(w, "broken", http.StatusInternalServerError)
 			return
+		}
+		if nonce := os.Getenv(EnvBootNonce); nonce != "" && r.Header.Get(HeaderBootProbe) == nonce {
+			w.Header().Set(HeaderBootAck, BootAck(nonce))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`, ver)
@@ -1574,5 +1578,465 @@ func TestStoreRollbackPendingTargetDigestMatchesSelectedRelease(t *testing.T) {
 	}
 	if got := st2.CurrentDigest(); got != "" {
 		t.Fatalf("expected empty CurrentDigest after digestless rollback, got %q", got)
+	}
+}
+
+func TestCheckEndpointHealthCorrelatesReleaseAndBootNonce(t *testing.T) {
+	var body string
+	var ackHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackHeader != "" {
+			w.Header().Set(HeaderBootAck, ackHeader)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	client := srv.Client()
+	dataURL := srv.URL + "/healthz"
+
+	// 1. Mismatched version must fail even without a nonce.
+	body = `{"status":"ok","version":"v0.1.0"}`
+	if err := checkEndpointHealth(context.Background(), client, dataURL, "", healthExpectation{
+		ExpectedVersion: "v0.2.0",
+	}); err == nil || !strings.Contains(err.Error(), "does not match expected release") {
+		t.Fatalf("expected version mismatch error, got: %v", err)
+	}
+
+	// 2. Matching version without required boot ack must fail.
+	body = `{"status":"ok","version":"v0.2.0"}`
+	ackHeader = ""
+	if err := checkEndpointHealth(context.Background(), client, dataURL, "", healthExpectation{
+		ExpectedVersion: "v0.2.0",
+		BootNonce:       "nonce-1",
+		RequireBootAck:  true,
+	}); err == nil || !strings.Contains(err.Error(), "missing matching boot ack") {
+		t.Fatalf("expected missing boot ack error, got: %v", err)
+	}
+
+	// 3. Wrong boot ack must fail.
+	ackHeader = BootAck("other-nonce")
+	if err := checkEndpointHealth(context.Background(), client, dataURL, "", healthExpectation{
+		ExpectedVersion: "v0.2.0",
+		BootNonce:       "nonce-1",
+		RequireBootAck:  true,
+	}); err == nil || !strings.Contains(err.Error(), "boot ack mismatch") {
+		t.Fatalf("expected boot ack mismatch error, got: %v", err)
+	}
+
+	// 4. Matching version + matching boot ack passes.
+	ackHeader = BootAck("nonce-1")
+	if err := checkEndpointHealth(context.Background(), client, dataURL, "", healthExpectation{
+		ExpectedVersion: "v0.2.0",
+		BootNonce:       "nonce-1",
+		RequireBootAck:  true,
+	}); err != nil {
+		t.Fatalf("expected matching healthz + ack to pass, got: %v", err)
+	}
+
+	// 5. Baseline rollback rejects un-acked response from the replaced previous version.
+	body = `{"status":"ok","version":"v0.2.0"}`
+	ackHeader = ""
+	if err := checkEndpointHealth(context.Background(), client, dataURL, "", healthExpectation{
+		RejectVersion: "v0.2.0",
+		BootNonce:     "nonce-2",
+	}); err == nil || !strings.Contains(err.Error(), "previous release") {
+		t.Fatalf("expected baseline rollback to reject previous release response, got: %v", err)
+	}
+}
+
+func TestSupervisorRejectsStrayInstanceOccupyingPortAndRollsBack(t *testing.T) {
+	strayLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := strayLn.Addr().String()
+	straySrv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			// Even if the unrelated process reports v2, it does not possess the boot nonce.
+			_, _ = w.Write([]byte(`{"status":"ok","version":"v2"}`))
+		}),
+	}
+	go func() { _ = straySrv.Serve(strayLn) }()
+	defer func() { _ = straySrv.Close() }()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink-based test helper uses unix symlinks")
+	}
+	t.Setenv("GATEHOUSE_SUPERVISE_HELPER", "1")
+	t.Setenv("GATEHOUSE_SUPERVISE_HOME", "")
+
+	home := t.TempDir()
+	st := NewStore(home)
+	if err := os.MkdirAll(st.BinDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ver := range []string{"v1", "v2"} {
+		relDir := filepath.Join(st.ReleasesDir(), ver)
+		if err := os.MkdirAll(relDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(exe, filepath.Join(relDir, binaryFilename())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join("..", "releases", "v2", binaryFilename()), st.BinLink()); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(home, currentVerFileName), []byte("v2\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(home, prevVerFileName), []byte("v1\n"), 0o644)
+	if err := st.WritePending(&PendingUpdate{
+		TargetVersion:   "v2",
+		TargetDigest:    "sha256:v2-stray",
+		PreviousVersion: "v1",
+		PreviousDigest:  "sha256:v1-good",
+		RequestedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfgYAML := fmt.Sprintf("listen: %s\nmode: personal\ndata_dir: %s\nupdater:\n  home_dir: %s\n  health_timeout: 500ms\n", addr, t.TempDir(), home)
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RunSupervisor(ctx, SuperviseOptions{
+			ConfigPath:    cfgPath,
+			ProbeInterval: 30 * time.Millisecond,
+			HealthTimeout: 500 * time.Millisecond,
+		})
+	}()
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		failed, _ := st.ReadFailed()
+		pending, _ := st.ReadPending()
+		if st.CurrentVersion() == "v1" && failed != nil && failed.Version == "v2" && pending == nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	_ = straySrv.Close()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RunSupervisor returned error: %v", err)
+	}
+
+	if got := st.CurrentVersion(); got != "v1" {
+		t.Fatalf("expected rollback to v1 when stray instance occupied port, got %q", got)
+	}
+	if failed, err := st.ReadFailed(); err != nil || failed == nil || failed.Version != "v2" {
+		t.Fatalf("expected .failed_update for v2, got %+v err=%v", failed, err)
+	}
+	if pending, err := st.ReadPending(); err != nil || pending != nil {
+		t.Fatalf("expected .update_pending cleared after rollback, got %+v err=%v", pending, err)
+	}
+}
+
+func TestManagerAutoApplyPinsCheckedReleaseAndRevalidates(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("drift_between_check_and_download_aborts", func(t *testing.T) {
+		home := t.TempDir()
+		dataDir := filepath.Join(home, "data")
+		db, err := store.Open(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		liveMgr, cfgPath := newTestLiveManager(t, fmt.Sprintf(`listen: 127.0.0.1:17788
+mode: personal
+data_dir: %s
+updater:
+  enabled: true
+  auto_apply: true
+  source: github
+  github_repo: yiyiSmallti/precinct-gatehouse
+  home_dir: %s
+  fallback_dns: []
+`, dataDir, home))
+
+		var restarted atomic.Int32
+		src := &fakeSource{
+			remote: &RemoteInfo{Source: "github", Version: "v2.0.0", Tag: "v2.0.0", Digest: "sha256:v2"},
+			artifact: &DownloadedArtifact{
+				Version: "v1.0.0",
+				Remote:  RemoteInfo{Source: "github", Version: "v1.0.0", Tag: "v1.0.0", Digest: "sha256:v1"},
+			},
+		}
+		mgr := NewManager(Deps{
+			CurrentVersion: "v1.5.0",
+			ConfigPath:     cfgPath,
+			Live:           liveMgr,
+			DB:             db,
+			RequestRestart: func() { restarted.Add(1) },
+			NewSource:      func(_ config.Updater, _ string) (ArtifactSource, error) { return src, nil },
+		})
+		mgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+
+		mgr.runBackgroundCycle(ctx)
+		if got := mgr.Store().CurrentVersion(); got != "" {
+			t.Fatalf("expected drifted downgrade artifact not to be installed, got %q", got)
+		}
+		if restarted.Load() != 0 {
+			t.Fatalf("expected 0 restarts after drifted auto-apply abort, got %d", restarted.Load())
+		}
+	})
+
+	t.Run("downloaded_failed_digest_aborts", func(t *testing.T) {
+		home := t.TempDir()
+		dataDir := filepath.Join(home, "data")
+		db, err := store.Open(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		liveMgr, cfgPath := newTestLiveManager(t, fmt.Sprintf(`listen: 127.0.0.1:17788
+mode: personal
+data_dir: %s
+updater:
+  enabled: true
+  auto_apply: true
+  source: oci
+  image: registry.example.com/smallti/gatehouse
+  home_dir: %s
+  fallback_dns: []
+`, dataDir, home))
+
+		var restarted atomic.Int32
+		src := &fakeSource{
+			remote: &RemoteInfo{Source: "oci", Version: "v2.0.0", Digest: "sha256:good"},
+			artifact: &DownloadedArtifact{
+				Version: "v2.0.0",
+				Remote:  RemoteInfo{Source: "oci", Version: "v2.0.0", Digest: "sha256:bad"},
+			},
+		}
+		mgr := NewManager(Deps{
+			CurrentVersion: "v1.0.0",
+			ConfigPath:     cfgPath,
+			Live:           liveMgr,
+			DB:             db,
+			RequestRestart: func() { restarted.Add(1) },
+			NewSource:      func(_ config.Updater, _ string) (ArtifactSource, error) { return src, nil },
+		})
+		mgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+		_ = mgr.Store().WriteFailed(&FailedUpdate{Version: "v2.0.0", Digest: "sha256:bad", Reason: "crashed", At: time.Now().UTC()})
+
+		mgr.runBackgroundCycle(ctx)
+		if got := mgr.Store().CurrentVersion(); got != "" {
+			t.Fatalf("expected previously failed digest not to be installed, got %q", got)
+		}
+		if restarted.Load() != 0 {
+			t.Fatalf("expected 0 restarts when downloaded digest matched failed_update, got %d", restarted.Load())
+		}
+	})
+
+	t.Run("github_pinning_survives_latest_flip", func(t *testing.T) {
+		binName := binaryFilename()
+		buildTar := func(ver string) []byte {
+			binBytes := []byte("gatehouse-" + ver)
+			binSum := sha256.Sum256(binBytes)
+			binHex := hex.EncodeToString(binSum[:])
+			sumsBytes := []byte(binHex + "  " + binName + "\n")
+			metaBytes, _ := json.Marshal(ReleaseMeta{Version: ver, BinarySHA256: binHex})
+			return buildTestTar(t, true, map[string][]byte{
+				binName:        binBytes,
+				"SHA256SUMS":   sumsBytes,
+				"RELEASE_META": metaBytes,
+			})
+		}
+		tarV1 := buildTar("v1.0.0")
+		tarV2 := buildTar("v2.0.0")
+		sumV2 := sha256.Sum256(tarV2)
+		digestV2 := "sha256:" + hex.EncodeToString(sumV2[:])
+		assetV1 := fmt.Sprintf("gatehouse_v1.0.0_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+		assetV2 := fmt.Sprintf("gatehouse_v2.0.0_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+
+		var latestServed atomic.Bool
+		var apiSrv *httptest.Server
+		apiSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/repos/yiyiSmallti/precinct-gatehouse/releases/latest":
+				// First call (Check) returns v2.0.0; subsequent calls flip /latest to older v1.0.0!
+				if !latestServed.Swap(true) {
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"tag_name": "v2.0.0",
+						"assets": []map[string]any{
+							{"id": 2, "name": assetV2, "digest": digestV2, "browser_download_url": apiSrv.URL + "/dl/v2"},
+						},
+					})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"tag_name": "v1.0.0",
+					"assets": []map[string]any{
+						{"id": 1, "name": assetV1, "browser_download_url": apiSrv.URL + "/dl/v1"},
+					},
+				})
+			case "/repos/yiyiSmallti/precinct-gatehouse/releases/tags/v2.0.0":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"tag_name": "v2.0.0",
+					"assets": []map[string]any{
+						{"id": 2, "name": assetV2, "digest": digestV2, "browser_download_url": apiSrv.URL + "/dl/v2"},
+					},
+				})
+			case "/dl/v2":
+				_, _ = w.Write(tarV2)
+			case "/dl/v1":
+				_, _ = w.Write(tarV1)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer apiSrv.Close()
+
+		home := t.TempDir()
+		dataDir := filepath.Join(home, "data")
+		db, err := store.Open(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		liveMgr, cfgPath := newTestLiveManager(t, fmt.Sprintf(`listen: 127.0.0.1:17788
+mode: personal
+data_dir: %s
+updater:
+  enabled: true
+  auto_apply: true
+  source: github
+  github_repo: yiyiSmallti/precinct-gatehouse
+  github_api_url: %s
+  require_signature: false
+  home_dir: %s
+  fallback_dns: []
+`, dataDir, apiSrv.URL, home))
+
+		var restarted atomic.Int32
+		mgr := NewManager(Deps{
+			CurrentVersion: "v1.5.0",
+			ConfigPath:     cfgPath,
+			Live:           liveMgr,
+			DB:             db,
+			RequestRestart: func() { restarted.Add(1) },
+		})
+		mgr.Store().PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+
+		mgr.runBackgroundCycle(ctx)
+		if got := mgr.Store().CurrentVersion(); got != "v2.0.0" {
+			t.Fatalf("expected pinned download to install v2.0.0 even after /latest flipped, got %q", got)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && restarted.Load() == 0 {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if restarted.Load() != 1 {
+			t.Fatalf("expected 1 restart after pinned auto-apply, got %d", restarted.Load())
+		}
+	})
+}
+
+func TestStoreListReleasesDistinguishesVerifiedVsUnverifiedSignature(t *testing.T) {
+	ctx := context.Background()
+	st := NewStore(t.TempDir())
+	st.PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+
+	binName := binaryFilename()
+	stage := func(ver, sigContent string, metaSigned bool) map[string]string {
+		dir := t.TempDir()
+		binBytes := []byte("gatehouse-" + ver)
+		sum := sha256.Sum256(binBytes)
+		shaHex := hex.EncodeToString(sum[:])
+
+		binPath := filepath.Join(dir, binName)
+		sumsPath := filepath.Join(dir, "SHA256SUMS")
+		metaPath := filepath.Join(dir, "RELEASE_META")
+		sigPath := filepath.Join(dir, "SIGNATURE")
+
+		_ = os.WriteFile(binPath, binBytes, 0o755)
+		sumsData := []byte(shaHex + "  " + binName + "\n")
+		_ = os.WriteFile(sumsPath, sumsData, 0o644)
+		mb, _ := json.Marshal(ReleaseMeta{Version: ver, BinarySHA256: shaHex, Signed: metaSigned})
+		_ = os.WriteFile(metaPath, mb, 0o644)
+		_ = os.WriteFile(sigPath, []byte(sigContent), 0o644)
+		return map[string]string{
+			binName:        binPath,
+			"SHA256SUMS":   sumsPath,
+			"RELEASE_META": metaPath,
+			"SIGNATURE":    sigPath,
+		}
+	}
+
+	// 1. Metadata claims signed=true and an invalid SIGNATURE exists, but no public key verified it.
+	unverifiedFound := stage("v1.0.0", "ed25519:not-verified\n", true)
+	unverifiedArt, err := VerifyExtractedArtifact(unverifiedFound, binName, nil, false)
+	if err != nil {
+		t.Fatalf("VerifyExtractedArtifact without pubkey: %v", err)
+	}
+	if unverifiedArt.Signed {
+		t.Fatal("expected VerifiedArtifact.Signed=false when no public key configured")
+	}
+	if _, err := st.Install(ctx, InstallRequest{
+		Version:      "v1.0.0",
+		Digest:       "sha256:u1",
+		Artifact:     unverifiedArt,
+		KeepReleases: 5,
+	}); err != nil {
+		t.Fatalf("Install unverified v1.0.0: %v", err)
+	}
+
+	rels := st.ListReleases()
+	if len(rels) != 1 || rels[0].Signed || !rels[0].HasSignature {
+		t.Fatalf("expected unverified release to report Signed=false, HasSignature=true; got %+v", rels)
+	}
+
+	// 2. Properly signed + verified release must report both Signed=true and HasSignature=true.
+	pubStr, privStr, err := GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _ := ParsePublicKey(pubStr)
+	priv, _ := ParsePrivateKey(privStr)
+	verifiedFound := stage("v2.0.0", "", true)
+	sumsData, _ := os.ReadFile(verifiedFound["SHA256SUMS"])
+	_ = os.WriteFile(verifiedFound["SIGNATURE"], []byte(SignBytes(priv, sumsData)+"\n"), 0o644)
+
+	verifiedArt, err := VerifyExtractedArtifact(verifiedFound, binName, pub, true)
+	if err != nil {
+		t.Fatalf("VerifyExtractedArtifact with pubkey: %v", err)
+	}
+	if !verifiedArt.Signed {
+		t.Fatal("expected VerifiedArtifact.Signed=true when Ed25519 verification passed")
+	}
+	if _, err := st.Install(ctx, InstallRequest{
+		Version:      "v2.0.0",
+		Digest:       "sha256:v2",
+		Artifact:     verifiedArt,
+		KeepReleases: 5,
+	}); err != nil {
+		t.Fatalf("Install verified v2.0.0: %v", err)
+	}
+
+	byVer := map[string]ReleaseInfo{}
+	for _, r := range st.ListReleases() {
+		byVer[r.Version] = r
+	}
+	if byVer["v1.0.0"].Signed || !byVer["v1.0.0"].HasSignature {
+		t.Fatalf("unexpected v1.0.0 signature flags: %+v", byVer["v1.0.0"])
+	}
+	if !byVer["v2.0.0"].Signed || !byVer["v2.0.0"].HasSignature {
+		t.Fatalf("unexpected v2.0.0 signature flags: %+v", byVer["v2.0.0"])
 	}
 }

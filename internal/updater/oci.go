@@ -99,9 +99,17 @@ type OCISource struct {
 	RequireSig   bool
 	TargetOS     string
 	TargetArch   string
+	MaxLayerSize int64
 
 	tokMu  sync.Mutex
 	tokens map[string]string
+}
+
+func (o *OCISource) maxLayerSize() int64 {
+	if o.MaxLayerSize > 0 {
+		return o.MaxLayerSize
+	}
+	return maxBinarySize
 }
 
 type ociManifest struct {
@@ -388,10 +396,18 @@ func (o *OCISource) fetchConfigLabels(ctx context.Context, registry, repo string
 	return out
 }
 
-func (o *OCISource) downloadBlob(ctx context.Context, registry, repo, digest, destPath string) error {
+func (o *OCISource) downloadBlob(ctx context.Context, registry, repo, digest string, declaredSize int64, destPath string) error {
 	if !strings.HasPrefix(digest, "sha256:") {
 		return fmt.Errorf("unsupported blob digest algorithm: %q", digest)
 	}
+	maxSize := o.maxLayerSize()
+	if declaredSize < 0 {
+		return fmt.Errorf("blob %s has invalid negative size %d", digest, declaredSize)
+	}
+	if declaredSize > maxSize {
+		return fmt.Errorf("blob %s declared size %d exceeds maximum size (%d)", digest, declaredSize, maxSize)
+	}
+
 	expected := strings.ToLower(strings.TrimPrefix(digest, "sha256:"))
 	p := fmt.Sprintf("/v2/%s/blobs/%s", repo, digest)
 	resp, err := o.doRegistryRequest(ctx, registry, repo, p, nil)
@@ -403,21 +419,44 @@ func (o *OCISource) downloadBlob(ctx context.Context, registry, repo, digest, de
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("blob %s HTTP %d: %s", digest, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	if resp.ContentLength > maxSize {
+		return fmt.Errorf("blob %s content-length %d exceeds maximum size (%d)", digest, resp.ContentLength, maxSize)
+	}
+	if declaredSize > 0 && resp.ContentLength > 0 && resp.ContentLength != declaredSize {
+		return fmt.Errorf("blob %s content-length %d does not match manifest size %d", digest, resp.ContentLength, declaredSize)
+	}
+
+	limit := maxSize
+	if declaredSize > 0 && declaredSize < limit {
+		limit = declaredSize
+	}
+
 	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
 	h := sha256.New()
-	_, copyErr := io.Copy(io.MultiWriter(f, h), resp.Body)
+	written, copyErr := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, limit+1))
 	closeErr := f.Close()
 	if copyErr != nil {
+		_ = os.Remove(destPath)
 		return copyErr
 	}
 	if closeErr != nil {
+		_ = os.Remove(destPath)
 		return closeErr
+	}
+	if written > maxSize {
+		_ = os.Remove(destPath)
+		return fmt.Errorf("blob %s exceeds maximum size (%d)", digest, maxSize)
+	}
+	if declaredSize > 0 && written != declaredSize {
+		_ = os.Remove(destPath)
+		return fmt.Errorf("blob %s size mismatch: manifest declares %d, received %d", digest, declaredSize, written)
 	}
 	actual := hex.EncodeToString(h.Sum(nil))
 	if actual != expected {
+		_ = os.Remove(destPath)
 		return fmt.Errorf("blob digest mismatch for %s: expected %s, got %s", digest, expected, actual)
 	}
 	return nil
@@ -485,7 +524,7 @@ func (o *OCISource) Download(ctx context.Context, outDir string) (*DownloadedArt
 	found := map[string]string{}
 	for idx, layer := range doc.Layers {
 		tmpBlob := filepath.Join(outDir, fmt.Sprintf(".blob-%d.tar", idx))
-		err := o.downloadBlob(ctx, registry, repo, layer.Digest, tmpBlob)
+		err := o.downloadBlob(ctx, registry, repo, layer.Digest, layer.Size, tmpBlob)
 		if err != nil {
 			_ = os.Remove(tmpBlob)
 			return nil, err

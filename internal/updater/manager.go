@@ -52,10 +52,13 @@ type Deps struct {
 
 // ApplyOptions controls Apply / ApplyAsync behavior.
 type ApplyOptions struct {
-	Tag       string
-	Force     bool
-	NoRestart bool
-	Auto      bool
+	Tag            string
+	Force          bool
+	NoRestart      bool
+	Auto           bool
+	ExpectedSource string
+	ExpectedVer    string
+	ExpectedDigest string
 }
 
 // RollbackOptions controls Rollback / RollbackAsync behavior.
@@ -331,21 +334,60 @@ func (m *Manager) runBackgroundCycle(ctx context.Context) {
 		m.log.Warn("skipping background auto-apply: gateway is not running under `gatehouse supervise`")
 		return
 	}
-	if failed, _ := m.Store().ReadFailed(); failed != nil {
-		var matched bool
-		if failed.Digest != "" && st.Available.Digest != "" {
-			matched = failed.Digest == st.Available.Digest
-		} else {
-			matched = failed.Version != "" && st.Available.Version != "" && failed.Version == st.Available.Version
-		}
-		if matched {
-			m.log.Warn("skipping auto-apply for previously failed update",
-				"version", st.Available.Version, "digest", st.Available.Digest, "reason", failed.Reason)
-			return
+	if failed, _ := m.Store().ReadFailed(); matchesFailedUpdate(failed, st.Available.Version, st.Available.Digest) {
+		m.log.Warn("skipping auto-apply for previously failed update",
+			"version", st.Available.Version, "digest", st.Available.Digest, "reason", failed.Reason)
+		return
+	}
+	pinTag := ""
+	switch st.Available.Source {
+	case "github":
+		pinTag = strings.TrimSpace(st.Available.Tag)
+	case "oci":
+		if d := strings.TrimSpace(st.Available.Digest); strings.HasPrefix(d, "sha256:") {
+			pinTag = d
 		}
 	}
-	if _, err := m.Apply(ctx, ApplyOptions{Force: false, Auto: true}); err != nil && !errors.Is(err, ErrBusy) {
+	if _, err := m.Apply(ctx, ApplyOptions{
+		Tag:            pinTag,
+		Force:          false,
+		Auto:           true,
+		ExpectedSource: st.Available.Source,
+		ExpectedVer:    st.Available.Version,
+		ExpectedDigest: st.Available.Digest,
+	}); err != nil && !errors.Is(err, ErrBusy) {
 		m.log.Warn("background auto-update failed", "err", err)
+	}
+}
+
+func matchesFailedUpdate(failed *FailedUpdate, ver, digest string) bool {
+	if failed == nil {
+		return false
+	}
+	fd := strings.TrimSpace(failed.Digest)
+	vd := strings.TrimSpace(digest)
+	if fd != "" && vd != "" {
+		return fd == vd
+	}
+	fv := strings.TrimSpace(failed.Version)
+	vv := strings.TrimSpace(ver)
+	return fv != "" && vv != "" && fv == vv
+}
+
+func isUpdateAvailable(source, remoteVer, remoteDigest, curVer, curDigest string) bool {
+	switch source {
+	case "oci":
+		if strings.TrimSpace(curDigest) != "" {
+			return strings.TrimSpace(remoteDigest) != "" && strings.TrimSpace(remoteDigest) != strings.TrimSpace(curDigest)
+		}
+		if strings.TrimSpace(remoteVer) != "" && strings.TrimSpace(remoteVer) == strings.TrimSpace(curVer) && !IsNewerVersion(remoteVer, curVer) {
+			return false
+		}
+		return true
+	case "github":
+		return IsNewerVersion(remoteVer, curVer)
+	default:
+		return false
 	}
 }
 
@@ -584,21 +626,12 @@ func (m *Manager) Check(ctx context.Context) (Status, error) {
 
 	st := m.Store()
 	curDigest := st.CurrentDigest()
-	switch remote.Source {
-	case "oci":
-		if curDigest != "" {
-			remote.UpdateAvailable = remote.Digest != "" && remote.Digest != curDigest
-		} else if remote.Version != "" && remote.Version == m.deps.CurrentVersion && !IsNewerVersion(remote.Version, m.deps.CurrentVersion) {
-			if remote.Digest != "" {
-				_ = st.WriteCurrentDigest(remote.Digest)
-			}
-			remote.UpdateAvailable = false
-		} else {
-			remote.UpdateAvailable = true
-		}
-	case "github":
-		remote.UpdateAvailable = IsNewerVersion(remote.Version, m.deps.CurrentVersion)
+	if remote.Source == "oci" && curDigest == "" &&
+		remote.Version != "" && remote.Version == m.deps.CurrentVersion && !IsNewerVersion(remote.Version, m.deps.CurrentVersion) &&
+		remote.Digest != "" {
+		_ = st.WriteCurrentDigest(remote.Digest)
 	}
+	remote.UpdateAvailable = isUpdateAvailable(remote.Source, remote.Version, remote.Digest, m.deps.CurrentVersion, curDigest)
 
 	m.mu.Lock()
 	m.lastCheckAt = &now
@@ -701,10 +734,37 @@ func (m *Manager) releaseBusyOnError(err error, action, ver, digest string) {
 	})
 }
 
+func (m *Manager) abortAutoApply(reason, ver, digest string) (InstallResult, error) {
+	m.log.Info("aborting background auto-apply", "reason", reason, "version", ver, "digest", digest)
+	m.mu.Lock()
+	m.busy = false
+	m.state = StateIdle
+	m.message = "已跳过自动更新"
+	m.mu.Unlock()
+	m.recordEvent(UpdateEvent{
+		At:      time.Now().UTC(),
+		Action:  "apply",
+		Version: ver,
+		Digest:  digest,
+		Status:  "skipped",
+		Detail:  reason,
+	})
+	return InstallResult{}, fmt.Errorf("auto-apply aborted: %s", reason)
+}
+
 func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (InstallResult, error) {
 	cfg := m.currentConfig()
 	m.syncStoreHome(cfg)
 	st := m.Store()
+
+	if opts.Auto {
+		if !cfg.Enabled || !cfg.AutoApply {
+			return m.abortAutoApply("auto_apply policy disabled before download", opts.ExpectedVer, opts.ExpectedDigest)
+		}
+		if opts.ExpectedSource != "" && cfg.EffectiveSource() != opts.ExpectedSource {
+			return m.abortAutoApply(fmt.Sprintf("source changed from %s to %s", opts.ExpectedSource, cfg.EffectiveSource()), opts.ExpectedVer, opts.ExpectedDigest)
+		}
+	}
 
 	src, err := m.buildSource(cfg, opts.Tag)
 	if err != nil {
@@ -728,6 +788,28 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 	if err != nil {
 		m.releaseBusyOnError(err, "apply", opts.Tag, "")
 		return InstallResult{}, err
+	}
+
+	if opts.Auto {
+		effSource := strings.TrimSpace(art.Remote.Source)
+		if effSource == "" {
+			effSource = cfg.EffectiveSource()
+		}
+		if opts.ExpectedSource != "" && effSource != opts.ExpectedSource {
+			return m.abortAutoApply(fmt.Sprintf("downloaded source %q mismatch expected %q", effSource, opts.ExpectedSource), art.Version, art.Remote.Digest)
+		}
+		if opts.ExpectedDigest != "" && strings.TrimSpace(art.Remote.Digest) != strings.TrimSpace(opts.ExpectedDigest) {
+			return m.abortAutoApply(fmt.Sprintf("downloaded digest %q mismatch checked %q", art.Remote.Digest, opts.ExpectedDigest), art.Version, art.Remote.Digest)
+		}
+		if opts.ExpectedVer != "" && strings.TrimSpace(art.Version) != strings.TrimSpace(opts.ExpectedVer) {
+			return m.abortAutoApply(fmt.Sprintf("downloaded version %q mismatch checked %q", art.Version, opts.ExpectedVer), art.Version, art.Remote.Digest)
+		}
+		if !isUpdateAvailable(effSource, art.Version, art.Remote.Digest, m.deps.CurrentVersion, st.CurrentDigest()) {
+			return m.abortAutoApply("downloaded artifact is no longer an eligible update", art.Version, art.Remote.Digest)
+		}
+		if failed, _ := st.ReadFailed(); matchesFailedUpdate(failed, art.Version, art.Remote.Digest) {
+			return m.abortAutoApply("downloaded artifact matches previously failed update", art.Version, art.Remote.Digest)
+		}
 	}
 
 	m.setState(StateVerifying, fmt.Sprintf("正在预检 %s...", art.Version), "")

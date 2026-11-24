@@ -23,6 +23,7 @@ const (
 	currentDigestFile   = ".current_digest"
 	prevDigestFile      = ".previous_digest"
 	releaseDigestFile   = ".digest"
+	sigVerifiedFile     = ".sig_verified"
 	deployLockFile      = ".deploy.lock"
 )
 
@@ -331,6 +332,11 @@ func (s *Store) Install(ctx context.Context, req InstallRequest) (InstallResult,
 
 	if req.Artifact.SigPath != "" {
 		if err := copyFile(req.Artifact.SigPath, filepath.Join(tmpDir, "SIGNATURE"), 0o644); err != nil {
+			return InstallResult{}, err
+		}
+	}
+	if req.Artifact.Signed {
+		if err := atomicWriteFile(filepath.Join(tmpDir, sigVerifiedFile), []byte("ed25519\n"), 0o644); err != nil {
 			return InstallResult{}, err
 		}
 	}
@@ -779,14 +785,14 @@ func (s *Store) ListReleases() []ReleaseInfo {
 				ri.BinarySHA256 = meta.BinarySHA256
 				ri.ShortSHA = meta.ShortSHA
 				ri.BuiltAt = meta.BuiltAt
-				ri.Signed = meta.Signed
 				ri.Note = meta.Note
 			}
 		}
-		if !ri.Signed {
-			if _, err := os.Stat(filepath.Join(full, "SIGNATURE")); err == nil {
-				ri.Signed = true
-			}
+		if _, err := os.Stat(filepath.Join(full, "SIGNATURE")); err == nil {
+			ri.HasSignature = true
+		}
+		if _, err := os.Stat(filepath.Join(full, sigVerifiedFile)); err == nil {
+			ri.Signed = true
 		}
 		items = append(items, sortable{mtime: fi.ModTime(), info: ri})
 	}

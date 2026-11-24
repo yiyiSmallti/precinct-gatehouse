@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -326,5 +327,100 @@ func TestOCISourceRejectsMismatchedPinnedManifestDigest(t *testing.T) {
 	}
 	if _, err := tagged.Download(context.Background(), t.TempDir()); err == nil || !strings.Contains(err.Error(), "manifest digest mismatch") {
 		t.Fatalf("expected manifest digest mismatch on index child Download, got: %v", err)
+	}
+}
+
+func TestOCISourceRejectsOversizedLayerBeforeExhaustingDisk(t *testing.T) {
+	smallPayload := bytes.Repeat([]byte("a"), 256)
+	smallSum := sha256.Sum256(smallPayload)
+	smallDigest := "sha256:" + hex.EncodeToString(smallSum[:])
+
+	oversizedPayload := bytes.Repeat([]byte("b"), 4096)
+	oversizedSum := sha256.Sum256(oversizedPayload)
+	oversizedDigest := "sha256:" + hex.EncodeToString(oversizedSum[:])
+
+	mkManifest := func(layerDigest string, layerSize int64) []byte {
+		b, _ := json.Marshal(map[string]any{
+			"schemaVersion": 2,
+			"layers": []map[string]any{
+				{
+					"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+					"digest":    layerDigest,
+					"size":      layerSize,
+				},
+			},
+		})
+		return b
+	}
+
+	var blobHits atomic.Int32
+	regSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/smallti/gatehouse/manifests/declared-too-big":
+			_, _ = w.Write(mkManifest(smallDigest, 2048))
+		case "/v2/smallti/gatehouse/manifests/stream-too-big":
+			_, _ = w.Write(mkManifest(oversizedDigest, 0))
+		case "/v2/smallti/gatehouse/manifests/size-mismatch":
+			_, _ = w.Write(mkManifest(smallDigest, 256))
+		case "/v2/smallti/gatehouse/blobs/" + smallDigest:
+			blobHits.Add(1)
+			_, _ = w.Write(bytes.Repeat([]byte("c"), 1024))
+		case "/v2/smallti/gatehouse/blobs/" + oversizedDigest:
+			blobHits.Add(1)
+			_, _ = w.Write(oversizedPayload)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer regSrv.Close()
+
+	host := strings.TrimPrefix(regSrv.URL, "http://")
+
+	// 1. Declared size exceeding MaxLayerSize fails before even fetching the blob.
+	out1 := t.TempDir()
+	src1 := &OCISource{
+		Image:        host + "/smallti/gatehouse:declared-too-big",
+		InsecureHTTP: true,
+		HTTPClient:   NewHTTPClient(0, nil),
+		MaxLayerSize: 1024,
+	}
+	if _, err := src1.Download(context.Background(), out1); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected declared oversized layer error, got: %v", err)
+	}
+	if blobHits.Load() != 0 {
+		t.Fatalf("expected 0 blob HTTP hits when manifest declared size exceeds limit, got %d", blobHits.Load())
+	}
+	if entries, _ := os.ReadDir(out1); len(entries) != 0 {
+		t.Fatalf("expected no temp blobs left behind in %s, got %d entries", out1, len(entries))
+	}
+
+	// 2. Omitted manifest size with streaming body exceeding MaxLayerSize stops bounded copy cleanly.
+	out2 := t.TempDir()
+	src2 := &OCISource{
+		Image:        host + "/smallti/gatehouse:stream-too-big",
+		InsecureHTTP: true,
+		HTTPClient:   NewHTTPClient(0, nil),
+		MaxLayerSize: 1024,
+	}
+	if _, err := src2.Download(context.Background(), out2); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected streamed oversized layer error, got: %v", err)
+	}
+	if entries, _ := os.ReadDir(out2); len(entries) != 0 {
+		t.Fatalf("expected no temp blobs left behind in %s, got %d entries", out2, len(entries))
+	}
+
+	// 3. Body exceeding declared manifest size (within MaxLayerSize) rejects size mismatch.
+	out3 := t.TempDir()
+	src3 := &OCISource{
+		Image:        host + "/smallti/gatehouse:size-mismatch",
+		InsecureHTTP: true,
+		HTTPClient:   NewHTTPClient(0, nil),
+		MaxLayerSize: 4096,
+	}
+	if _, err := src3.Download(context.Background(), out3); err == nil || (!strings.Contains(err.Error(), "size mismatch") && !strings.Contains(err.Error(), "does not match manifest size")) {
+		t.Fatalf("expected layer size mismatch error, got: %v", err)
+	}
+	if entries, _ := os.ReadDir(out3); len(entries) != 0 {
+		t.Fatalf("expected no temp blobs left behind in %s, got %d entries", out3, len(entries))
 	}
 }

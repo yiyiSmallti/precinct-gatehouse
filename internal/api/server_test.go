@@ -1605,3 +1605,64 @@ providers:
 		t.Fatalf("expected request admitted after SetDraining(false), got %d %s", rec2.Code, rec2.Body.String())
 	}
 }
+
+func TestHealthzBootNonceCorrelation(t *testing.T) {
+	t.Setenv("GATEHOUSE_BOOT_NONCE", "secret-boot-nonce-123")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	raw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    base_url: http://127.0.0.1:1/v1
+    models: [m1]
+`, dir)
+	if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(raw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "v0.2.0", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// Without matching X-Gatehouse-Boot-Probe, header must be omitted.
+	reqNoHdr := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	recNoHdr := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(recNoHdr, reqNoHdr)
+	if recNoHdr.Code != http.StatusOK {
+		t.Fatalf("/healthz HTTP %d", recNoHdr.Code)
+	}
+	if ack := recNoHdr.Header().Get("X-Gatehouse-Boot-Ack"); ack != "" {
+		t.Fatalf("expected empty X-Gatehouse-Boot-Ack without matching probe, got %q", ack)
+	}
+
+	// Wrong probe value must also omit X-Gatehouse-Boot-Ack.
+	reqWrong := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	reqWrong.Header.Set("X-Gatehouse-Boot-Probe", "wrong-nonce")
+	recWrong := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(recWrong, reqWrong)
+	if ack := recWrong.Header().Get("X-Gatehouse-Boot-Ack"); ack != "" {
+		t.Fatalf("expected empty X-Gatehouse-Boot-Ack on wrong probe, got %q", ack)
+	}
+
+	// Matching probe value must emit X-Gatehouse-Boot-Ack and body version.
+	reqOK := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	reqOK.Header.Set("X-Gatehouse-Boot-Probe", "secret-boot-nonce-123")
+	recOK := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(recOK, reqOK)
+	if recOK.Header().Get("X-Gatehouse-Boot-Ack") == "" {
+		t.Fatal("expected non-empty X-Gatehouse-Boot-Ack when probe matches nonce")
+	}
+	if !strings.Contains(recOK.Body.String(), `"version":"v0.2.0"`) {
+		t.Fatalf("expected /healthz body to include version v0.2.0, got %s", recOK.Body.String())
+	}
+}
