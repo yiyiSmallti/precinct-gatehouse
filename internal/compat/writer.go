@@ -20,10 +20,32 @@ type Translator interface {
 	EndStream(w http.ResponseWriter, ok bool)
 }
 
+type countingWriter struct {
+	http.ResponseWriter
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	k, err := c.ResponseWriter.Write(p)
+	c.n += int64(k)
+	return k, err
+}
+
+func (c *countingWriter) Flush() {
+	if fl, ok := c.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+func (c *countingWriter) Unwrap() http.ResponseWriter {
+	return c.ResponseWriter
+}
+
 // Writer wraps an http.ResponseWriter, buffering JSON/error bodies and
 // streaming SSE chunks through a Translator while preserving gateway headers.
 type Writer struct {
 	w         http.ResponseWriter
+	out       *countingWriter
 	tr        Translator
 	hdr       http.Header
 	status    int
@@ -40,9 +62,16 @@ type Writer struct {
 func NewWriter(w http.ResponseWriter, tr Translator) *Writer {
 	return &Writer{
 		w:   w,
+		out: &countingWriter{ResponseWriter: w},
 		tr:  tr,
 		hdr: make(http.Header),
 	}
+}
+
+// ClientBytesWritten returns the cumulative bytes written to the underlying
+// client ResponseWriter so streaming relays can detect translator buffering.
+func (cw *Writer) ClientBytesWritten() int64 {
+	return cw.out.n
 }
 
 func (cw *Writer) Header() http.Header { return cw.hdr }
@@ -66,7 +95,7 @@ func (cw *Writer) WriteHeader(status int) {
 	ct := cw.hdr.Get("Content-Type")
 	if status == http.StatusOK && strings.HasPrefix(strings.ToLower(ct), "text/event-stream") {
 		cw.streaming = true
-		cw.tr.StartStream(cw.w)
+		cw.tr.StartStream(cw.out)
 		cw.Flush()
 	}
 }
@@ -95,7 +124,7 @@ func (cw *Writer) Write(p []byte) (int, error) {
 func (cw *Writer) processLine(line string) {
 	trimmed := strings.TrimSpace(line)
 	if strings.HasPrefix(trimmed, ":") {
-		_, _ = cw.w.Write([]byte(trimmed + "\n\n"))
+		_, _ = cw.out.Write([]byte(trimmed + "\n\n"))
 		cw.Flush()
 		return
 	}
@@ -128,15 +157,13 @@ func (cw *Writer) processLine(line string) {
 			}
 		}
 	}
-	cw.tr.OnChunk(cw.w, chunk)
+	cw.tr.OnChunk(cw.out, chunk)
 }
 
 // Flush forwards flushes to the underlying ResponseWriter when streaming.
 func (cw *Writer) Flush() {
 	if cw.streaming {
-		if fl, ok := cw.w.(http.Flusher); ok {
-			fl.Flush()
-		}
+		cw.out.Flush()
 	}
 }
 
@@ -151,7 +178,7 @@ func (cw *Writer) Finish() {
 	}
 	cw.copyHeaders()
 	if cw.status != http.StatusOK {
-		cw.tr.WriteError(cw.w, cw.status, cw.buf.Bytes())
+		cw.tr.WriteError(cw.out, cw.status, cw.buf.Bytes())
 		return
 	}
 	if cw.streaming {
@@ -159,11 +186,11 @@ func (cw *Writer) Finish() {
 			cw.processLine(strings.TrimRight(cw.sseBuf.String(), "\r"))
 			cw.sseBuf.Reset()
 		}
-		cw.tr.EndStream(cw.w, !cw.sawError && (cw.sawDone || cw.sawFinish))
+		cw.tr.EndStream(cw.out, !cw.sawError && (cw.sawDone || cw.sawFinish))
 		cw.Flush()
 		return
 	}
-	cw.tr.WriteJSON(cw.w, cw.buf.Bytes())
+	cw.tr.WriteJSON(cw.out, cw.buf.Bytes())
 }
 
 func reqIDFromWriter(w http.ResponseWriter) string {

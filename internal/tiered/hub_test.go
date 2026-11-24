@@ -1094,3 +1094,100 @@ func TestTieredKeepaliveStreamPreservesBackendFailover(t *testing.T) {
 		}
 	}
 }
+
+func TestTieredMidStreamKeepalive(t *testing.T) {
+	var mode atomic.Int32 // 0=clean-pause-after-chunk, 1=split-line-pause
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		fl, _ := w.(http.Flusher)
+		// Delay response headers past sseKeepaliveInitDelay (10ms) so startKeepaliveStream handles the stream.
+		time.Sleep(20 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if mode.Load() == 0 {
+			_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"part1\"}}]}\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+			time.Sleep(85 * time.Millisecond)
+			_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"part2\"},\"finish_reason\":\"stop\"}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		} else {
+			_, _ = io.WriteString(w, "data: {\"id\":\"1")
+			if fl != nil {
+				fl.Flush()
+			}
+			time.Sleep(75 * time.Millisecond)
+			_, _ = io.WriteString(w, "23\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+	}))
+	defer up.Close()
+
+	hub := NewHub(t.TempDir(), nil)
+	defer hub.Close()
+	f := false
+	tc := config.TieredConfig{
+		Mode:               "active",
+		HeavyMissThreshold: 24000,
+		SSEKeepaliveSec:    1,
+		HealthIntervalSec:  60,
+		ZhThinkAnchor:      &f,
+		StarterCache:       &config.TieredStarterCache{Enabled: false},
+		Backends: []config.TieredBackend{
+			{ID: "b1", URL: up.URL, Tier: 1, MaxContextTokens: 32000, MaxSafeInput: 16000, PromoteAt: 16000, SpeedScore: 100},
+		},
+	}
+	tr, err := hub.Transport("p", "local", &tc, nil)
+	if err != nil {
+		t.Fatalf("Transport: %v", err)
+	}
+	hub.Activate(&config.Config{Providers: []config.Provider{{Name: "p", Target: "local", Tiered: &tc}}})
+	r, _ := hub.Router("p")
+	r.sseKeepaliveInitDelay.Store(int64(10 * time.Millisecond))
+	r.sseKeepaliveIntervalOverride.Store(int64(20 * time.Millisecond))
+
+	// 1. Mid-stream pause after SSE chunk triggers >=2 keepalives between part1 and part2.
+	mode.Store(0)
+	req1, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	req1.Header.Set("Content-Type", "application/json")
+	resp1, err := tr.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("RoundTrip 1: %v", err)
+	}
+	raw1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	body1 := string(raw1)
+	p1Idx := strings.Index(body1, `"content":"part1"`)
+	p2Idx := strings.Index(body1, `"content":"part2"`)
+	if p1Idx < 0 || p2Idx < 0 || p2Idx <= p1Idx {
+		t.Fatalf("missing expected parts in %q", body1)
+	}
+	between := body1[p1Idx:p2Idx]
+	if strings.Count(between, ": keepalive\n\n") < 2 {
+		t.Fatalf("expected >=2 mid-stream keepalives between part1 and part2, got %q", between)
+	}
+
+	// 2. Pause inside an incomplete SSE line must NOT inject keepalive comments into the line.
+	mode.Store(1)
+	req2, _ := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m1","stream":true,"messages":[{"role":"user","content":"split"}]}`)))
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := tr.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("RoundTrip 2: %v", err)
+	}
+	raw2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	body2 := string(raw2)
+	if !strings.Contains(body2, `data: {"id":"123",`) {
+		t.Fatalf("expected split SSE line uncorrupted, got %q", body2)
+	}
+}
