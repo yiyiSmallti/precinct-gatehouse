@@ -57,6 +57,27 @@ export function fmtCompact(n) {
   return fmtNum(v);
 }
 
+export function fmtTokens(n) {
+  if (n === undefined || n === null || Number.isNaN(Number(n))) return '0';
+  const v = Math.round(Number(n));
+  if (!Number.isFinite(v)) return '0';
+  const abs = Math.abs(v);
+  if (abs < 1000) return String(v);
+  if (abs < 999_950) return `${(v / 1e3).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${(v / 1e6).toFixed(1).replace(/\.0$/, '')}M`;
+}
+
+export function fmtDuration(ms) {
+  if (ms === undefined || ms === null || Number.isNaN(Number(ms))) return '0ms';
+  const n = Math.round(Number(ms));
+  if (!Number.isFinite(n)) return '0ms';
+  if (n < 1000) return `${n}ms`;
+  if (n < 59_950) return `${(n / 1e3).toFixed(1).replace(/\.0$/, '')}s`;
+  const sec = Math.floor((n + 500) / 1000);
+  if (sec < 3600) return `${Math.floor(sec / 60)}m${String(sec % 60).padStart(2, '0')}s`;
+  return `${Math.floor(sec / 3600)}h${String(Math.floor((sec % 3600) / 60)).padStart(2, '0')}m`;
+}
+
 export function fmtTime(secOrMs) {
   if (!secOrMs) return '-';
   const ms = secOrMs > 1e12 ? secOrMs : secOrMs * 1000;

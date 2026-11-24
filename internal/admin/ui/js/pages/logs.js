@@ -5,7 +5,9 @@ import {
   closeDrawer,
   el,
   fmtDateTime,
+  fmtDuration,
   fmtNum,
+  fmtTokens,
   openDrawer,
   toast,
 } from '/admin/js/ui.js';
@@ -49,6 +51,20 @@ function outputSpeed(r) {
 
 function fmtTps(v) {
   return v >= 100 ? Math.round(v).toLocaleString('en-US') : v.toFixed(1);
+}
+
+function fmtTokenDetail(n) {
+  const v = Math.round(Number(n || 0));
+  if (!Number.isFinite(v)) return '0';
+  const raw = fmtNum(v);
+  return Math.abs(v) >= 1000 ? `${fmtTokens(v)} (${raw})` : raw;
+}
+
+function fmtDurationDetail(ms) {
+  const v = Math.round(Number(ms || 0));
+  if (!Number.isFinite(v)) return '0 ms';
+  const raw = `${fmtNum(v)} ms`;
+  return v >= 1000 ? `${fmtDuration(v)} (${raw})` : raw;
 }
 
 function cacheCell(r) {
@@ -116,12 +132,12 @@ export function renderLogs(container, ctx) {
           kvRow('路由模型', r.model || '-'),
           kvRow('路由后端', r.route_backend || '-'),
           kvRow('路由原因', r.route_reason || '-'),
-          kvRow('输入 Token', fmtNum(r.prompt_tokens)),
-          kvRow('输出 Token', fmtNum(r.completion_tokens)),
-          kvRow('缓存命中 Token', fmtNum(r.cached_tokens)),
+          kvRow('输入 Token', fmtTokenDetail(r.prompt_tokens)),
+          kvRow('输出 Token', fmtTokenDetail(r.completion_tokens)),
+          kvRow('缓存命中 Token', fmtTokenDetail(r.cached_tokens)),
           kvRow('缓存命中率', cacheHit(r) === null ? '-' : `${(cacheHit(r) * 100).toFixed(1)}%`),
-          kvRow('端到端耗时', `${fmtNum(r.latency_ms)} ms`),
-          kvRow('首字延迟 TTFT', r.ttft_ms ? `${fmtNum(r.ttft_ms)} ms` : '-'),
+          kvRow('端到端耗时', fmtDurationDetail(r.latency_ms)),
+          kvRow('首字延迟 TTFT', r.ttft_ms ? fmtDurationDetail(r.ttft_ms) : '-'),
           kvRow('输出速度', (() => {
             const sp = outputSpeed(r);
             if (!sp) return '-';
@@ -300,8 +316,11 @@ export function renderLogs(container, ctx) {
                       r.error_code ? el('span', { className: 'mono muted', style: { fontSize: '11px' } }, r.error_code) : null
                     )
                   ),
-                  el('td', { className: 'td-right num' },
-                    `${fmtNum(r.prompt_tokens)} / ${fmtNum(r.completion_tokens)}`
+                  el('td', {
+                    className: 'td-right num nowrap',
+                    title: `输入 ${fmtNum(r.prompt_tokens)} / 输出 ${fmtNum(r.completion_tokens)} Token`,
+                  },
+                    `${fmtTokens(r.prompt_tokens)} / ${fmtTokens(r.completion_tokens)}`
                   ),
                   el('td', { className: 'nowrap' }, cacheCell(r)),
                   el('td', null,
@@ -311,8 +330,12 @@ export function renderLogs(container, ctx) {
                       )
                       : el('span', { className: 'muted' }, '-')
                   ),
-                  el('td', { className: 'td-right num', style: { whiteSpace: 'nowrap' } },
-                    `${fmtNum(r.latency_ms)}ms${r.ttft_ms ? ` / ${fmtNum(r.ttft_ms)}ms` : ''}`
+                  el('td', {
+                    className: 'td-right num',
+                    style: { whiteSpace: 'nowrap' },
+                    title: `耗时 ${fmtNum(r.latency_ms)} ms${r.ttft_ms ? ` / TTFT ${fmtNum(r.ttft_ms)} ms` : ''}`,
+                  },
+                    `${fmtDuration(r.latency_ms)}${r.ttft_ms ? ` / ${fmtDuration(r.ttft_ms)}` : ''}`
                   ),
                   el('td', { className: 'td-right' }, speedCell(r))
                 )
