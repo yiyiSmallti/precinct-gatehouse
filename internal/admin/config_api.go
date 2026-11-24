@@ -35,6 +35,17 @@ func (s *Server) providerHasKey(p config.Provider) bool {
 	return s.keyRefExists(p.KeyRef)
 }
 
+func (s *Server) updaterSecretExists(ref string) bool {
+	if ref == "" {
+		return false
+	}
+	if name, ok := strings.CutPrefix(ref, "db:"); ok {
+		v, err := getSetting(s.deps.DB, "updater_secret:"+name)
+		return err == nil && v != ""
+	}
+	return true
+}
+
 func (s *Server) getConfig(w http.ResponseWriter, _ *http.Request, _ string) {
 	st := s.deps.Live.Status()
 	raw := st.Snapshot.Cfg.RawCopy()
@@ -46,8 +57,11 @@ func (s *Server) getConfig(w http.ResponseWriter, _ *http.Request, _ string) {
 			cc.SummarizerAPIKey = ""
 		}
 	}
+	raw.Updater.HasPassword = s.updaterSecretExists(raw.Updater.PasswordRef)
+	raw.Updater.HasToken = s.updaterSecretExists(raw.Updater.TokenRef)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":          st.Version,
+		"app_version":      s.deps.Version,
 		"loaded_at":        st.LoadedAt.UTC().Format(time.RFC3339),
 		"path":             st.Path,
 		"hash":             st.Hash,
@@ -148,6 +162,24 @@ func applySectionToRaw(raw *config.Config, section string, data json.RawMessage)
 		if gen.Audit != nil {
 			raw.Audit = *gen.Audit
 		}
+	case "updater":
+		prevPwdRef := raw.Updater.PasswordRef
+		prevTokRef := raw.Updater.TokenRef
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(data, &fields)
+		var upd config.Updater
+		if err := json.Unmarshal(data, &upd); err != nil {
+			return err
+		}
+		upd.HasPassword = false
+		upd.HasToken = false
+		if _, has := fields["password_ref"]; !has && prevPwdRef != "" {
+			upd.PasswordRef = prevPwdRef
+		}
+		if _, has := fields["token_ref"]; !has && prevTokRef != "" {
+			upd.TokenRef = prevTokRef
+		}
+		raw.Updater = upd
 	default:
 		return errors.New("unknown section: " + section)
 	}
@@ -207,7 +239,7 @@ func applySectionsMapToRaw(raw *config.Config, sections map[string]json.RawMessa
 	if len(sections) == 0 {
 		return nil, errors.New("sections is required")
 	}
-	order := []string{"providers", "routing", "aliases", "redaction", "general"}
+	order := []string{"providers", "routing", "aliases", "redaction", "general", "updater"}
 	seen := make(map[string]bool, len(order))
 	applied := make([]string, 0, len(sections))
 	for _, sec := range order {

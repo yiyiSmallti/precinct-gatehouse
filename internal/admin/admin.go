@@ -23,6 +23,7 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact/rules"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/tiered"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/updater"
 )
 
 //go:embed ui
@@ -35,6 +36,8 @@ type Deps struct {
 	Limiter          *limit.Limiter
 	Live             *live.Manager
 	Tiered           *tiered.Hub
+	Updater          *updater.Manager
+	Version          string
 	MissingDetectors []string
 	UserKey          []byte
 	SessionTTL       time.Duration
@@ -124,6 +127,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/api/tiered/{provider}/checkpoints", s.guard(s.getTieredCheckpoints))
 	s.mux.HandleFunc("DELETE /admin/api/tiered/{provider}/checkpoints", s.guard(s.deleteTieredCheckpoints))
 	s.mux.HandleFunc("DELETE /admin/api/tiered/{provider}/checkpoints/{id}", s.guard(s.deleteTieredCheckpoint))
+
+	s.mux.HandleFunc("GET /admin/api/updater", s.guard(s.getUpdater))
+	s.mux.HandleFunc("POST /admin/api/updater/check", s.guard(s.checkUpdater))
+	s.mux.HandleFunc("POST /admin/api/updater/apply", s.guard(s.applyUpdater))
+	s.mux.HandleFunc("POST /admin/api/updater/rollback", s.guard(s.rollbackUpdater))
+	s.mux.HandleFunc("PUT /admin/api/updater/secret", s.guard(s.putUpdaterSecret))
+	s.mux.HandleFunc("DELETE /admin/api/updater/secret/{kind}", s.guard(s.deleteUpdaterSecret))
 }
 
 func (s *Server) sessionTTL() time.Duration {

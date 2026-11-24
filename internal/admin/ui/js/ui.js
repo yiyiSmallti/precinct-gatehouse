@@ -475,6 +475,7 @@ export function sectionLabel(sec) {
     aliases: '模型别名',
     redaction: '隐私脱敏',
     general: '常规参数',
+    updater: '系统更新',
   };
   return labels[sec] || sec;
 }

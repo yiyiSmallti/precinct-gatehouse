@@ -22,6 +22,7 @@ import { renderRedaction } from '/admin/js/pages/redaction.js';
 import { renderLogs } from '/admin/js/pages/logs.js';
 import { renderUsage } from '/admin/js/pages/usage.js';
 import { renderSettings } from '/admin/js/pages/settings.js';
+import { renderUpdater } from '/admin/js/pages/updater.js';
 
 const NAV_GROUPS = [
   {
@@ -41,6 +42,7 @@ const NAV_GROUPS = [
       { id: 'tiered', title: '智能路由', ic: 'tiers', sec: 'providers' },
       { id: 'redaction', title: '隐私脱敏', ic: 'redaction', sec: 'redaction' },
       { id: 'settings', title: '系统与配置', ic: 'settings', sec: 'general' },
+      { id: 'updates', title: '系统更新', ic: 'download', sec: 'updater' },
     ],
   },
 ];
@@ -55,6 +57,7 @@ const ROUTE_TITLES = {
   tiered: '智能路由',
   redaction: '隐私脱敏',
   settings: '系统与配置',
+  updates: '系统更新',
 };
 
 const appRoot = document.getElementById('app');
@@ -411,7 +414,7 @@ function renderTopbarStatus() {
   const pill = el('button', {
     type: 'button',
     className: `config-pill${hasErr ? ' has-err' : hasWarn ? ' has-warn' : ''}`,
-    title: hasErr ? `最近加载错误: ${cfg.last_error.msg}` : `配置文件: ${cfg.path || ''}`,
+    title: hasErr ? `最近加载错误: ${cfg.last_error.msg}` : `程序版本: ${cfg.app_version || '-'} | 配置文件: ${cfg.path || ''}`,
     onClick: () => navigate('settings'),
   },
     el('span', { className: 'status-dot' }),
@@ -506,6 +509,10 @@ function renderShell() {
     ),
     sidebarNavHost,
     el('div', { className: 'sidebar-footer' },
+      el('div', { className: 'sidebar-footer-row' },
+        el('span', null, '程序版本'),
+        el('span', { className: 'mono' }, store.server?.app_version || '-')
+      ),
       el('div', { className: 'sidebar-footer-row' },
         el('span', null, '运行模式'),
         el('span', { className: 'mono' }, modeVal)
@@ -655,6 +662,9 @@ function renderPage() {
       break;
     case 'settings':
       renderSettings(pageHost, ctx);
+      break;
+    case 'updates':
+      renderUpdater(pageHost, ctx);
       break;
     default:
       renderOverview(pageHost, ctx);
