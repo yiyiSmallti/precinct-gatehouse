@@ -183,7 +183,6 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 
 	hub := tiered.NewHub(cfg.DataDir, log)
 	s.Tiered = hub
-	s.closers = append(s.closers, func() { _ = hub.Close() })
 
 	resolveKey := func(ref string) (string, error) {
 		return ResolveKey(db, ref)
@@ -369,11 +368,28 @@ func (s *Server) LocalToken() (string, bool, error) {
 
 // Shutdown stops serving, flushes metrics and kills plugins.
 func (s *Server) Shutdown(ctx context.Context) {
+	s.shutdownInternal(ctx, false)
+}
+
+// ShutdownHandoff drains in-flight requests after another worker has already taken
+// over listening sockets, and skips overwriting Tiered persisted state on exit.
+func (s *Server) ShutdownHandoff(ctx context.Context) {
+	s.shutdownInternal(ctx, true)
+}
+
+func (s *Server) shutdownInternal(ctx context.Context, skipTieredSave bool) {
 	if s.HTTP != nil {
 		_ = s.HTTP.Shutdown(ctx)
 	}
 	if s.otlp != nil {
 		_ = s.otlp.Shutdown(ctx)
+	}
+	if s.Tiered != nil {
+		if skipTieredSave {
+			_ = s.Tiered.CloseWithoutSave()
+		} else {
+			_ = s.Tiered.Close()
+		}
 	}
 	for i := len(s.closers) - 1; i >= 0; i-- {
 		s.closers[i]()

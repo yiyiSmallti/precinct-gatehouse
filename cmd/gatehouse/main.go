@@ -23,7 +23,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -139,9 +141,11 @@ func load(path string) (*config.Config, error) {
 
 func serve(args []string) error {
 	fs, cfgPath := newFlags("serve")
+	handoffFlag := fs.Bool("handoff", false, "accept inherited listener FDs for zero-downtime upgrade")
 	if err := fs.Parse(args); err != nil {
 		return exitErr(2)
 	}
+	inHandoff := *handoffFlag && os.Getenv(updater.EnvHandoff) == "1"
 	cfg, err := config.Load(*cfgPath)
 	firstRun := false
 	if errors.Is(err, config.ErrNotFound) {
@@ -176,24 +180,26 @@ func serve(args []string) error {
 			log.Info("issued the local gateway token", "file", tokPath)
 		}
 	}
-	ln, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		srv.Shutdown(context.Background())
-		return err
-	}
 	if firstRun {
 		log.Info("no configuration found; wrote a default one, configure everything from the web console", "file", *cfgPath)
 	}
-	log.Info("gatehouse listening", "addr", "http://"+ln.Addr().String()+"/v1", "mode", cfg.Mode, "token_file", tokPath)
-	if srv.PolicyDown {
-		log.Warn("policy plugin unavailable; org mode refuses every request with 503 (fail-closed)")
-	}
-	if len(srv.Missing) > 0 {
-		log.Warn("required detectors unavailable; requests that need redaction will get 503", "detectors", srv.Missing)
-	}
 	restartCh := make(chan struct{}, 1)
-	var requestRestart func()
-	if updater.IsSupervised() {
+	var (
+		hc             *updater.WorkerHandoff
+		requestRestart func()
+		requestHandoff func()
+	)
+	if inHandoff {
+		hc, err = updater.NewWorkerHandoffFromEnv()
+		if err != nil {
+			srv.Shutdown(context.Background())
+			return err
+		}
+		defer hc.Close()
+		requestHandoff = func() {
+			_ = hc.SendEvent(updater.HandoffEvent{Event: "restart"})
+		}
+	} else if updater.IsSupervised() {
 		requestRestart = func() {
 			select {
 			case restartCh <- struct{}{}:
@@ -212,15 +218,16 @@ func serve(args []string) error {
 			return api.ResolveUpdaterSecret(srv.DB, ref)
 		},
 		RequestRestart: requestRestart,
+		RequestHandoff: requestHandoff,
 		Log:            log,
 	})
 	srv.Live.AddOnSwap(func(_ *live.Snapshot) {
 		updMgr.NotifyConfigChange()
 	})
 
-	var admSrv *http.Server
+	var adm *admin.Server
 	if cfg.Admin.Listen != "" {
-		adm := admin.New(admin.Deps{
+		adm = admin.New(admin.Deps{
 			DB:               srv.DB,
 			Keys:             srv.Keys,
 			Limiter:          srv.Limiter,
@@ -230,40 +237,190 @@ func serve(args []string) error {
 			Version:          version,
 			MissingDetectors: srv.Missing,
 			UserKey:          srv.UserKey,
-			SessionTTL:       cfg.Admin.SessionTTL.D(12 * time.Hour),
+			SessionTTL:       cfg.Admin.EffectiveSessionTTL(),
+			IdleTimeout:      time.Duration(cfg.Admin.IdleTimeout),
 		})
-		admLn, err := net.Listen("tcp", cfg.Admin.Listen)
-		if err != nil {
-			_ = ln.Close()
-			srv.Shutdown(context.Background())
-			return err
-		}
-		admSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second}
-		log.Info("admin listening", "addr", "http://"+admLn.Addr().String()+"/admin/")
-		if code := adm.SetupCode(); code != "" {
-			fmt.Fprintf(os.Stderr, "\nOpen the console to create the admin account (one-time setup code %s):\n  http://%s/admin/#/setup?code=%s\n\n", code, admLn.Addr().String(), code)
-		}
-		defer admLn.Close()
-		go func() {
-			if err := admSrv.Serve(admLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-				log.Error("admin server failed", "err", err)
-			}
-		}()
 	}
-	updMgr.ConfirmBoot()
-	updCtx, cancelUpd := context.WithCancel(context.Background())
-	defer cancelUpd()
-	updMgr.Start(updCtx)
 
-	errc := make(chan error, 1)
-	go func() { errc <- srv.HTTP.Serve(ln) }()
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	hup := notifyReload()
 	if hup != nil {
 		defer signal.Stop(hup)
 	}
+
+	var (
+		ln     net.Listener
+		admLn  net.Listener
+		admSrv *http.Server
+	)
+	errc := make(chan error, 1)
+
+	if inHandoff {
+		probeDataLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			srv.Shutdown(context.Background())
+			return err
+		}
+		probeDataSrv := &http.Server{Handler: srv.HTTP.Handler, ReadHeaderTimeout: srv.HTTP.ReadHeaderTimeout}
+		probeErr := make(chan error, 2)
+		go func() { probeErr <- probeDataSrv.Serve(probeDataLn) }()
+
+		var (
+			probeAdmLn  net.Listener
+			probeAdmSrv *http.Server
+			probeAdmStr string
+		)
+		if adm != nil {
+			probeAdmLn, err = net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				_ = probeDataSrv.Close()
+				_ = probeDataLn.Close()
+				srv.Shutdown(context.Background())
+				return err
+			}
+			probeAdmStr = probeAdmLn.Addr().String()
+			probeAdmSrv = &http.Server{Handler: adm, ReadHeaderTimeout: 10 * time.Second}
+			go func() { probeErr <- probeAdmSrv.Serve(probeAdmLn) }()
+		}
+		closeProbes := func() {
+			_ = probeDataSrv.Close()
+			_ = probeDataLn.Close()
+			if probeAdmSrv != nil {
+				_ = probeAdmSrv.Close()
+			}
+			if probeAdmLn != nil {
+				_ = probeAdmLn.Close()
+			}
+		}
+
+		if err := hc.SendEvent(updater.HandoffEvent{
+			Event:     "probe_ready",
+			DataAddr:  probeDataLn.Addr().String(),
+			AdminAddr: probeAdmStr,
+		}); err != nil {
+			closeProbes()
+			srv.Shutdown(context.Background())
+			return err
+		}
+
+		activated := false
+		for !activated {
+			select {
+			case <-sig:
+				closeProbes()
+				srv.Shutdown(context.Background())
+				return nil
+			case perr := <-probeErr:
+				if perr != nil && !errors.Is(perr, http.ErrServerClosed) && !errors.Is(perr, net.ErrClosed) {
+					closeProbes()
+					srv.Shutdown(context.Background())
+					return perr
+				}
+			case cmd, ok := <-hc.Commands():
+				if !ok || cmd.Cmd == "abort" || cmd.Cmd == "drain" {
+					closeProbes()
+					srv.Shutdown(context.Background())
+					return nil
+				}
+				if cmd.Cmd == "activate" {
+					ln, admLn, err = hc.RecvListeners(adm != nil)
+					if err != nil {
+						_ = hc.SendEvent(updater.HandoffEvent{Event: "activated", Error: err.Error()})
+						closeProbes()
+						srv.Shutdown(context.Background())
+						return err
+					}
+					if adm != nil {
+						admSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second}
+						go func() {
+							if err := admSrv.Serve(admLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+								log.Error("admin server failed", "err", err)
+							}
+						}()
+					}
+					go func() { errc <- srv.HTTP.Serve(ln) }()
+					runtime.Gosched()
+					select {
+					case err := <-errc:
+						if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+							_ = hc.SendEvent(updater.HandoffEvent{Event: "activated", Error: err.Error()})
+							if admSrv != nil {
+								_ = admSrv.Close()
+							}
+							_ = ln.Close()
+							closeProbes()
+							srv.Shutdown(context.Background())
+							return err
+						}
+					default:
+					}
+					if err := hc.SendEvent(updater.HandoffEvent{Event: "activated"}); err != nil {
+						if admSrv != nil {
+							_ = admSrv.Close()
+						}
+						_ = ln.Close()
+						closeProbes()
+						srv.Shutdown(context.Background())
+						return err
+					}
+					closeProbes()
+					activated = true
+				}
+			}
+		}
+		defer ln.Close()
+		if admLn != nil {
+			defer admLn.Close()
+		}
+	} else {
+		ln, err = net.Listen("tcp", cfg.Listen)
+		if err != nil {
+			srv.Shutdown(context.Background())
+			return err
+		}
+		defer ln.Close()
+		if adm != nil {
+			admLn, err = net.Listen("tcp", cfg.Admin.Listen)
+			if err != nil {
+				srv.Shutdown(context.Background())
+				return err
+			}
+			admSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second}
+			defer admLn.Close()
+			go func() {
+				if err := admSrv.Serve(admLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+					log.Error("admin server failed", "err", err)
+				}
+			}()
+		}
+		go func() { errc <- srv.HTTP.Serve(ln) }()
+	}
+
+	log.Info("gatehouse listening", "addr", "http://"+ln.Addr().String()+"/v1", "mode", cfg.Mode, "token_file", tokPath, "handoff", inHandoff)
+	if srv.PolicyDown {
+		log.Warn("policy plugin unavailable; org mode refuses every request with 503 (fail-closed)")
+	}
+	if len(srv.Missing) > 0 {
+		log.Warn("required detectors unavailable; requests that need redaction will get 503", "detectors", srv.Missing)
+	}
+	if adm != nil && admLn != nil {
+		log.Info("admin listening", "addr", "http://"+admLn.Addr().String()+"/admin/")
+		if code := adm.SetupCode(); code != "" {
+			fmt.Fprintf(os.Stderr, "\nOpen the console to create the admin account (one-time setup code %s):\n  http://%s/admin/#/setup?code=%s\n\n", code, admLn.Addr().String(), code)
+		}
+	}
+	updMgr.ConfirmBoot()
+	updCtx, cancelUpd := context.WithCancel(context.Background())
+	defer cancelUpd()
+	updMgr.Start(updCtx)
+
+	var cmdCh <-chan updater.HandoffCommand
+	if hc != nil {
+		cmdCh = hc.Commands()
+	}
 	restartRequested := false
+	drainingHandoff := false
 loop:
 	for {
 		select {
@@ -272,6 +429,18 @@ loop:
 		case <-restartCh:
 			restartRequested = true
 			break loop
+		case cmd, ok := <-cmdCh:
+			if !ok {
+				cmdCh = nil
+				continue
+			}
+			switch cmd.Cmd {
+			case "drain":
+				drainingHandoff = true
+				break loop
+			case "abort":
+				updMgr.AbortHandoff()
+			}
 		case <-hup:
 			res, changed, rerr := srv.Live.ReloadFromDisk("signal")
 			if rerr != nil {
@@ -282,7 +451,7 @@ loop:
 				log.Info("SIGHUP received, config unchanged", "version", res.Version)
 			}
 		case err := <-errc:
-			if err != nil && !errors.Is(err, net.ErrClosed) {
+			if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 				cancelUpd()
 				if admSrv != nil {
 					_ = admSrv.Shutdown(context.Background())
@@ -294,6 +463,30 @@ loop:
 		}
 	}
 	cancelUpd()
+	if drainingHandoff {
+		drainWait := 5 * time.Minute
+		if snap := srv.Live.Current(); snap != nil {
+			drainWait = snap.Cfg.Updater.DrainTimeout.D(5 * time.Minute)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), drainWait)
+		defer cancel()
+		var wg sync.WaitGroup
+		if admSrv != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = admSrv.Shutdown(ctx)
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			srv.ShutdownHandoff(ctx)
+		}()
+		wg.Wait()
+		log.Info("gatehouse stopped after graceful handoff drain")
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if admSrv != nil {

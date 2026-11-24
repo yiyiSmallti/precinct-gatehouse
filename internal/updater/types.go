@@ -22,7 +22,30 @@ const (
 	EnvBootNonce    = "GATEHOUSE_BOOT_NONCE"
 	HeaderBootProbe = "X-Gatehouse-Boot-Probe"
 	HeaderBootAck   = "X-Gatehouse-Boot-Ack"
+
+	EnvHandoff     = "GATEHOUSE_HANDOFF"
+	EnvFDSockFD    = "GATEHOUSE_FD_SOCK_FD"
+	EnvListenFD    = "GATEHOUSE_LISTEN_FD"
+	EnvListenAddr  = "GATEHOUSE_LISTEN_ADDR"
+	EnvAdminFD     = "GATEHOUSE_ADMIN_FD"
+	EnvAdminAddr   = "GATEHOUSE_ADMIN_ADDR"
+	EnvCtrlWriteFD = "GATEHOUSE_CTRL_WRITE_FD"
+	EnvCmdReadFD   = "GATEHOUSE_CMD_READ_FD"
 )
+
+// HandoffEvent is emitted as a JSON line from a supervised --handoff worker to
+// its supervisor over EnvCtrlWriteFD.
+type HandoffEvent struct {
+	Event     string `json:"event"` // "probe_ready", "activated", "restart"
+	DataAddr  string `json:"data_addr,omitempty"`
+	AdminAddr string `json:"admin_addr,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// HandoffCommand is sent as a JSON line from supervisor to worker over EnvCmdReadFD.
+type HandoffCommand struct {
+	Cmd string `json:"cmd"` // "activate", "drain", "abort"
+}
 
 // Update state constants reported via Manager.Status() and Admin API.
 const (

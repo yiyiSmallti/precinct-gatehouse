@@ -369,6 +369,16 @@ func (h *Hub) Statuses() []ProviderStatus {
 
 // Close shuts down background loops and flushes persisted starters to disk.
 func (h *Hub) Close() error {
+	return h.closeInternal(true)
+}
+
+// CloseWithoutSave shuts down background loops without flushing state to disk,
+// used when a draining worker exits after handing over live traffic to a new worker.
+func (h *Hub) CloseWithoutSave() error {
+	return h.closeInternal(false)
+}
+
+func (h *Hub) closeInternal(save bool) error {
 	h.mu.Lock()
 	all := make([]*Router, 0, len(h.routers))
 	for _, r := range h.routers {
@@ -378,7 +388,11 @@ func (h *Hub) Close() error {
 	h.mu.Unlock()
 
 	for _, r := range all {
-		r.close()
+		if save {
+			r.close()
+		} else {
+			r.closeWithoutSave()
+		}
 	}
 	h.transport.CloseIdleConnections()
 	return nil

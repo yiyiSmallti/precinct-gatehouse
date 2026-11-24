@@ -27,9 +27,23 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	if os.Getenv("GATEHOUSE_SUPERVISE_HELPER") == "1" && len(os.Args) >= 4 && os.Args[1] == "serve" && os.Args[2] == "--config" {
-		runSuperviseHelper(os.Args[3])
-		return
+	if os.Getenv("GATEHOUSE_SUPERVISE_HELPER") == "1" {
+		if len(os.Args) >= 3 && os.Args[1] == "serve" && (os.Args[2] == "-h" || os.Args[2] == "--help") {
+			if os.Getenv("GATEHOUSE_HANDOFF_HELPER") == "1" {
+				fmt.Fprintln(os.Stderr, "Usage of serve:\n  --config string\n  -handoff\n\taccept inherited listener FDs")
+			} else {
+				fmt.Fprintln(os.Stderr, "Usage of serve:\n  --config string")
+			}
+			os.Exit(2)
+		}
+		if len(os.Args) >= 4 && os.Args[1] == "serve" && os.Args[2] == "--config" {
+			if os.Getenv("GATEHOUSE_HANDOFF_HELPER") == "1" {
+				runHandoffHelper(os.Args[3])
+				return
+			}
+			runSuperviseHelper(os.Args[3])
+			return
+		}
 	}
 	os.Exit(m.Run())
 }

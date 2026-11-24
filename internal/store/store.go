@@ -94,6 +94,15 @@ CREATE TABLE IF NOT EXISTS settings (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS admin_sessions (
+  token_hash TEXT PRIMARY KEY,
+  user TEXT NOT NULL,
+  pass_hash TEXT NOT NULL,
+  issued_at INTEGER NOT NULL,
+  last_active_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at);
 `
 
 // Open opens (and migrates) <dataDir>/gatehouse.db.

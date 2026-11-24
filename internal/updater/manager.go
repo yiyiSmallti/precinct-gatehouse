@@ -42,6 +42,7 @@ type Deps struct {
 	SetDraining     func(draining bool)
 	ResolveSecret   func(ref string) (string, error)
 	RequestRestart  func()
+	RequestHandoff  func()
 	ManualRestartOK bool
 	Log             *slog.Logger
 
@@ -676,28 +677,36 @@ func (m *Manager) Check(ctx context.Context) (Status, error) {
 }
 
 // CanRestart reports whether the Manager can trigger an automatic process restart
-// after switching releases (i.e. when running under `gatehouse supervise`).
+// or zero-downtime handoff after switching releases.
 func (m *Manager) CanRestart() bool {
-	return m.deps.RequestRestart != nil
+	return m.deps.RequestRestart != nil || m.deps.RequestHandoff != nil
+}
+
+func (m *Manager) beginOp(noRestart bool, initialState, msg string) (context.Context, error) {
+	if !noRestart && !m.CanRestart() && !m.deps.ManualRestartOK {
+		return nil, ErrRestartUnavailable
+	}
+	m.mu.Lock()
+	if m.busy || m.state == StateRestarting {
+		m.mu.Unlock()
+		return nil, ErrBusy
+	}
+	m.busy = true
+	m.state = initialState
+	m.message = msg
+	m.lastError = ""
+	ctx := m.bgCtx
+	m.mu.Unlock()
+	return ctx, nil
 }
 
 // ApplyAsync begins an update in the background, returning ErrBusy if one is active
 // or ErrRestartUnavailable if a restart is required without supervisor support.
 func (m *Manager) ApplyAsync(opts ApplyOptions) error {
-	if !opts.NoRestart && !m.CanRestart() && !m.deps.ManualRestartOK {
-		return ErrRestartUnavailable
+	ctx, err := m.beginOp(opts.NoRestart, StateDownloading, "准备拉取更新包...")
+	if err != nil {
+		return err
 	}
-	m.mu.Lock()
-	if m.busy {
-		m.mu.Unlock()
-		return ErrBusy
-	}
-	m.busy = true
-	m.state = StateDownloading
-	m.message = "准备拉取更新包..."
-	m.lastError = ""
-	ctx := m.bgCtx
-	m.mu.Unlock()
 
 	go func() {
 		_, err := m.runApplyLocked(ctx, opts)
@@ -711,20 +720,9 @@ func (m *Manager) ApplyAsync(opts ApplyOptions) error {
 // Apply downloads, verifies, preflights, drains in-flight requests, installs,
 // and triggers a restart (unless opts.NoRestart is set).
 func (m *Manager) Apply(ctx context.Context, opts ApplyOptions) (InstallResult, error) {
-	if !opts.NoRestart && !m.CanRestart() && !m.deps.ManualRestartOK {
-		return InstallResult{}, ErrRestartUnavailable
+	if _, err := m.beginOp(opts.NoRestart, StateDownloading, "准备拉取更新包..."); err != nil {
+		return InstallResult{}, err
 	}
-	m.mu.Lock()
-	if m.busy {
-		m.mu.Unlock()
-		return InstallResult{}, ErrBusy
-	}
-	m.busy = true
-	m.state = StateDownloading
-	m.message = "准备拉取更新包..."
-	m.lastError = ""
-	m.mu.Unlock()
-
 	return m.runApplyLocked(ctx, opts)
 }
 
@@ -850,7 +848,9 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 		return InstallResult{}, err
 	}
 
-	willRestart := !opts.NoRestart && m.deps.RequestRestart != nil
+	canRestart := m.deps.RequestHandoff != nil || m.deps.RequestRestart != nil
+	willRestart := !opts.NoRestart && canRestart
+	useHandoff := willRestart && m.deps.RequestHandoff != nil
 	draining := false
 	restarting := false
 	stopDraining := func() {
@@ -860,12 +860,12 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 		draining = false
 	}
 	defer stopDraining()
-	if willRestart && m.deps.SetDraining != nil {
+	if willRestart && !useHandoff && m.deps.SetDraining != nil {
 		m.deps.SetDraining(true)
 		draining = true
 	}
 
-	if !opts.Force {
+	if willRestart && !useHandoff && !opts.Force {
 		drainTimeout := cfg.DrainTimeout.D(5 * time.Minute)
 		if err := m.waitForInflightDrain(ctx, drainTimeout); err != nil {
 			stopDraining()
@@ -919,7 +919,7 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 		Detail:  fmt.Sprintf("switched from %s", res.PreviousVersion),
 	})
 
-	if opts.NoRestart || m.deps.RequestRestart == nil {
+	if opts.NoRestart || !canRestart {
 		m.mu.Lock()
 		m.busy = false
 		m.state = StateIdle
@@ -933,30 +933,28 @@ func (m *Manager) runApplyLocked(ctx context.Context, opts ApplyOptions) (Instal
 	m.mu.Lock()
 	m.busy = false
 	m.state = StateRestarting
-	m.message = fmt.Sprintf("正在重启切换到 %s...", res.Version)
+	if useHandoff {
+		m.message = fmt.Sprintf("正在平滑切换到 %s...", res.Version)
+	} else {
+		m.message = fmt.Sprintf("正在重启切换到 %s...", res.Version)
+	}
 	m.available = nil
 	m.mu.Unlock()
 
-	m.scheduleRestart()
+	if useHandoff {
+		m.scheduleHandoff()
+	} else {
+		m.scheduleRestart()
+	}
 	return res, nil
 }
 
 // RollbackAsync starts an asynchronous rollback to opts.TargetVersion (or previous).
 func (m *Manager) RollbackAsync(opts RollbackOptions) error {
-	if !opts.NoRestart && !m.CanRestart() && !m.deps.ManualRestartOK {
-		return ErrRestartUnavailable
+	ctx, err := m.beginOp(opts.NoRestart, StateApplying, "准备回滚版本...")
+	if err != nil {
+		return err
 	}
-	m.mu.Lock()
-	if m.busy {
-		m.mu.Unlock()
-		return ErrBusy
-	}
-	m.busy = true
-	m.state = StateApplying
-	m.message = "准备回滚版本..."
-	m.lastError = ""
-	ctx := m.bgCtx
-	m.mu.Unlock()
 
 	go func() {
 		_, err := m.runRollbackLocked(ctx, opts)
@@ -969,20 +967,9 @@ func (m *Manager) RollbackAsync(opts RollbackOptions) error {
 
 // Rollback switches to opts.TargetVersion (or previous) and triggers restart.
 func (m *Manager) Rollback(ctx context.Context, opts RollbackOptions) (InstallResult, error) {
-	if !opts.NoRestart && !m.CanRestart() && !m.deps.ManualRestartOK {
-		return InstallResult{}, ErrRestartUnavailable
+	if _, err := m.beginOp(opts.NoRestart, StateApplying, "准备回滚版本..."); err != nil {
+		return InstallResult{}, err
 	}
-	m.mu.Lock()
-	if m.busy {
-		m.mu.Unlock()
-		return InstallResult{}, ErrBusy
-	}
-	m.busy = true
-	m.state = StateApplying
-	m.message = "准备回滚版本..."
-	m.lastError = ""
-	m.mu.Unlock()
-
 	return m.runRollbackLocked(ctx, opts)
 }
 
@@ -992,7 +979,9 @@ func (m *Manager) runRollbackLocked(ctx context.Context, opts RollbackOptions) (
 	st := m.Store()
 	initialHome := st.HomeDir
 
-	willRestart := !opts.NoRestart && m.deps.RequestRestart != nil
+	canRestart := m.deps.RequestHandoff != nil || m.deps.RequestRestart != nil
+	willRestart := !opts.NoRestart && canRestart
+	useHandoff := willRestart && m.deps.RequestHandoff != nil
 	draining := false
 	restarting := false
 	stopDraining := func() {
@@ -1002,12 +991,12 @@ func (m *Manager) runRollbackLocked(ctx context.Context, opts RollbackOptions) (
 		draining = false
 	}
 	defer stopDraining()
-	if willRestart && m.deps.SetDraining != nil {
+	if willRestart && !useHandoff && m.deps.SetDraining != nil {
 		m.deps.SetDraining(true)
 		draining = true
 	}
 
-	if !opts.Force {
+	if willRestart && !useHandoff && !opts.Force {
 		drainTimeout := cfg.DrainTimeout.D(5 * time.Minute)
 		if err := m.waitForInflightDrain(ctx, drainTimeout); err != nil {
 			stopDraining()
@@ -1039,7 +1028,7 @@ func (m *Manager) runRollbackLocked(ctx context.Context, opts RollbackOptions) (
 		Detail:  fmt.Sprintf("rolled back from %s", res.PreviousVersion),
 	})
 
-	if opts.NoRestart || m.deps.RequestRestart == nil {
+	if opts.NoRestart || !canRestart {
 		m.mu.Lock()
 		m.busy = false
 		m.state = StateIdle
@@ -1052,10 +1041,18 @@ func (m *Manager) runRollbackLocked(ctx context.Context, opts RollbackOptions) (
 	m.mu.Lock()
 	m.busy = false
 	m.state = StateRestarting
-	m.message = fmt.Sprintf("正在重启切换到 %s...", res.Version)
+	if useHandoff {
+		m.message = fmt.Sprintf("正在平滑切换到 %s...", res.Version)
+	} else {
+		m.message = fmt.Sprintf("正在重启切换到 %s...", res.Version)
+	}
 	m.mu.Unlock()
 
-	m.scheduleRestart()
+	if useHandoff {
+		m.scheduleHandoff()
+	} else {
+		m.scheduleRestart()
+	}
 	return res, nil
 }
 
@@ -1094,6 +1091,39 @@ func (m *Manager) scheduleRestart() {
 		time.Sleep(150 * time.Millisecond)
 		m.deps.RequestRestart()
 	}()
+}
+
+func (m *Manager) scheduleHandoff() {
+	if m.deps.RequestHandoff == nil {
+		return
+	}
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		m.deps.RequestHandoff()
+	}()
+}
+
+// AbortHandoff resets StateRestarting when a zero-downtime replacement worker
+// failed health verification and the supervisor kept this worker running.
+func (m *Manager) AbortHandoff() {
+	st := m.Store()
+	var reason string
+	if failed, err := st.ReadFailed(); err == nil && failed != nil {
+		m.recordFailedOnce(failed)
+		reason = failed.Reason
+	}
+	m.mu.Lock()
+	m.busy = false
+	if m.state == StateRestarting {
+		m.state = StateError
+		if reason != "" {
+			m.lastError = reason
+			m.message = fmt.Sprintf("新版本健康检查失败，已自动回滚并保持当前版本运行: %s", reason)
+		} else {
+			m.message = "新版本健康检查失败，已自动回滚并保持当前版本运行"
+		}
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) loadHistory() {

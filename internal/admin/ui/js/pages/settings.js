@@ -274,6 +274,22 @@ export function renderSettings(container) {
             })
           ),
           el('div', { className: 'opt-item' },
+            el('label', { className: 'field-label' }, '空闲自动退出'),
+            optionSelect({
+              value: gen.admin?.idle_timeout || '',
+              mono: true,
+              customPlaceholder: '如 45m 或 -1s 关闭',
+              options: [
+                { value: '15m', label: '15 分钟' },
+                { value: '30m', label: '30 分钟' },
+                { value: '', label: '1 小时（默认）' },
+                { value: '2h', label: '2 小时' },
+                { value: '-1s', label: '不自动退出' },
+              ],
+              onChange: (v) => setGen((n) => { n.admin = { ...(n.admin || {}), idle_timeout: v }; }),
+            })
+          ),
+          el('div', { className: 'opt-item' },
             el('label', { className: 'field-label' }, '审计记录目录', restartTag.cloneNode(true)),
             el('input', {
               className: 'input mono',

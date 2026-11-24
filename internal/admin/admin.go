@@ -41,6 +41,7 @@ type Deps struct {
 	MissingDetectors []string
 	UserKey          []byte
 	SessionTTL       time.Duration
+	IdleTimeout      time.Duration
 }
 
 // Server serves the /admin/ Web UI and /admin/api/* JSON API.
@@ -60,10 +61,10 @@ func New(d Deps) *Server {
 	}
 	s := &Server{
 		deps: d,
-		auth: newAuthStore(d.SessionTTL),
 		ui:   sub,
 		mux:  http.NewServeMux(),
 	}
+	s.auth = newAuthStoreWithDB(d.SessionTTL, s.idleTimeout(), newSessionDB(d.DB))
 	s.routes()
 	return s
 }
@@ -160,6 +161,21 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, tok st
 	})
 }
 
+func (s *Server) idleTimeout() time.Duration {
+	if s.deps.Live != nil {
+		if snap := s.deps.Live.Current(); snap != nil {
+			return snap.Cfg.Admin.EffectiveIdleTimeout()
+		}
+	}
+	if s.deps.IdleTimeout < 0 {
+		return 0
+	}
+	if s.deps.IdleTimeout == 0 {
+		return time.Hour
+	}
+	return s.deps.IdleTimeout
+}
+
 func (s *Server) guard(next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(cookieName)
@@ -172,7 +188,8 @@ func (s *Server) guard(next func(http.ResponseWriter, *http.Request, string)) ht
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		user, ok := s.auth.verifySession(c.Value, storedPass, s.sessionTTL(), time.Now())
+		touch := r.Header.Get("X-Gatehouse-Background") != "1"
+		user, ok := s.auth.verifySession(c.Value, storedPass, s.sessionTTL(), s.idleTimeout(), touch, time.Now())
 		if !ok {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -217,7 +234,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	s.auth.clearFails(ip)
 	ttl := s.sessionTTL()
-	tok, err := s.auth.createSession(storedUser, storedPass, ttl, now)
+	tok, err := s.auth.createSession(storedUser, storedPass, ttl, time.Now())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return

@@ -568,6 +568,14 @@ func (r *Router) ensureLoops() {
 }
 
 func (r *Router) close() {
+	r.closeInternal(true)
+}
+
+func (r *Router) closeWithoutSave() {
+	r.closeInternal(false)
+}
+
+func (r *Router) closeInternal(save bool) {
 	r.loopMu.Lock()
 	if r.loopCancel != nil {
 		r.loopCancel()
@@ -577,8 +585,10 @@ func (r *Router) close() {
 	r.loopMu.Unlock()
 	r.starters.syncWarmLoop(context.Background(), false)
 	r.compressor.syncLoop(context.Background(), false)
-	r.starters.saveToDisk()
-	r.compressor.saveToDisk()
+	if save {
+		r.starters.saveToDisk()
+		r.compressor.saveToDisk()
+	}
 }
 
 func (r *Router) getConfig() RouterConfig {

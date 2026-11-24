@@ -87,19 +87,24 @@ export function renderUpdater(container, ctx) {
 
   const loadStatus = async (fromPoll = false) => {
     try {
-      const res = await api.updaterStatus();
+      const opts = fromPoll ? { background: true } : undefined;
+      const res = await api.updaterStatus(opts);
       const prevReconnecting = reconnecting;
       status = res;
       reconnecting = false;
       reconnectTries = 0;
 
       if (prevReconnecting) {
-        await store.refresh().catch(() => {});
+        await store.refresh(opts).catch(() => {});
         if (versionBeforeRestart && res.current_version && res.current_version !== versionBeforeRestart) {
           toast(`网关已重启并切换至 ${res.current_version}`, 'ok', 5000);
         } else {
           toast(`网关已恢复在线 (${res.current_version || res.active_release || '-'})`, 'ok');
         }
+        versionBeforeRestart = '';
+      } else if (versionBeforeRestart && res.current_version && res.current_version !== versionBeforeRestart) {
+        await store.refresh(opts).catch(() => {});
+        toast(`网关已平滑升级并切换至 ${res.current_version}`, 'ok', 5000);
         versionBeforeRestart = '';
       }
 

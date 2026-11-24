@@ -70,7 +70,8 @@ export function renderTiered(container, ctx) {
   const load = async (silent = false) => {
     const seq = ++reqSeq;
     try {
-      const res = await api.tieredStatus();
+      const opts = silent ? { background: true } : undefined;
+      const res = await api.tieredStatus(opts);
       if (destroyed || seq !== reqSeq) return;
       statusData = res;
       const provs = res?.providers || [];
@@ -79,7 +80,7 @@ export function renderTiered(container, ctx) {
       }
       if (selectedProvider) {
         try {
-          const stRes = await api.tieredStarters(selectedProvider);
+          const stRes = await api.tieredStarters(selectedProvider, opts);
           if (destroyed || seq !== reqSeq) return;
           startersMap[selectedProvider] = stRes?.starters || [];
         } catch {
@@ -87,7 +88,7 @@ export function renderTiered(container, ctx) {
           if (!startersMap[selectedProvider]) startersMap[selectedProvider] = [];
         }
         try {
-          const cpRes = await api.tieredCheckpoints(selectedProvider);
+          const cpRes = await api.tieredCheckpoints(selectedProvider, opts);
           if (destroyed || seq !== reqSeq) return;
           checkpointsMap[selectedProvider] = {
             items: cpRes?.checkpoints || [],
