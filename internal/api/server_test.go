@@ -1543,3 +1543,126 @@ func TestReadRequestBodyErrorClassification(t *testing.T) {
 		t.Fatalf("expected 408 for truncated count_tokens body, got code=%d body=%q", rec4.Code, rec4.Body.String())
 	}
 }
+
+func TestServerSetDrainingRejectsNewRequests(t *testing.T) {
+	dir := t.TempDir()
+	raw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    base_url: http://127.0.0.1:1/v1
+    models: [m1]
+`, dir)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(raw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "test", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv.SetDraining(true)
+	req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`{"model":"p/m1","messages":[{"role":"user","content":"hi"}]}`)))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 while draining, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") != "5" {
+		t.Fatalf("expected Retry-After: 5 header, got %q", rec.Header().Get("Retry-After"))
+	}
+	if !strings.Contains(rec.Body.String(), "service_restarting") {
+		t.Fatalf("expected service_restarting error body, got %s", rec.Body.String())
+	}
+	if srv.Inflight() != 0 {
+		t.Fatalf("expected inflight=0 after rejected draining request, got %d", srv.Inflight())
+	}
+
+	// Restoring admission allows requests to enter the pipeline again.
+	srv.SetDraining(false)
+	req2, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader([]byte(`bad-json`)))
+	req2.Header.Set("Authorization", "Bearer "+tok)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec2, req2)
+	if rec2.Code == http.StatusServiceUnavailable && strings.Contains(rec2.Body.String(), "service_restarting") {
+		t.Fatalf("expected request admitted after SetDraining(false), got %d %s", rec2.Code, rec2.Body.String())
+	}
+}
+
+func TestHealthzBootNonceCorrelation(t *testing.T) {
+	t.Setenv("GATEHOUSE_BOOT_NONCE", "secret-boot-nonce-123")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	raw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    base_url: http://127.0.0.1:1/v1
+    models: [m1]
+`, dir)
+	if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(raw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, "v0.2.0", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// Without matching X-Gatehouse-Boot-Probe, header must be omitted.
+	reqNoHdr := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	recNoHdr := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(recNoHdr, reqNoHdr)
+	if recNoHdr.Code != http.StatusOK {
+		t.Fatalf("/healthz HTTP %d", recNoHdr.Code)
+	}
+	if ack := recNoHdr.Header().Get("X-Gatehouse-Boot-Ack"); ack != "" {
+		t.Fatalf("expected empty X-Gatehouse-Boot-Ack without matching probe, got %q", ack)
+	}
+
+	// Wrong probe value must also omit X-Gatehouse-Boot-Ack.
+	reqWrong := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	reqWrong.Header.Set("X-Gatehouse-Boot-Probe", "wrong-nonce")
+	recWrong := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(recWrong, reqWrong)
+	if ack := recWrong.Header().Get("X-Gatehouse-Boot-Ack"); ack != "" {
+		t.Fatalf("expected empty X-Gatehouse-Boot-Ack on wrong probe, got %q", ack)
+	}
+
+	// Matching probe value must emit X-Gatehouse-Boot-Ack and body version.
+	reqOK := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	reqOK.Header.Set("X-Gatehouse-Boot-Probe", "secret-boot-nonce-123")
+	recOK := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(recOK, reqOK)
+	if recOK.Header().Get("X-Gatehouse-Boot-Ack") == "" {
+		t.Fatal("expected non-empty X-Gatehouse-Boot-Ack when probe matches nonce")
+	}
+	if !strings.Contains(recOK.Body.String(), `"version":"v0.2.0"`) {
+		t.Fatalf("expected /healthz body to include version v0.2.0, got %s", recOK.Body.String())
+	}
+}

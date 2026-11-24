@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
@@ -67,6 +68,52 @@ type Pipeline struct {
 	Hooks                 []Hook           // OnRequest/OnResponse plugins, in config order
 	SSEKeepaliveInitDelay time.Duration    // delay before Gatehouse sends SSE keepalive during long prefill (0 = 20s, <0 disables)
 	SSEKeepaliveInterval  time.Duration    // interval between SSE keepalives (0 = 15s, <0 disables)
+	admitMu               sync.Mutex
+	draining              bool
+	inflight              atomic.Int64
+}
+
+// SetDraining toggles request admission for clean graceful update cutovers.
+func (p *Pipeline) SetDraining(draining bool) {
+	if p == nil {
+		return
+	}
+	p.admitMu.Lock()
+	p.draining = draining
+	p.admitMu.Unlock()
+}
+
+// IsDraining reports whether new data-plane requests are currently rejected.
+func (p *Pipeline) IsDraining() bool {
+	if p == nil {
+		return false
+	}
+	p.admitMu.Lock()
+	d := p.draining
+	p.admitMu.Unlock()
+	return d
+}
+
+func (p *Pipeline) tryAdmit() bool {
+	p.admitMu.Lock()
+	if p.draining {
+		p.admitMu.Unlock()
+		return false
+	}
+	p.inflight.Add(1)
+	p.admitMu.Unlock()
+	return true
+}
+
+// Inflight returns the number of active requests currently inside the pipeline.
+func (p *Pipeline) Inflight() int64 {
+	if p == nil {
+		return 0
+	}
+	p.admitMu.Lock()
+	n := p.inflight.Load()
+	p.admitMu.Unlock()
+	return n
 }
 
 func (p *Pipeline) keepaliveInitDelay() time.Duration {
@@ -141,6 +188,12 @@ func (p *Pipeline) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Serve runs one request through the gateway pipeline using the supplied
 // protocol label and request decoder.
 func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string, decode func([]byte) (oai.Object, error)) {
+	if !p.tryAdmit() {
+		w.Header().Set("Retry-After", "5")
+		oai.WriteError(w, oai.Errorf(http.StatusServiceUnavailable, "service_restarting", "gateway is draining for update restart; please retry shortly"))
+		return
+	}
+	defer p.inflight.Add(-1)
 	if decode == nil {
 		decode = oai.Decode
 	}

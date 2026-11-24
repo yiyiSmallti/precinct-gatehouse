@@ -141,4 +141,13 @@ export const api = {
     request('POST', `/admin/api/tiered/${encodeURIComponent(provider)}/starters/warm`, data),
   resetTieredShadow: (provider) =>
     request('POST', `/admin/api/tiered/${encodeURIComponent(provider)}/shadow/reset`, {}),
+
+  updaterStatus: () => request('GET', '/admin/api/updater'),
+  updaterCheck: () => request('POST', '/admin/api/updater/check', {}),
+  updaterApply: (data = {}) => request('POST', '/admin/api/updater/apply', data),
+  updaterRollback: (data = {}) => request('POST', '/admin/api/updater/rollback', data),
+  putUpdaterSecret: (kind, value, baseHash = '') =>
+    request('PUT', '/admin/api/updater/secret', { kind, value, base_hash: baseHash }),
+  deleteUpdaterSecret: (kind, baseHash = '') =>
+    request('DELETE', `/admin/api/updater/secret/${encodeURIComponent(kind)}`, { base_hash: baseHash }),
 };

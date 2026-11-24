@@ -3,7 +3,9 @@ package config
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -44,6 +46,7 @@ type Config struct {
 	Tokens         TokenDefaults            `yaml:"tokens,omitempty" json:"tokens,omitempty"`
 	Org            Org                      `yaml:"org,omitempty" json:"org,omitempty"`
 	Admin          Admin                    `yaml:"admin,omitempty" json:"admin,omitempty"`
+	Updater        Updater                  `yaml:"updater,omitempty" json:"updater,omitempty"`
 
 	path string
 	src  []byte
@@ -55,6 +58,110 @@ type Config struct {
 type Admin struct {
 	Listen     string   `yaml:"listen,omitempty" json:"listen,omitempty"`
 	SessionTTL Duration `yaml:"session_ttl,omitempty" json:"session_ttl,omitempty"` // default 12h
+}
+
+// Updater configures built-in self-update checking, downloading, verification and cutover.
+type Updater struct {
+	Enabled          bool      `yaml:"enabled,omitempty" json:"enabled"`
+	AutoApply        bool      `yaml:"auto_apply,omitempty" json:"auto_apply"`
+	Source           string    `yaml:"source,omitempty" json:"source,omitempty"` // oci | github
+	Interval         Duration  `yaml:"interval,omitempty" json:"interval,omitempty"`
+	DrainTimeout     Duration  `yaml:"drain_timeout,omitempty" json:"drain_timeout,omitempty"`
+	HealthTimeout    Duration  `yaml:"health_timeout,omitempty" json:"health_timeout,omitempty"`
+	KeepReleases     int       `yaml:"keep_releases,omitempty" json:"keep_releases,omitempty"`
+	HomeDir          string    `yaml:"home_dir,omitempty" json:"home_dir,omitempty"`
+	FallbackDNS      *[]string `yaml:"fallback_dns,omitempty" json:"fallback_dns,omitempty"`
+	PublicKey        string    `yaml:"public_key,omitempty" json:"public_key,omitempty"`
+	RequireSignature *bool     `yaml:"require_signature,omitempty" json:"require_signature,omitempty"`
+	Image            string    `yaml:"image,omitempty" json:"image,omitempty"`
+	Tag              string    `yaml:"tag,omitempty" json:"tag,omitempty"`
+	Username         string    `yaml:"username,omitempty" json:"username,omitempty"`
+	PasswordRef      string    `yaml:"password_ref,omitempty" json:"password_ref,omitempty"`
+	HasPassword      bool      `yaml:"-" json:"has_password,omitempty"`
+	GitHubRepo       string    `yaml:"github_repo,omitempty" json:"github_repo,omitempty"`
+	GitHubAPIURL     string    `yaml:"github_api_url,omitempty" json:"github_api_url,omitempty"`
+	TokenRef         string    `yaml:"token_ref,omitempty" json:"token_ref,omitempty"`
+	HasToken         bool      `yaml:"-" json:"has_token,omitempty"`
+	Prerelease       bool      `yaml:"prerelease,omitempty" json:"prerelease,omitempty"`
+}
+
+// EffectiveSource returns "oci" or "github", inferring from Image or GitHubRepo when Source is empty.
+func (u Updater) EffectiveSource() string {
+	if s := strings.ToLower(strings.TrimSpace(u.Source)); s != "" {
+		return s
+	}
+	if strings.TrimSpace(u.Image) != "" {
+		return "oci"
+	}
+	if strings.TrimSpace(u.GitHubRepo) != "" {
+		return "github"
+	}
+	return ""
+}
+
+// RequireSig reports whether Ed25519 signature verification is mandatory for updates.
+func (u Updater) RequireSig() bool {
+	if u.RequireSignature != nil {
+		return *u.RequireSignature
+	}
+	return strings.TrimSpace(u.PublicKey) != ""
+}
+
+// KeepCount returns how many historical releases to retain on disk.
+func (u Updater) KeepCount() int {
+	if u.KeepReleases > 0 {
+		return u.KeepReleases
+	}
+	return 5
+}
+
+// EffectiveTag returns the target OCI tag, defaulting to "latest".
+func (u Updater) EffectiveTag() string {
+	if t := strings.TrimSpace(u.Tag); t != "" {
+		return t
+	}
+	return "latest"
+}
+
+// EffectiveFallbackDNS returns configured fallback DNS servers, defaulting to
+// 223.5.5.5 and 119.29.29.29 when FallbackDNS is omitted (nil). An explicit
+// empty slice disables fallback DNS.
+func (u Updater) EffectiveFallbackDNS() []string {
+	if u.FallbackDNS != nil {
+		if len(*u.FallbackDNS) == 0 {
+			return []string{}
+		}
+		return append([]string(nil), (*u.FallbackDNS)...)
+	}
+	return []string{"223.5.5.5", "119.29.29.29"}
+}
+
+// ValidateEd25519PublicKey checks that s encodes a 32-byte Ed25519 public key
+// (with optional "ed25519:" prefix, in standard/raw base64 or hex).
+func ValidateEd25519PublicKey(s string) error {
+	raw := strings.TrimSpace(s)
+	if raw == "" {
+		return fmt.Errorf("empty public key")
+	}
+	raw = strings.TrimPrefix(raw, "ed25519:")
+	raw = strings.TrimSpace(raw)
+	var wrongLen int
+	for _, dec := range []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		hex.DecodeString,
+	} {
+		if b, err := dec(raw); err == nil {
+			if len(b) == ed25519.PublicKeySize {
+				return nil
+			}
+			wrongLen = len(b)
+		}
+	}
+	if wrongLen > 0 {
+		return fmt.Errorf("expected %d bytes, got %d", ed25519.PublicKeySize, wrongLen)
+	}
+	return fmt.Errorf("invalid base64 or hex encoding")
 }
 
 // ModelAlias maps a requested model name (exact or path.Match pattern) to a
@@ -468,6 +575,25 @@ func (c *Config) applyDefaults() {
 	for i := range c.Plugins {
 		c.Plugins[i].Path = ExpandHome(c.Plugins[i].Path)
 	}
+	c.Updater.Source = strings.ToLower(strings.TrimSpace(c.Updater.Source))
+	c.Updater.Image = strings.TrimSpace(c.Updater.Image)
+	c.Updater.Tag = strings.TrimSpace(c.Updater.Tag)
+	c.Updater.Username = strings.TrimSpace(c.Updater.Username)
+	c.Updater.GitHubRepo = strings.TrimSpace(c.Updater.GitHubRepo)
+	c.Updater.GitHubAPIURL = strings.TrimRight(strings.TrimSpace(c.Updater.GitHubAPIURL), "/")
+	c.Updater.PublicKey = strings.TrimSpace(c.Updater.PublicKey)
+	if c.Updater.HomeDir != "" {
+		c.Updater.HomeDir = ExpandHome(strings.TrimSpace(c.Updater.HomeDir))
+	}
+	if c.Updater.FallbackDNS != nil {
+		cleaned := make([]string, 0, len(*c.Updater.FallbackDNS))
+		for _, d := range *c.Updater.FallbackDNS {
+			if s := strings.TrimSpace(d); s != "" {
+				cleaned = append(cleaned, s)
+			}
+		}
+		c.Updater.FallbackDNS = &cleaned
+	}
 }
 
 var loopbackRe = regexp.MustCompile(`^https?://(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?(/|$)`)
@@ -791,7 +917,64 @@ func (c *Config) Validate() []string {
 	if c.Meter.OTLP != nil && c.Meter.OTLP.Endpoint == "" {
 		add("meter.otlp.endpoint: required when meter.otlp is set")
 	}
+	validateUpdater(add, &c.Updater)
 	return p
+}
+
+func validateUpdater(add func(string, ...any), u *Updater) {
+	if u.Source != "" && u.Source != "oci" && u.Source != "github" {
+		add("updater.source: must be oci or github, got %q", u.Source)
+	}
+	if u.GitHubRepo != "" {
+		owner, repo, ok := strings.Cut(u.GitHubRepo, "/")
+		if !ok || strings.Contains(repo, "/") || strings.TrimSpace(owner) == "" || strings.TrimSpace(repo) == "" {
+			add("updater.github_repo: must look like owner/repo, got %q", u.GitHubRepo)
+		}
+	}
+	if u.GitHubAPIURL != "" && !strings.HasPrefix(u.GitHubAPIURL, "http://") && !strings.HasPrefix(u.GitHubAPIURL, "https://") {
+		add("updater.github_api_url: must start with http:// or https://")
+	}
+	if u.Interval != 0 && time.Duration(u.Interval) < 30*time.Second {
+		add("updater.interval: must be at least 30s, got %s", time.Duration(u.Interval))
+	}
+	if time.Duration(u.DrainTimeout) < 0 {
+		add("updater.drain_timeout: must be >= 0")
+	}
+	if time.Duration(u.HealthTimeout) < 0 {
+		add("updater.health_timeout: must be >= 0")
+	}
+	if u.KeepReleases < 0 {
+		add("updater.keep_releases: must be >= 0")
+	}
+	if u.PasswordRef != "" && !isValidKeyRef(u.PasswordRef) {
+		add("updater.password_ref: must be env:NAME, keychain:NAME, file:PATH or db:NAME")
+	}
+	if u.TokenRef != "" && !isValidKeyRef(u.TokenRef) {
+		add("updater.token_ref: must be env:NAME, keychain:NAME, file:PATH or db:NAME")
+	}
+	if u.PublicKey != "" {
+		if err := ValidateEd25519PublicKey(u.PublicKey); err != nil {
+			add("updater.public_key: %v", err)
+		}
+	}
+	if u.RequireSignature != nil && *u.RequireSignature && u.PublicKey == "" {
+		add("updater.require_signature: public_key is required when require_signature is true")
+	}
+	if u.Enabled {
+		src := u.EffectiveSource()
+		switch src {
+		case "oci":
+			if u.Image == "" {
+				add("updater.image: required when updater.enabled is true and source is oci")
+			}
+		case "github":
+			if u.GitHubRepo == "" {
+				add("updater.github_repo: required when updater.enabled is true and source is github")
+			}
+		default:
+			add("updater.source: image or github_repo is required when updater.enabled is true")
+		}
+	}
 }
 
 func (c *Config) hasPlugin(name, kind string) bool {

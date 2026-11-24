@@ -59,6 +59,7 @@ type LastError struct {
 // ApplyResult is returned after a successful Apply, Rollback or Reload.
 type ApplyResult struct {
 	Version         int64    `json:"version"`
+	Hash            string   `json:"hash,omitempty"`
 	RestartRequired []string `json:"restart_required"`
 }
 
@@ -96,6 +97,29 @@ type Manager struct {
 	restart   []string
 	lastMtime time.Time
 	lastSize  int64
+	onSwaps   []func(*Snapshot)
+}
+
+// AddOnSwap registers an additional callback invoked whenever a new Snapshot becomes active.
+func (m *Manager) AddOnSwap(fn func(*Snapshot)) {
+	if fn == nil {
+		return
+	}
+	m.stateMu.Lock()
+	m.onSwaps = append(m.onSwaps, fn)
+	m.stateMu.Unlock()
+}
+
+func (m *Manager) notifySwapped(snap *Snapshot) {
+	if m.OnSwap != nil {
+		m.OnSwap(snap)
+	}
+	m.stateMu.RLock()
+	cbs := append(([]func(*Snapshot))(nil), m.onSwaps...)
+	m.stateMu.RUnlock()
+	for _, fn := range cbs {
+		fn(snap)
+	}
 }
 
 // New builds the initial Snapshot and creates a Manager.
@@ -266,14 +290,12 @@ func (m *Manager) applyLocked(prev *Snapshot, newBytes []byte, source string) (A
 		m.lastSize = st.Size()
 	}
 	m.stateMu.Unlock()
-	if m.OnSwap != nil {
-		m.OnSwap(snap)
-	}
+	m.notifySwapped(snap)
 
 	if restart == nil {
 		restart = []string{}
 	}
-	return ApplyResult{Version: snap.Version, RestartRequired: restart}, nil
+	return ApplyResult{Version: snap.Version, Hash: snap.Cfg.Hash(), RestartRequired: restart}, nil
 }
 
 // ReloadFromDisk reads the config file from disk and reloads if its hash changed.
@@ -301,7 +323,7 @@ func (m *Manager) reloadFromDiskLocked(source string) (ApplyResult, bool, error)
 		if rr == nil {
 			rr = []string{}
 		}
-		return ApplyResult{Version: prev.Version, RestartRequired: rr}, false, nil
+		return ApplyResult{Version: prev.Version, Hash: prev.Cfg.Hash(), RestartRequired: rr}, false, nil
 	}
 
 	newCfg, err := config.Parse(b, m.path)
@@ -330,14 +352,12 @@ func (m *Manager) reloadFromDiskLocked(source string) (ApplyResult, bool, error)
 		m.lastSize = st.Size()
 	}
 	m.stateMu.Unlock()
-	if m.OnSwap != nil {
-		m.OnSwap(snap)
-	}
+	m.notifySwapped(snap)
 
 	if restart == nil {
 		restart = []string{}
 	}
-	return ApplyResult{Version: snap.Version, RestartRequired: restart}, true, nil
+	return ApplyResult{Version: snap.Version, Hash: snap.Cfg.Hash(), RestartRequired: restart}, true, nil
 }
 
 func (m *Manager) recordError(err error) {

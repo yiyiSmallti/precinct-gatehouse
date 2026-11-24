@@ -90,6 +90,31 @@ export const store = {
         audit: { dir: raw.audit?.dir || '' },
       });
     }
+    if (sec === 'updater') {
+      const u = raw.updater || {};
+      const out = {
+        enabled: Boolean(u.enabled),
+        auto_apply: Boolean(u.auto_apply),
+        source: u.source || '',
+        interval: u.interval || '',
+        drain_timeout: u.drain_timeout || '',
+        health_timeout: u.health_timeout || '',
+        keep_releases: u.keep_releases || 0,
+        home_dir: u.home_dir || '',
+        public_key: u.public_key || '',
+        require_signature: u.require_signature,
+        image: u.image || '',
+        tag: u.tag || '',
+        username: u.username || '',
+        password_ref: u.password_ref || '',
+        github_repo: u.github_repo || '',
+        github_api_url: u.github_api_url || '',
+        token_ref: u.token_ref || '',
+        prerelease: Boolean(u.prerelease),
+      };
+      if (Array.isArray(u.fallback_dns)) out.fallback_dns = u.fallback_dns;
+      return clone(out);
+    }
     return {};
   },
 
@@ -153,9 +178,52 @@ export const store = {
     toast('已重新加载最新生效配置', 'ok');
   },
 
+  markConflict(currentHash) {
+    this.conflict = {
+      currentHash: currentHash || '',
+      message: '配置在您编辑期间已被其他操作修改，请重新加载后再应用。',
+    };
+    this.notify();
+  },
+
+  async syncAfterUpdaterSecret(kind, newRef, appliedHash = '') {
+    const fresh = await api.getConfig();
+    this.latestServer = fresh;
+    if (appliedHash && fresh?.hash && fresh.hash !== appliedHash) {
+      if (this.isDirty()) {
+        this.baseHash = appliedHash;
+        this.conflict = {
+          currentHash: fresh.hash,
+          message: '配置在您编辑期间已被其他操作修改，请重新加载后再应用。',
+        };
+      } else {
+        this.server = fresh;
+        this.baseHash = fresh?.hash || '';
+        this.conflict = null;
+      }
+      this.notify();
+      return fresh;
+    }
+
+    this.server = fresh;
+    this.baseHash = fresh?.hash || '';
+    this.conflict = null;
+    if ('updater' in this.drafts && this.drafts.updater && typeof this.drafts.updater === 'object') {
+      const field = kind === 'password' ? 'password_ref' : 'token_ref';
+      const serverRef = fresh?.raw?.updater?.[field];
+      this.drafts.updater[field] = serverRef !== undefined ? serverRef : (newRef || '');
+      const base = this.getServerSection('updater');
+      if (stableStringify(base) === stableStringify(this.drafts.updater)) {
+        delete this.drafts.updater;
+      }
+    }
+    this.notify();
+    return fresh;
+  },
+
   orderedDirtySections() {
     const keys = this.dirtySections();
-    const order = ['providers', 'routing', 'aliases', 'redaction', 'general'];
+    const order = ['providers', 'routing', 'aliases', 'redaction', 'general', 'updater'];
     if (keys.includes('providers')) {
       const oldNames = new Set((this.getServerSection('providers') || []).map((p) => p.name));
       const nextNames = new Set((this.drafts.providers || []).map((p) => p.name));
@@ -164,7 +232,7 @@ export const store = {
         if (!nextNames.has(n)) deleted = true;
       });
       if (deleted) {
-        return ['aliases', 'routing', 'providers', 'redaction', 'general'].filter((k) => keys.includes(k));
+        return ['aliases', 'routing', 'providers', 'redaction', 'general', 'updater'].filter((k) => keys.includes(k));
       }
     }
     return order.filter((k) => keys.includes(k));
