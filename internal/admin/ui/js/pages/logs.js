@@ -38,18 +38,16 @@ function cacheHit(r) {
 // outputSpeed returns output tokens per second. Streaming responses are timed
 // from the first token to the end (generation only). Non-streaming responses
 // record TTFT when the whole body arrives, so they — and streams whose
-// generation span is too short to time — fall back to end-to-end latency,
-// which includes prefill.
+// generation span is too short to time — fall back to service latency,
+// which excludes request upload time and includes prefill.
 const MIN_GEN_MS = 50;
 function outputSpeed(r) {
   const out = Number(r.completion_tokens || 0);
   const total = Number(r.latency_ms || 0);
   if (out <= 0 || total <= 0) return null;
-  const bodyRead = Math.max(0, Number(r.body_read_ms || 0));
-  const serviceMs = total > bodyRead ? total - bodyRead : total;
-  const gen = serviceMs - Number(r.ttft_ms || 0);
+  const gen = total - Number(r.ttft_ms || 0);
   if (r.stream && r.ttft_ms > 0 && gen >= MIN_GEN_MS) return { tps: (out * 1000) / gen, basis: 'gen' };
-  return { tps: (out * 1000) / serviceMs, basis: 'e2e' };
+  return { tps: (out * 1000) / total, basis: 'e2e' };
 }
 
 function fmtTps(v) {
@@ -86,7 +84,7 @@ function speedCell(r) {
   if (!sp) return el('span', { className: 'muted' }, '-');
   return el('span', {
     className: sp.basis === 'gen' ? 'num' : 'num muted-2',
-    title: sp.basis === 'gen' ? '首字之后的生成速度' : '按端到端耗时计算（含预填充）',
+    title: sp.basis === 'gen' ? '首字之后的生成速度' : '按服务耗时计算（含预填充）',
   }, fmtTps(sp.tps));
 }
 
@@ -139,13 +137,16 @@ export function renderLogs(container, ctx) {
           kvRow('输出 Token', fmtTokenDetail(r.completion_tokens)),
           kvRow('缓存命中 Token', fmtTokenDetail(r.cached_tokens)),
           kvRow('缓存命中率', cacheHit(r) === null ? '-' : `${(cacheHit(r) * 100).toFixed(1)}%`),
-          kvRow('端到端耗时', fmtDurationDetail(r.latency_ms)),
+          kvRow('服务耗时', fmtDurationDetail(r.latency_ms)),
           kvRow('请求体读取', r.body_read_ms || r.request_bytes ? `${fmtDurationDetail(r.body_read_ms)}${r.request_bytes ? ` · ${fmtBytes(r.request_bytes)}` : ''}` : '-'),
+          r.body_read_ms > 0 && r.admitted
+            ? kvRow('含上传总耗时', fmtDurationDetail(Number(r.latency_ms || 0) + Number(r.body_read_ms || 0)))
+            : null,
           kvRow('首字延迟 TTFT', r.ttft_ms ? fmtDurationDetail(r.ttft_ms) : '-'),
           kvRow('输出速度', (() => {
             const sp = outputSpeed(r);
             if (!sp) return '-';
-            return `${fmtTps(sp.tps)} tok/s（${sp.basis === 'gen' ? '首字后生成段' : '端到端，含预填充'}）`;
+            return `${fmtTps(sp.tps)} tok/s（${sp.basis === 'gen' ? '首字后生成段' : '服务耗时，含预填充'}）`;
           })()),
         ]),
         sectionGroup('脱敏审计', [
@@ -337,7 +338,7 @@ export function renderLogs(container, ctx) {
                   el('td', {
                     className: 'td-right num',
                     style: { whiteSpace: 'nowrap' },
-                    title: `耗时 ${fmtNum(r.latency_ms)} ms${r.body_read_ms ? ` / 上传 ${fmtNum(r.body_read_ms)} ms` : ''}${r.request_bytes ? ` (${fmtBytes(r.request_bytes)})` : ''}${r.ttft_ms ? ` / TTFT ${fmtNum(r.ttft_ms)} ms` : ''}`,
+                    title: `服务耗时 ${fmtNum(r.latency_ms)} ms${r.body_read_ms ? ` / 请求体读取 ${fmtNum(r.body_read_ms)} ms` : ''}${r.request_bytes ? ` (${fmtBytes(r.request_bytes)})` : ''}${r.ttft_ms ? ` / TTFT ${fmtNum(r.ttft_ms)} ms` : ''}`,
                   },
                     `${fmtDuration(r.latency_ms)}${r.ttft_ms ? ` / ${fmtDuration(r.ttft_ms)}` : ''}`
                   ),

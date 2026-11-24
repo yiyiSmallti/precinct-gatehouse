@@ -2151,7 +2151,7 @@ func TestTTFTExcludesSlowRequestBodyUpload(t *testing.T) {
 		return
 	}
 
-	assertLatestAuditUpload := func(t *testing.T, minBodyReadMS, wantReqBytes int64) {
+	assertLatestAuditUpload := func(t *testing.T, minBodyReadMS, minLatMS, wantReqBytes int64) {
 		t.Helper()
 		auditDir := filepath.Join(srv.Live.Current().Cfg.DataDir, "audit")
 		files, err := filepath.Glob(filepath.Join(auditDir, "*.jsonl"))
@@ -2171,15 +2171,15 @@ func TestTTFTExcludesSlowRequestBodyUpload(t *testing.T) {
 		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &rec); err != nil {
 			t.Fatalf("unmarshal audit: %v", err)
 		}
-		if rec.BodyReadMS < minBodyReadMS || rec.RequestBytes != wantReqBytes || rec.LatencyMS < rec.BodyReadMS {
-			t.Fatalf("unexpected audit upload fields: %+v (want body_read_ms>=%d req_bytes=%d)", rec, minBodyReadMS, wantReqBytes)
+		if rec.BodyReadMS < minBodyReadMS || rec.RequestBytes != wantReqBytes || rec.LatencyMS < minLatMS || rec.LatencyMS >= rec.BodyReadMS {
+			t.Fatalf("unexpected audit upload fields: %+v (want body_read_ms>=%d latency_ms in [%d,%d) req_bytes=%d)", rec, minBodyReadMS, minLatMS, rec.BodyReadMS, wantReqBytes)
 		}
 	}
 
 	t.Run("streaming_chat", func(t *testing.T) {
 		payload := []byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hello slow upload"}]}`)
 		req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions",
-			newSlowSplitBodyReader(context.Background(), payload, len(payload)/2, 140*time.Millisecond, nil))
+			newSlowSplitBodyReader(context.Background(), payload, len(payload)/2, 300*time.Millisecond, nil))
 		req.Header.Set("Authorization", "Bearer "+tok)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
@@ -2188,22 +2188,22 @@ func TestTTFTExcludesSlowRequestBodyUpload(t *testing.T) {
 			t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
 		}
 		st, _, ttftMS, bodyReadMS, latMS, reqBytes := queryLatestMetrics(t)
-		if st != http.StatusOK || bodyReadMS < 110 || reqBytes != int64(len(payload)) {
+		if st != http.StatusOK || bodyReadMS < 250 || reqBytes != int64(len(payload)) {
 			t.Fatalf("unexpected upload metrics: status=%d bodyRead=%dms reqBytes=%d", st, bodyReadMS, reqBytes)
 		}
-		if ttftMS < 15 || ttftMS >= 95 {
-			t.Fatalf("expected ttft_ms in [15,95) excluding 140ms upload, got ttft=%dms (bodyRead=%dms latency=%dms)", ttftMS, bodyReadMS, latMS)
+		if ttftMS < 15 || ttftMS >= 150 {
+			t.Fatalf("expected ttft_ms in [15,150) excluding 300ms upload, got ttft=%dms (bodyRead=%dms latency=%dms)", ttftMS, bodyReadMS, latMS)
 		}
-		if latMS < bodyReadMS+ttftMS || latMS-bodyReadMS-ttftMS < 50 {
-			t.Fatalf("expected latency_ms >= body_read_ms + ttft_ms + ~70ms decode, got lat=%dms bodyRead=%dms ttft=%dms", latMS, bodyReadMS, ttftMS)
+		if latMS < ttftMS+50 || latMS >= bodyReadMS {
+			t.Fatalf("expected latency_ms to exclude upload time and stay >= ttft_ms + ~50ms decode, got lat=%dms bodyRead=%dms ttft=%dms", latMS, bodyReadMS, ttftMS)
 		}
-		assertLatestAuditUpload(t, 110, int64(len(payload)))
+		assertLatestAuditUpload(t, 250, 75, int64(len(payload)))
 	})
 
 	t.Run("non_streaming_chat", func(t *testing.T) {
 		payload := []byte(`{"model":"p/m1","stream":false,"messages":[{"role":"user","content":"hello buffered slow upload"}]}`)
 		req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions",
-			newSlowSplitBodyReader(context.Background(), payload, len(payload)/2, 130*time.Millisecond, nil))
+			newSlowSplitBodyReader(context.Background(), payload, len(payload)/2, 300*time.Millisecond, nil))
 		req.Header.Set("Authorization", "Bearer "+tok)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
@@ -2212,11 +2212,11 @@ func TestTTFTExcludesSlowRequestBodyUpload(t *testing.T) {
 			t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
 		}
 		st, _, ttftMS, bodyReadMS, latMS, reqBytes := queryLatestMetrics(t)
-		if st != http.StatusOK || bodyReadMS < 100 || reqBytes != int64(len(payload)) {
+		if st != http.StatusOK || bodyReadMS < 250 || reqBytes != int64(len(payload)) {
 			t.Fatalf("unexpected buffered metrics: status=%d bodyRead=%dms reqBytes=%d", st, bodyReadMS, reqBytes)
 		}
-		if ttftMS < 15 || ttftMS >= 95 || latMS < bodyReadMS+ttftMS {
-			t.Fatalf("expected buffered ttft_ms in [15,95) and lat>=bodyRead+ttft, got ttft=%dms bodyRead=%dms lat=%dms", ttftMS, bodyReadMS, latMS)
+		if ttftMS < 15 || ttftMS >= 150 || latMS < ttftMS || latMS >= bodyReadMS {
+			t.Fatalf("expected buffered ttft_ms in [15,150) and latency_ms >= ttft_ms excluding upload, got ttft=%dms bodyRead=%dms lat=%dms", ttftMS, bodyReadMS, latMS)
 		}
 	})
 
@@ -2231,7 +2231,7 @@ func TestTTFTExcludesSlowRequestBodyUpload(t *testing.T) {
 		t.Run("compat_"+tc.name, func(t *testing.T) {
 			payload := []byte(tc.body)
 			req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local"+tc.path,
-				newSlowSplitBodyReader(context.Background(), payload, len(payload)/2, 130*time.Millisecond, nil))
+				newSlowSplitBodyReader(context.Background(), payload, len(payload)/2, 300*time.Millisecond, nil))
 			req.Header.Set("Authorization", "Bearer "+tok)
 			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
@@ -2240,11 +2240,11 @@ func TestTTFTExcludesSlowRequestBodyUpload(t *testing.T) {
 				t.Fatalf("%s status=%d body=%q", tc.name, rec.Code, rec.Body.String())
 			}
 			st, _, ttftMS, bodyReadMS, latMS, reqBytes := queryLatestMetrics(t)
-			if st != http.StatusOK || bodyReadMS < 100 || reqBytes != int64(len(payload)) {
+			if st != http.StatusOK || bodyReadMS < 250 || reqBytes != int64(len(payload)) {
 				t.Fatalf("%s unexpected metrics: status=%d bodyRead=%dms reqBytes=%d", tc.name, st, bodyReadMS, reqBytes)
 			}
-			if ttftMS < 15 || ttftMS >= 95 || latMS < bodyReadMS+ttftMS {
-				t.Fatalf("%s expected ttft_ms in [15,95) excluding upload, got ttft=%dms bodyRead=%dms lat=%dms", tc.name, ttftMS, bodyReadMS, latMS)
+			if ttftMS < 15 || ttftMS >= 150 || latMS < ttftMS+50 || latMS >= bodyReadMS {
+				t.Fatalf("%s expected ttft_ms in [15,150) and latency_ms excluding upload, got ttft=%dms bodyRead=%dms lat=%dms", tc.name, ttftMS, bodyReadMS, latMS)
 			}
 		})
 	}
@@ -2273,9 +2273,9 @@ func TestTTFTExcludesSlowRequestBodyUpload(t *testing.T) {
 		if rec.Code != 499 {
 			t.Fatalf("expected 499 on mid-upload cancel, got %d body=%q", rec.Code, rec.Body.String())
 		}
-		st, errCode, ttftMS, bodyReadMS, _, reqBytes := queryLatestMetrics(t)
-		if st != 499 || errCode != "client_disconnected" || ttftMS != 0 || bodyReadMS < 40 || reqBytes != 16 {
-			t.Fatalf("unexpected 499 upload metrics: st=%d err=%q ttft=%d bodyRead=%d reqBytes=%d", st, errCode, ttftMS, bodyReadMS, reqBytes)
+		st, errCode, ttftMS, bodyReadMS, latMS, reqBytes := queryLatestMetrics(t)
+		if st != 499 || errCode != "client_disconnected" || ttftMS != 0 || bodyReadMS < 40 || latMS < bodyReadMS || reqBytes != 16 {
+			t.Fatalf("unexpected 499 upload metrics: st=%d err=%q ttft=%d bodyRead=%d lat=%d reqBytes=%d", st, errCode, ttftMS, bodyReadMS, latMS, reqBytes)
 		}
 	})
 }

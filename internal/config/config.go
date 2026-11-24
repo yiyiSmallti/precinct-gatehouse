@@ -198,6 +198,7 @@ type TieredConfig struct {
 	Mode               string                 `yaml:"mode,omitempty" json:"mode,omitempty"` // shadow | active
 	HeavyMissThreshold int                    `yaml:"heavy_miss_threshold,omitempty" json:"heavy_miss_threshold,omitempty"`
 	HeavyStickySec     int                    `yaml:"heavy_sticky_sec,omitempty" json:"heavy_sticky_sec,omitempty"`
+	SpilloverThreshold int                    `yaml:"spillover_threshold,omitempty" json:"spillover_threshold,omitempty"`
 	SSEKeepaliveSec    int                    `yaml:"sse_keepalive_sec,omitempty" json:"sse_keepalive_sec,omitempty"`
 	HealthIntervalSec  int                    `yaml:"health_interval_sec,omitempty" json:"health_interval_sec,omitempty"`
 	HealthMaxTimeouts  int                    `yaml:"health_max_timeouts,omitempty" json:"health_max_timeouts,omitempty"`
@@ -660,7 +661,6 @@ func validateTiered(add func(string, ...any), pr *Provider) {
 		return
 	}
 	seenID := map[string]bool{}
-	seenTier := map[int]bool{}
 	for j, b := range t.Backends {
 		if strings.TrimSpace(b.ID) == "" {
 			add("providers.%s.tiered.backends[%d].id: required", pr.Name, j)
@@ -670,10 +670,7 @@ func validateTiered(add func(string, ...any), pr *Provider) {
 		seenID[b.ID] = true
 		if b.Tier <= 0 {
 			add("providers.%s.tiered.backends[%d].tier: must be > 0", pr.Name, j)
-		} else if seenTier[b.Tier] {
-			add("providers.%s.tiered.backends[%d].tier: duplicate tier %d", pr.Name, j, b.Tier)
 		}
-		seenTier[b.Tier] = true
 		if !strings.HasPrefix(b.URL, "http://") && !strings.HasPrefix(b.URL, "https://") {
 			add("providers.%s.tiered.backends[%d].url: must start with http:// or https://", pr.Name, j)
 		}

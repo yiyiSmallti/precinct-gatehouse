@@ -241,6 +241,14 @@ export function renderTiered(container, ctx) {
       dataset: { fieldPath: `${fpBase}.tiered.heavy_sticky_sec` },
       onInput: (e) => { draft.heavy_sticky_sec = Number(e.target.value || 0); },
     });
+    const spilloverIn = el('input', {
+      className: 'input num mono',
+      type: 'number',
+      value: String(draft.spillover_threshold ?? 4),
+      placeholder: '4 (-1 关闭)',
+      dataset: { fieldPath: `${fpBase}.tiered.spillover_threshold` },
+      onInput: (e) => { draft.spillover_threshold = Number(e.target.value || 0); },
+    });
     const keepaliveSSEIn = el('input', {
       className: 'input num mono',
       type: 'number',
@@ -450,6 +458,7 @@ export function renderTiered(container, ctx) {
         errBanner.style.display = 'flex';
         return;
       }
+      const seenIDs = new Set();
       for (let i = 0; i < draft.backends.length; i++) {
         const b = draft.backends[i];
         if (!String(b.id || '').trim() || !String(b.url || '').trim() || !(b.tier > 0) || !(b.max_safe_input > 0) || !(b.promote_at > 0)) {
@@ -458,6 +467,12 @@ export function renderTiered(container, ctx) {
           return;
         }
         b.id = b.id.trim();
+        if (seenIDs.has(b.id)) {
+          errBanner.textContent = `后端节点 ID 重复：${b.id}`;
+          errBanner.style.display = 'flex';
+          return;
+        }
+        seenIDs.add(b.id);
         b.url = b.url.trim().replace(/\/+$/, '');
       }
       if (origTiered.mode !== 'active' && draft.mode === 'active') {
@@ -520,6 +535,10 @@ export function renderTiered(container, ctx) {
         el('div', { className: 'field' },
           el('label', { className: 'field-label' }, '重算写入黏性窗口 (秒，-1 关闭)'),
           stickyIn
+        ),
+        el('div', { className: 'field' },
+          el('label', { className: 'field-label' }, '高并发溢出阈值 (-1 关闭)'),
+          spilloverIn
         ),
         el('div', { className: 'field' },
           el('label', { className: 'field-label' }, '长 Prefill SSE 保活 (秒，-1 关闭)'),
@@ -611,6 +630,7 @@ export function renderTiered(container, ctx) {
       ),
       el('div', { className: 'field' },
         el('label', { className: 'field-label' }, 'Tier 后端节点矩阵'),
+        el('div', { className: 'field-hint', style: { marginBottom: '6px' } }, '多个节点可共用同一 Tier，同层按活跃并发均衡与会话亲和度调度；节点 ID 不可重复。'),
         backendsBox
       )
     );
@@ -843,28 +863,51 @@ export function renderTiered(container, ctx) {
         )
       ),
       el('div', { className: 'sheet-body', style: { display: 'flex', flexDirection: 'column', gap: '12px' } },
-        ...backends.map((b) => {
-          const routed = Number(b.total_routed || 0);
-          const byAct = shadow.by_actual?.[b.id];
-          const valPct = isShadow && byAct?.total
-            ? Math.round((byAct.matched / byAct.total) * 100)
-            : Math.round((routed / maxRouted) * 100);
-          const metaRight = isShadow && byAct?.total
-            ? `${fmtNum(byAct.matched)}/${fmtNum(byAct.total)} 一致 (${valPct}%)`
-            : `${fmtNum(routed)} 次 (${totalRouted ? Math.round((routed / totalRouted) * 100) : 0}%) / Heavy ${fmtNum(b.heavy_routed || 0)}`;
-          return el('div', { className: 'meter-line' },
-            el('div', { className: 'meter-meta' },
-              el('span', { className: 'mono', style: { color: 'var(--ink)' } }, `T${b.tier} ${b.id}`),
-              el('span', { className: 'num' }, metaRight)
-            ),
-            el('div', { className: 'meter-track' },
-              el('div', {
-                className: `meter-fill${isShadow && byAct?.total && valPct < 80 ? ' danger' : ''}`,
-                style: { width: `${valPct}%` },
-              })
-            )
-          );
-        })
+        ...(() => {
+          const configuredIDs = new Set(backends.map((b) => b.id));
+          const extraActuals = isShadow
+            ? Object.keys(shadow.by_actual || {}).filter((id) => id && !configuredIDs.has(id)).sort()
+            : [];
+          const items = backends.map((b) => ({
+            id: b.id,
+            label: `T${b.tier} ${b.id}`,
+            routed: Number(b.total_routed || 0),
+            heavyRouted: Number(b.heavy_routed || 0),
+            byAct: shadow.by_actual?.[b.id],
+            unconfigured: false,
+          }));
+          for (const id of extraActuals) {
+            items.push({
+              id,
+              label: `${id} (未在配置中)`,
+              routed: 0,
+              heavyRouted: 0,
+              byAct: shadow.by_actual?.[id],
+              unconfigured: true,
+            });
+          }
+          return items.map((item) => {
+            const byAct = item.byAct;
+            const valPct = isShadow && byAct?.total
+              ? Math.round((byAct.matched / byAct.total) * 100)
+              : Math.round((item.routed / maxRouted) * 100);
+            const metaRight = isShadow && byAct?.total
+              ? `${fmtNum(byAct.matched)}/${fmtNum(byAct.total)} 一致 (${valPct}%)`
+              : `${fmtNum(item.routed)} 次 (${totalRouted ? Math.round((item.routed / totalRouted) * 100) : 0}%) / Heavy ${fmtNum(item.heavyRouted)}`;
+            return el('div', { className: 'meter-line' },
+              el('div', { className: 'meter-meta' },
+                el('span', { className: 'mono', style: { color: item.unconfigured ? 'var(--brass-text)' : 'var(--ink)' } }, item.label),
+                el('span', { className: 'num' }, metaRight)
+              ),
+              el('div', { className: 'meter-track' },
+                el('div', {
+                  className: `meter-fill${(item.unconfigured || (isShadow && byAct?.total && valPct < 80)) ? ' danger' : ''}`,
+                  style: { width: `${valPct}%` },
+                })
+              )
+            );
+          });
+        })()
       )
     );
 

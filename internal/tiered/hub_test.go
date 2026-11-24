@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1189,5 +1191,490 @@ func TestTieredMidStreamKeepalive(t *testing.T) {
 	body2 := string(raw2)
 	if !strings.Contains(body2, `data: {"id":"123",`) {
 		t.Fatalf("expected split SSE line uncorrupted, got %q", body2)
+	}
+}
+
+func makeMockTierBackend(id string, hook func(w http.ResponseWriter, r *http.Request) bool) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get_server_info" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		if hook != nil && hook(w, r) {
+			return
+		}
+		resp, _ := json.Marshal(map[string]any{
+			"id":     "c-" + id,
+			"object": "chat.completion",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": "from-" + id},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]any{
+				"prompt_tokens":         50,
+				"completion_tokens":     2,
+				"total_tokens":          52,
+				"prompt_tokens_details": map[string]any{"cached_tokens": 40},
+			},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(resp)
+	}))
+}
+
+func postChat(t *testing.T, tr http.RoundTripper, payload []byte) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://tiered.invalid/v1/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	return resp
+}
+
+func TestMultiNodeSameTierLoadBalanceAndAffinity(t *testing.T) {
+	var holdT1A sync.WaitGroup
+	var blockT1A atomic.Bool
+	var failT1AStatus atomic.Int32
+	var t1aHits, t1bHits, t2Hits atomic.Int32
+
+	releaseT1A := make(chan struct{})
+	var t1aEntered atomic.Bool
+	t1aEnteredCh := make(chan struct{}, 4)
+
+	t1aSrv := makeMockTierBackend("t1a", func(w http.ResponseWriter, r *http.Request) bool {
+		t1aHits.Add(1)
+		if blockT1A.Load() {
+			t1aEntered.Store(true)
+			t1aEnteredCh <- struct{}{}
+			<-releaseT1A
+			return false
+		}
+		switch failT1AStatus.Load() {
+		case 503:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"busy"}`))
+			return true
+		case 400:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"This model's maximum context length is 204800 tokens"}}`))
+			return true
+		}
+		return false
+	})
+	defer t1aSrv.Close()
+
+	t1bSrv := makeMockTierBackend("t1b", func(w http.ResponseWriter, r *http.Request) bool {
+		t1bHits.Add(1)
+		return false
+	})
+	defer t1bSrv.Close()
+
+	t2Srv := makeMockTierBackend("t2", func(w http.ResponseWriter, r *http.Request) bool {
+		t2Hits.Add(1)
+		return false
+	})
+	defer t2Srv.Close()
+
+	hub := NewHub(t.TempDir(), nil)
+	defer func() { _ = hub.Close() }()
+
+	f := false
+	tc := config.TieredConfig{
+		Mode:               "active",
+		HeavyMissThreshold: 24000,
+		HeavyStickySec:     12,
+		SpilloverThreshold: 4,
+		HealthIntervalSec:  60,
+		ZhThinkAnchor:      &f,
+		StarterCache:       &config.TieredStarterCache{Enabled: false},
+		Backends: []config.TieredBackend{
+			{ID: "t1a", URL: t1aSrv.URL, Tier: 1, MaxContextTokens: 204800, MaxSafeInput: 185000, PromoteAt: 150000, SpeedScore: 55},
+			{ID: "t1b", URL: t1bSrv.URL, Tier: 1, MaxContextTokens: 204800, MaxSafeInput: 185000, PromoteAt: 150000, SpeedScore: 55},
+			{ID: "t2", URL: t2Srv.URL, Tier: 2, MaxContextTokens: 524288, MaxSafeInput: 495000, PromoteAt: 450000, DemoteBelow: 100000, SpeedScore: 55},
+		},
+	}
+
+	tr, err := hub.Transport("p", "local", &tc, nil)
+	if err != nil {
+		t.Fatalf("Transport: %v", err)
+	}
+	hub.Activate(&config.Config{Providers: []config.Provider{{Name: "p", Target: "local", Tiered: &tc}}})
+
+	mkPrompt := func(sys, usr string) []byte {
+		b, _ := json.Marshal(map[string]any{
+			"model": "m1",
+			"messages": []map[string]any{
+				{"role": "system", "content": sys},
+				{"role": "user", "content": usr},
+			},
+		})
+		return b
+	}
+
+	// 1. Independent sessions spread across t1a and t1b via totalRouted balancing.
+	rA1 := postChat(t, tr, mkPrompt("sys-A", "u1"))
+	_, _ = io.Copy(io.Discard, rA1.Body)
+	rA1.Body.Close()
+	if got := rA1.Header.Get("X-Router-Backend"); got != "t1a" {
+		t.Fatalf("Session A turn 1 expected t1a, got %q", got)
+	}
+
+	rB1 := postChat(t, tr, mkPrompt("sys-B", "u1"))
+	_, _ = io.Copy(io.Discard, rB1.Body)
+	rB1.Body.Close()
+	if got := rB1.Header.Get("X-Router-Backend"); got != "t1b" {
+		t.Fatalf("Session B turn 1 expected t1b (load-balanced), got %q", got)
+	}
+
+	// Session C goes to t1a (both t1a and t1b have totalRouted=1), giving t1a higher totalRouted (2 vs 1).
+	rC1 := postChat(t, tr, mkPrompt("sys-C", "u1"))
+	_, _ = io.Copy(io.Discard, rC1.Body)
+	rC1.Body.Close()
+	if got := rC1.Header.Get("X-Router-Backend"); got != "t1a" {
+		t.Fatalf("Session C turn 1 expected t1a, got %q", got)
+	}
+
+	// 2. Session A turn 2 stays on LastBackend (t1a) when both t1a & t1b are idle,
+	// even though t1a has more totalRouted than t1b (L1 VRAM affinity).
+	rA2Body, _ := json.Marshal(map[string]any{
+		"model": "m1",
+		"messages": []map[string]any{
+			{"role": "system", "content": "sys-A"},
+			{"role": "user", "content": "u1"},
+			{"role": "assistant", "content": "from-t1a"},
+			{"role": "user", "content": "u2"},
+		},
+	})
+	rA2 := postChat(t, tr, rA2Body)
+	_, _ = io.Copy(io.Discard, rA2.Body)
+	rA2.Body.Close()
+	if got := rA2.Header.Get("X-Router-Backend"); got != "t1a" {
+		t.Fatalf("Session A turn 2 expected L1 VRAM affinity to t1a, got %q", got)
+	}
+
+	// 3a. Busy shift: while t1a has an active request in-flight, traffic shifts to sibling t1b (not t2).
+	blockT1A.Store(true)
+	holdT1A.Add(1)
+	go func() {
+		defer holdT1A.Done()
+		resp := postChat(t, tr, rA2Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+	<-t1aEnteredCh
+
+	rA3 := postChat(t, tr, rA2Body)
+	_, _ = io.Copy(io.Discard, rA3.Body)
+	rA3.Body.Close()
+	if got := rA3.Header.Get("X-Router-Backend"); got != "t1b" {
+		t.Fatalf("expected busy shift from t1a to sibling t1b, got %q", got)
+	}
+	blockT1A.Store(false)
+	close(releaseT1A)
+	holdT1A.Wait()
+	if !t1aEntered.Load() || t2Hits.Load() != 0 {
+		t.Fatalf("expected t1a blocker ran and t2 untouched so far, got t2Hits=%d", t2Hits.Load())
+	}
+
+	// 3b. 503 failover: give Session A affinity back to t1a via Session A on t1a (currently Session A's LastBackend is t1b from rA3,
+	// so send Session C turn 2 whose LastBackend is t1a). Set t1a to 503 -> should fail over to sibling t1b before t2.
+	failT1AStatus.Store(503)
+	rC2Body, _ := json.Marshal(map[string]any{
+		"model": "m1",
+		"messages": []map[string]any{
+			{"role": "system", "content": "sys-C"},
+			{"role": "user", "content": "u1"},
+			{"role": "assistant", "content": "from-t1a"},
+			{"role": "user", "content": "u2"},
+		},
+	})
+	t1bBefore503 := t1bHits.Load()
+	rC2 := postChat(t, tr, rC2Body)
+	_, _ = io.Copy(io.Discard, rC2.Body)
+	rC2.Body.Close()
+	if rC2.StatusCode != http.StatusOK || rC2.Header.Get("X-Router-Backend") != "t1b" {
+		t.Fatalf("expected 503 failover from t1a to sibling t1b, got status=%d backend=%q", rC2.StatusCode, rC2.Header.Get("X-Router-Backend"))
+	}
+	if t1bHits.Load() != t1bBefore503+1 || t2Hits.Load() != 0 {
+		t.Fatalf("expected failover to t1b without touching t2, got t1bDelta=%d t2Hits=%d", t1bHits.Load()-t1bBefore503, t2Hits.Load())
+	}
+
+	// 4. 400 context length error on t1a excludes BOTH t1a and t1b and retries directly on Tier 2 (t2).
+	failT1AStatus.Store(0)
+	var t1aSys string
+	for i := 0; i < 8; i++ {
+		sys := fmt.Sprintf("sys-ctx-%d", i)
+		rx := postChat(t, tr, mkPrompt(sys, "u1"))
+		_, _ = io.Copy(io.Discard, rx.Body)
+		rx.Body.Close()
+		if rx.Header.Get("X-Router-Backend") == "t1a" {
+			t1aSys = sys
+			break
+		}
+	}
+	if t1aSys == "" {
+		t.Fatal("failed to pin a session onto t1a before testing 400 failover")
+	}
+	failT1AStatus.Store(400)
+	t1aBefore400 := t1aHits.Load()
+	t1bBefore400 := t1bHits.Load()
+	ctxFollowBody, _ := json.Marshal(map[string]any{
+		"model": "m1",
+		"messages": []map[string]any{
+			{"role": "system", "content": t1aSys},
+			{"role": "user", "content": "u1"},
+			{"role": "assistant", "content": "from-t1a"},
+			{"role": "user", "content": "trigger context overflow on t1a"},
+		},
+	})
+	r400 := postChat(t, tr, ctxFollowBody)
+	_, _ = io.Copy(io.Discard, r400.Body)
+	r400.Body.Close()
+	if r400.StatusCode != http.StatusOK || r400.Header.Get("X-Router-Backend") != "t2" {
+		t.Fatalf("expected 400 context error on t1a to skip t1b and retry on t2, got status=%d backend=%q", r400.StatusCode, r400.Header.Get("X-Router-Backend"))
+	}
+	if t1aHits.Load() != t1aBefore400+1 || t1bHits.Load() != t1bBefore400 || t2Hits.Load() != 1 {
+		t.Fatalf("expected t1a+1 t1b+0 t2=1 on 400 context failover, got t1aDelta=%d t1bDelta=%d t2=%d",
+			t1aHits.Load()-t1aBefore400, t1bHits.Load()-t1bBefore400, t2Hits.Load())
+	}
+}
+
+func TestSameTierSpilloverAndNoPermanentPromotion(t *testing.T) {
+	var holdMode atomic.Bool
+	releaseCh := make(chan struct{})
+	var t1aInFlight, t1bInFlight, t2Hits, t3Hits atomic.Int32
+	t1BusyReady := make(chan struct{}, 8)
+
+	mkHoldable := func(id string, inflight *atomic.Int32) *httptest.Server {
+		return makeMockTierBackend(id, func(w http.ResponseWriter, r *http.Request) bool {
+			if holdMode.Load() {
+				inflight.Add(1)
+				t1BusyReady <- struct{}{}
+				<-releaseCh
+				inflight.Add(-1)
+			}
+			return false
+		})
+	}
+	t1aSrv := mkHoldable("t1a", &t1aInFlight)
+	defer t1aSrv.Close()
+	t1bSrv := mkHoldable("t1b", &t1bInFlight)
+	defer t1bSrv.Close()
+	t2Srv := makeMockTierBackend("t2", func(w http.ResponseWriter, r *http.Request) bool {
+		t2Hits.Add(1)
+		return false
+	})
+	defer t2Srv.Close()
+	t3Srv := makeMockTierBackend("t3", func(w http.ResponseWriter, r *http.Request) bool {
+		t3Hits.Add(1)
+		return false
+	})
+	defer t3Srv.Close()
+
+	hub := NewHub(t.TempDir(), nil)
+	defer func() { _ = hub.Close() }()
+
+	f := false
+	tc := config.TieredConfig{
+		Mode:               "active",
+		HeavyMissThreshold: 24000,
+		HeavyStickySec:     12,
+		SpilloverThreshold: 2,
+		HealthIntervalSec:  60,
+		ZhThinkAnchor:      &f,
+		StarterCache:       &config.TieredStarterCache{Enabled: false},
+		Backends: []config.TieredBackend{
+			{ID: "t1a", URL: t1aSrv.URL, Tier: 1, MaxContextTokens: 204800, MaxSafeInput: 185000, PromoteAt: 150000, SpeedScore: 55},
+			{ID: "t1b", URL: t1bSrv.URL, Tier: 1, MaxContextTokens: 204800, MaxSafeInput: 185000, PromoteAt: 150000, SpeedScore: 55},
+			{ID: "t2", URL: t2Srv.URL, Tier: 2, MaxContextTokens: 524288, MaxSafeInput: 495000, PromoteAt: 450000, DemoteBelow: 20, SpeedScore: 55},
+			{ID: "t3", URL: t3Srv.URL, Tier: 3, MaxContextTokens: 1048576, MaxSafeInput: 1048576, PromoteAt: 1048576, DemoteBelow: 350000, SpeedScore: 110},
+		},
+	}
+
+	tr, err := hub.Transport("p", "local", &tc, nil)
+	if err != nil {
+		t.Fatalf("Transport: %v", err)
+	}
+	hub.Activate(&config.Config{Providers: []config.Provider{{Name: "p", Target: "local", Tiered: &tc}}})
+
+	// Saturate both t1a and t1b up to SpilloverThreshold=2 (4 concurrent Tier-1 requests).
+	holdMode.Store(true)
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			body, _ := json.Marshal(map[string]any{
+				"model": "m1",
+				"messages": []map[string]any{
+					{"role": "system", "content": fmt.Sprintf("sat-sys-%d", idx)},
+					{"role": "user", "content": "hold"},
+				},
+			})
+			resp := postChat(t, tr, body)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}(i)
+		<-t1BusyReady
+	}
+	if t1aInFlight.Load() < 2 || t1bInFlight.Load() < 2 {
+		t.Fatalf("expected both Tier 1 backends at >=2 activeReqs, got t1a=%d t1b=%d", t1aInFlight.Load(), t1bInFlight.Load())
+	}
+
+	// Send Session S while Tier 1 is saturated: must spill over to Tier 2 (protecting Tier 3).
+	spillBody, _ := json.Marshal(map[string]any{
+		"model": "m1",
+		"messages": []map[string]any{
+			{"role": "system", "content": "session-S-system-prompt-above-demote-floor"},
+			{"role": "user", "content": "hello spillover request with enough tokens to exceed demote_below 20"},
+		},
+	})
+	spillResp := postChat(t, tr, spillBody)
+	_, _ = io.Copy(io.Discard, spillResp.Body)
+	spillResp.Body.Close()
+	if got, reason := spillResp.Header.Get("X-Router-Backend"), spillResp.Header.Get("X-Router-Reason"); got != "t2" || !strings.Contains(reason, "-spillover(t1_busy=") {
+		t.Fatalf("expected spillover to t2 with -spillover(t1_busy=...) reason, got backend=%q reason=%q", got, reason)
+	}
+	if t3Hits.Load() != 0 {
+		t.Fatalf("expected t3 protected during spillover, got t3Hits=%d", t3Hits.Load())
+	}
+
+	// Release Tier-1 saturation.
+	holdMode.Store(false)
+	close(releaseCh)
+	wg.Wait()
+
+	// Next turn of Session S has prompt >= t2.DemoteBelow (20), yet because spillover is temporary
+	// (sess.Tier stayed 1), it must return naturally to Tier 1 rather than sticking on Tier 2!
+	followBody, _ := json.Marshal(map[string]any{
+		"model": "m1",
+		"messages": []map[string]any{
+			{"role": "system", "content": "session-S-system-prompt-above-demote-floor"},
+			{"role": "user", "content": "hello spillover request with enough tokens to exceed demote_below 20"},
+			{"role": "assistant", "content": "from-t2"},
+			{"role": "user", "content": "follow up after spillover"},
+		},
+	})
+	t2BeforeFollow := t2Hits.Load()
+	followResp := postChat(t, tr, followBody)
+	_, _ = io.Copy(io.Discard, followResp.Body)
+	followResp.Body.Close()
+	gotFollow := followResp.Header.Get("X-Router-Backend")
+	if gotFollow != "t1a" && gotFollow != "t1b" {
+		t.Fatalf("expected follow-up after spillover to return to Tier 1, got backend=%q reason=%q", gotFollow, followResp.Header.Get("X-Router-Reason"))
+	}
+	if t2Hits.Load() != t2BeforeFollow {
+		t.Fatalf("expected t2 not hit after spillover subsided, delta=%d", t2Hits.Load()-t2BeforeFollow)
+	}
+}
+
+func TestShadowMultiNodeTracking(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Router-Backend", "t2b")
+		w.Header().Set("X-Router-Reason", "tier2-len(120)")
+		_, _ = w.Write([]byte(`{"id":"c-up","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":2,"total_tokens":122,"prompt_tokens_details":{"cached_tokens":100}}}`))
+	}))
+	defer upstream.Close()
+
+	mockHealth := makeMockTierBackend("health", nil)
+	defer mockHealth.Close()
+
+	hub := NewHub(t.TempDir(), nil)
+	defer func() { _ = hub.Close() }()
+
+	f := false
+	tc := config.TieredConfig{
+		Mode:               "shadow",
+		HeavyMissThreshold: 500,
+		SpilloverThreshold: 4,
+		HealthIntervalSec:  60,
+		ZhThinkAnchor:      &f,
+		StarterCache:       &config.TieredStarterCache{Enabled: false},
+		Backends: []config.TieredBackend{
+			{ID: "t1a", URL: mockHealth.URL, Tier: 1, MaxContextTokens: 204800, MaxSafeInput: 1000, PromoteAt: 80, SpeedScore: 55},
+			{ID: "t1b", URL: mockHealth.URL, Tier: 1, MaxContextTokens: 204800, MaxSafeInput: 1000, PromoteAt: 80, SpeedScore: 55},
+			{ID: "t2a", URL: mockHealth.URL, Tier: 2, MaxContextTokens: 524288, MaxSafeInput: 5000, PromoteAt: 500, DemoteBelow: 40, SpeedScore: 55},
+			{ID: "t2b", URL: mockHealth.URL, Tier: 2, MaxContextTokens: 524288, MaxSafeInput: 5000, PromoteAt: 500, DemoteBelow: 40, SpeedScore: 55},
+			{ID: "t3", URL: mockHealth.URL, Tier: 3, MaxContextTokens: 1048576, MaxSafeInput: 10000, PromoteAt: 10000, DemoteBelow: 300, SpeedScore: 110},
+		},
+	}
+
+	u, _ := url.Parse(upstream.URL)
+	tr, err := hub.Transport("p", "local", &tc, &http.Transport{
+		Proxy: nil,
+	})
+	if err != nil {
+		t.Fatalf("Transport: %v", err)
+	}
+	hub.Activate(&config.Config{Providers: []config.Provider{{Name: "p", BaseURL: upstream.URL, Target: "local", Tiered: &tc}}})
+
+	// Send >=80 estimated tokens (< 500 heavy miss threshold) so targetTier == 2.
+	turn1Body, _ := json.Marshal(map[string]any{
+		"model": "m1",
+		"messages": []map[string]any{
+			{"role": "system", "content": strings.Repeat("shadow routing system prompt prefix ", 12)},
+			{"role": "user", "content": strings.Repeat("initial turn context ", 8)},
+		},
+	})
+	req1, _ := http.NewRequest(http.MethodPost, u.String()+"/v1/chat/completions", bytes.NewReader(turn1Body))
+	req1.Header.Set("Content-Type", "application/json")
+	resp1, err := tr.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("shadow turn1 RoundTrip: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp1.Body)
+	resp1.Body.Close()
+
+	// Verify t2b recorded total_routed=1 and session recorded LastBackend="t2b".
+	r, _ := hub.Router("p")
+	st := r.Status()
+	var t2bStatus *BackendStatus
+	for i := range st.Backends {
+		if st.Backends[i].ID == "t2b" {
+			t2bStatus = &st.Backends[i]
+		}
+	}
+	if t2bStatus == nil || t2bStatus.TotalRouted != 1 {
+		t.Fatalf("expected t2b TotalRouted=1 in shadow mode, got %+v", t2bStatus)
+	}
+	if st.Shadow.Compared != 1 || st.Shadow.ByActual["t2b"].Total != 1 {
+		t.Fatalf("unexpected shadow stats after turn1: %+v", st.Shadow)
+	}
+
+	// Turn 2 on same session: L1 VRAM affinity keeps shadow prediction on t2b (matching upstream).
+	turn2Body, _ := json.Marshal(map[string]any{
+		"model": "m1",
+		"messages": []map[string]any{
+			{"role": "system", "content": strings.Repeat("shadow routing system prompt prefix ", 12)},
+			{"role": "user", "content": strings.Repeat("initial turn context ", 8)},
+			{"role": "assistant", "content": "ok"},
+			{"role": "user", "content": "follow up"},
+		},
+	})
+	req2, _ := http.NewRequest(http.MethodPost, u.String()+"/v1/chat/completions", bytes.NewReader(turn2Body))
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := tr.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("shadow turn2 RoundTrip: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp2.Body)
+	resp2.Body.Close()
+
+	if gotPred := resp2.Header.Get("X-Router-Shadow-Backend"); gotPred != "t2b" {
+		t.Fatalf("expected shadow turn2 prediction to match t2b via L1 VRAM affinity, got %q (reason=%q)", gotPred, resp2.Header.Get("X-Router-Shadow-Reason"))
+	}
+	st2 := r.Status()
+	if st2.Shadow.Compared != 2 || st2.Shadow.Matched < 1 || st2.Shadow.ByActual["t2b"].Matched < 1 {
+		t.Fatalf("expected t2b shadow match recorded on turn2, got %+v", st2.Shadow)
 	}
 }
