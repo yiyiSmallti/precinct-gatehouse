@@ -1090,6 +1090,17 @@ func appendTail(tail, chunk []byte) []byte {
 	return tail
 }
 
+func updateTrailingNewlines(cur int, data []byte) int {
+	for _, b := range data {
+		if b == '\n' {
+			cur++
+		} else if b != '\r' {
+			cur = 0
+		}
+	}
+	return cur
+}
+
 func (t *hubTransport) startKeepaliveStream(
 	st *keepaliveFailoverState,
 	cur *activeAttempt,
@@ -1256,6 +1267,19 @@ func (t *hubTransport) startKeepaliveStream(
 
 		var tail []byte
 		firstSeen := false
+		trailingNewlines := 2
+		tk.Stop()
+		idleTimer := time.NewTimer(st.keepaliveEvery)
+		defer idleTimer.Stop()
+		resetIdle := func() {
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(st.keepaliveEvery)
+		}
 		for {
 			select {
 			case ch, ok := <-chunkCh:
@@ -1267,7 +1291,6 @@ func (t *hubTransport) startKeepaliveStream(
 				if len(ch.data) > 0 {
 					if !firstSeen {
 						firstSeen = true
-						tk.Stop()
 						cur.releaseHeavy()
 					}
 					tail = appendTail(tail, ch.data)
@@ -1278,6 +1301,8 @@ func (t *hubTransport) startKeepaliveStream(
 						_ = pw.CloseWithError(werr)
 						return
 					}
+					trailingNewlines = updateTrailingNewlines(trailingNewlines, ch.data)
+					resetIdle()
 				}
 				if ch.err != nil {
 					completed := errors.Is(ch.err, io.EOF)
@@ -1301,8 +1326,8 @@ func (t *hubTransport) startKeepaliveStream(
 				cur.finishActive(false, tail, winResp.StatusCode)
 				_ = pw.CloseWithError(st.req.Context().Err())
 				return
-			case <-tk.C:
-				if !firstSeen {
+			case <-idleTimer.C:
+				if trailingNewlines >= 2 {
 					if _, err := pw.Write([]byte(": keepalive\n\n")); err != nil {
 						stopReader()
 						cur.cancel()
@@ -1311,6 +1336,7 @@ func (t *hubTransport) startKeepaliveStream(
 						return
 					}
 				}
+				idleTimer.Reset(st.keepaliveEvery)
 			}
 		}
 	}()

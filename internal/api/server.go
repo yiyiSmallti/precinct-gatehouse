@@ -443,7 +443,8 @@ func (s *Server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(rc)
 	if err != nil {
-		compat.WriteAnthropicError(w, http.StatusRequestEntityTooLarge, err.Error())
+		be := pipeline.BodyReadError(r.Context(), err)
+		compat.WriteAnthropicError(w, be.Status, be.Message)
 		return
 	}
 	req, _, err := compat.DecodeAnthropic(body)

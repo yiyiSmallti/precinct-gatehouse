@@ -461,6 +461,20 @@ func (p *Pipeline) orgAllowed(snap *live.Snapshot, pc *policy.Context) map[strin
 	return out
 }
 
+// BodyReadError classifies request-body read failures into accurate HTTP status
+// and error codes so upload timeouts and client disconnects are not misreported
+// as HTTP 413 payload-too-large errors.
+func BodyReadError(ctx context.Context, err error) *oai.Error {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return oai.Errorf(http.StatusRequestEntityTooLarge, "body_too_large", "%v", err)
+	}
+	if errors.Is(err, context.Canceled) || (ctx != nil && errors.Is(ctx.Err(), context.Canceled)) {
+		return oai.Errorf(499, "client_disconnected", "%v", err)
+	}
+	return oai.Errorf(http.StatusRequestTimeout, "request_body_read_error", "%v", err)
+}
+
 func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error) {
 	rc := r.Body
 	if maxBytes := st.snap.Cfg.MaxBodyBytes(); maxBytes > 0 {
@@ -468,7 +482,7 @@ func (p *Pipeline) readRequest(st *reqState, r *http.Request) (oai.Object, error
 	}
 	body, err := io.ReadAll(rc)
 	if err != nil {
-		return nil, oai.Errorf(http.StatusRequestEntityTooLarge, "body_too_large", "%v", err)
+		return nil, BodyReadError(r.Context(), err)
 	}
 	req, err := st.decode(body)
 	if err != nil {
@@ -681,7 +695,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 		st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: resp.StatusCode})
 		var usage oai.Usage
 		if upStream {
-			usage, err = p.relayStream(st, resp, clientUsage)
+			usage, err = p.relayStream(reqCtx, st, resp, clientUsage, p.keepaliveIntervalFor(prov))
 		} else {
 			usage, err = p.relayBuffered(st, resp, vaultKey, clientStream, clientUsage)
 		}
@@ -851,9 +865,20 @@ func toChunks(o oai.Object, withUsage bool) [][]byte {
 	return out
 }
 
+type sseEventItem struct {
+	ev  []byte
+	err error
+}
+
+type clientByteCounter interface {
+	ClientBytesWritten() int64
+}
+
 // relayStream passes an SSE stream through, reading usage from the final
-// chunk. The usage-only chunk is dropped unless the client asked for it.
-func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bool) (oai.Usage, error) {
+// chunk and emitting idle `: keepalive` comments whenever client-visible output
+// stalls (e.g., during upstream tool buffering or translator custom-tool
+// buffering). The usage-only chunk is dropped unless the client asked for it.
+func (p *Pipeline) relayStream(ctx context.Context, st *reqState, resp *http.Response, clientUsage bool, keepaliveEvery time.Duration) (oai.Usage, error) {
 	if !st.written {
 		st.w.Header().Set("Content-Type", "text/event-stream")
 		st.w.Header().Set("Cache-Control", "no-cache")
@@ -862,50 +887,139 @@ func (p *Pipeline) relayStream(st *reqState, resp *http.Response, clientUsage bo
 	}
 	st.keepaliveOnly = false
 	fl, _ := st.w.(http.Flusher)
+	counter, hasCounter := st.w.(clientByteCounter)
+
+	evCh := make(chan sseEventItem, 1)
+	stopRead := make(chan struct{})
+	var stopOnce sync.Once
+	stopReader := func() {
+		stopOnce.Do(func() { close(stopRead) })
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(evCh)
+		br := bufio.NewReaderSize(resp.Body, 64<<10)
+		var event bytes.Buffer
+		send := func(ev []byte, err error) bool {
+			var cp []byte
+			if len(ev) > 0 {
+				cp = append([]byte(nil), ev...)
+			}
+			select {
+			case evCh <- sseEventItem{ev: cp, err: err}:
+				return true
+			case <-stopRead:
+				return false
+			}
+		}
+		for {
+			line, rerr := br.ReadBytes('\n')
+			if len(line) > 0 {
+				event.Write(line)
+				if len(bytes.TrimSpace(line)) == 0 {
+					if !send(event.Bytes(), nil) {
+						return
+					}
+					event.Reset()
+				}
+			}
+			if rerr != nil {
+				_ = send(event.Bytes(), rerr)
+				return
+			}
+		}
+	}()
+	defer func() {
+		stopReader()
+		wg.Wait()
+	}()
+
+	var idleTimer *time.Timer
+	var idleC <-chan time.Time
+	if keepaliveEvery > 0 {
+		idleTimer = time.NewTimer(keepaliveEvery)
+		idleC = idleTimer.C
+		defer idleTimer.Stop()
+	}
+	resetIdle := func() {
+		if idleTimer == nil {
+			return
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(keepaliveEvery)
+	}
+
 	var usage oai.Usage
 	done := false // saw [DONE] or a finish_reason
 	sawStreamErr := false
-	br := bufio.NewReaderSize(resp.Body, 64<<10)
-	var event bytes.Buffer
+
 	for {
-		line, err := br.ReadBytes('\n')
-		if len(line) > 0 {
-			event.Write(line)
-			if len(bytes.TrimSpace(line)) == 0 {
-				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done, &sawStreamErr) && st.ttft == 0 {
-					st.ttft = time.Since(st.start)
-				}
-				event.Reset()
-				if fl != nil {
-					fl.Flush()
-				}
-			}
-		}
-		if err != nil {
-			if event.Len() > 0 {
-				if p.flushEvent(st.w, event.Bytes(), clientUsage, &usage, &done, &sawStreamErr) && st.ttft == 0 {
-					st.ttft = time.Since(st.start)
-				}
-			}
-			if fl != nil {
-				fl.Flush()
-			}
-			if errors.Is(err, io.EOF) {
+		select {
+		case item, ok := <-evCh:
+			if !ok {
 				if sawStreamErr {
 					return usage, oai.Errorf(http.StatusBadGateway, "upstream_error", "upstream stream error")
 				}
 				if done {
 					return usage, nil
 				}
-				err = errors.New("stream ended before completion")
+				return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "stream ended before completion")
 			}
-			// the client already has a partial stream; report the failure so it is metered and audited
-			return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "%v", err)
+			if len(item.ev) > 0 {
+				var before int64
+				if hasCounter {
+					before = counter.ClientBytesWritten()
+				}
+				hasContent, wrote := p.flushEvent(st.w, item.ev, clientUsage, &usage, &done, &sawStreamErr)
+				if hasContent && st.ttft == 0 {
+					st.ttft = time.Since(st.start)
+				}
+				if fl != nil {
+					fl.Flush()
+				}
+				clientProgressed := wrote
+				if hasCounter {
+					clientProgressed = counter.ClientBytesWritten() > before
+				}
+				if clientProgressed {
+					resetIdle()
+				}
+			}
+			if item.err != nil {
+				if errors.Is(item.err, io.EOF) {
+					if sawStreamErr {
+						return usage, oai.Errorf(http.StatusBadGateway, "upstream_error", "upstream stream error")
+					}
+					if done {
+						return usage, nil
+					}
+					return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "stream ended before completion")
+				}
+				// the client already has a partial stream; report the failure so it is metered and audited
+				return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "%v", item.err)
+			}
+		case <-idleC:
+			_, _ = io.WriteString(st.w, ": keepalive\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+			idleTimer.Reset(keepaliveEvery)
+		case <-ctx.Done():
+			stopReader()
+			_ = resp.Body.Close()
+			return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "%v", ctx.Err())
 		}
 	}
 }
 
-func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool, sawStreamErr *bool) bool {
+func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *oai.Usage, done *bool, sawStreamErr *bool) (bool, bool) {
 	hasContent := false
 	for _, l := range bytes.Split(ev, []byte("\n")) {
 		data, ok := bytes.CutPrefix(bytes.TrimSpace(l), []byte("data:"))
@@ -939,13 +1053,13 @@ func (p *Pipeline) flushEvent(w io.Writer, ev []byte, clientUsage bool, usage *o
 		if u, ok := oai.UsageOf(o); ok {
 			*usage = u
 			if ch, _ := o["choices"].([]any); len(ch) == 0 && !clientUsage {
-				return false
+				return false, false
 			}
 		}
 		hasContent = true
 	}
-	w.Write(ev)
-	return hasContent
+	_, _ = w.Write(ev)
+	return hasContent, true
 }
 
 func injectSystemPrompt(req oai.Object, prompt string) {

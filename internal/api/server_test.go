@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1314,6 +1315,232 @@ routing_groups:
 	}
 	if gotStatus != http.StatusBadGateway {
 		t.Fatalf("expected request_log status=502 when all candidates fail, got %d", gotStatus)
+	}
+}
+
+type failingReadCloser struct {
+	err error
+}
+
+func (f failingReadCloser) Read([]byte) (int, error) { return 0, f.err }
+func (f failingReadCloser) Close() error             { return nil }
+
+func newMidStreamTestServer(t *testing.T, upstreamURL string, maxBodyMB int) (*Server, string) {
+	t.Helper()
+	dir := t.TempDir()
+	cfgRaw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+max_body_mb: %d
+providers:
+  - name: p
+    base_url: %s/v1
+    target: local
+    models: [m1]
+default_group: main
+routing_groups:
+  main:
+    type: order
+    members: [p/m1]
+`, dir, maxBodyMB, upstreamURL)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(cfgRaw), cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(cfg, "test", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+	tok, _, err := srv.LocalToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, tok
+}
+
+func TestMidStreamKeepaliveAllProtocols(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		fl, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello \"}}]}\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		time.Sleep(75 * time.Millisecond)
+		_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	}))
+	defer up.Close()
+
+	srv, tok := newMidStreamTestServer(t, up.URL, 0)
+	srv.Pipeline.SSEKeepaliveInitDelay = 500 * time.Millisecond
+	srv.Pipeline.SSEKeepaliveInterval = 20 * time.Millisecond
+
+	cases := []struct {
+		name     string
+		path     string
+		body     string
+		wantText string
+	}{
+		{
+			name:     "chat",
+			path:     "/v1/chat/completions",
+			body:     `{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			wantText: `"content":"world"`,
+		},
+		{
+			name:     "messages",
+			path:     "/v1/messages",
+			body:     `{"model":"p/m1","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`,
+			wantText: `event: message_stop`,
+		},
+		{
+			name:     "responses",
+			path:     "/v1/responses",
+			body:     `{"model":"p/m1","stream":true,"input":"hi"}`,
+			wantText: `event: response.completed`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local"+tc.path, bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Authorization", "Bearer "+tok)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			srv.HTTP.Handler.ServeHTTP(rec, req)
+			got := rec.Body.String()
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s status=%d body=%q", tc.name, rec.Code, got)
+			}
+			if strings.Count(got, ": keepalive\n\n") < 2 {
+				t.Fatalf("%s expected >=2 mid-stream keepalives, got %q", tc.name, got)
+			}
+			if !strings.Contains(got, tc.wantText) {
+				t.Fatalf("%s missing %q in %q", tc.name, tc.wantText, got)
+			}
+			var logRow meter.RequestLogEntry
+			if err := srv.DB.QueryRow(`SELECT status, ttft_ms FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&logRow.Status, &logRow.TTFTMS); err != nil {
+				t.Fatalf("query request_log: %v", err)
+			}
+			if logRow.Status != http.StatusOK || logRow.TTFTMS >= 65 {
+				t.Fatalf("%s unexpected log status=%d ttft=%dms", tc.name, logRow.Status, logRow.TTFTMS)
+			}
+		})
+	}
+}
+
+func TestResponsesCustomToolBufferingEmitsKeepalive(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		fl, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// Initial tool call announcement triggers ResponsesTranslator.announceCall (bytes written > 0).
+		_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"fc_1\",\"type\":\"function\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"\"}}]}}]}\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		// Upstream trickles chunks every 10ms (< 25ms keepalive interval), while ResponsesTranslator
+		// buffers custom tool arguments in memory without writing any client bytes.
+		for i := 0; i < 8; i++ {
+			time.Sleep(10 * time.Millisecond)
+			_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"line\\n\"}}]}}]}\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":30,\"total_tokens\":50}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	}))
+	defer up.Close()
+
+	srv, tok := newMidStreamTestServer(t, up.URL, 0)
+	srv.Pipeline.SSEKeepaliveInitDelay = 500 * time.Millisecond
+	srv.Pipeline.SSEKeepaliveInterval = 25 * time.Millisecond
+
+	body := `{"model":"p/m1","stream":true,"input":"edit","tools":[{"type":"custom","name":"apply_patch","description":"patch files"}]}`
+	req, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/responses", bytes.NewReader([]byte(body)))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec, req)
+	got := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, got)
+	}
+	if n := strings.Count(got, ": keepalive\n\n"); n < 2 {
+		t.Fatalf("expected >=2 keepalives while buffering custom tool arguments, got %d in %q", n, got)
+	}
+	if !strings.Contains(got, `"type":"custom_tool_call"`) || !strings.Contains(got, `event: response.completed`) {
+		t.Fatalf("expected complete custom_tool_call output, got %q", got)
+	}
+}
+
+func TestReadRequestBodyErrorClassification(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	srv, tok := newMidStreamTestServer(t, up.URL, 1)
+
+	// 1. Exceeds max_body_mb (1 MiB) -> 413 body_too_large.
+	huge := append([]byte(`{"model":"p/m1","messages":[{"role":"user","content":"`), bytes.Repeat([]byte("a"), (1<<20)+1024)...)
+	huge = append(huge, []byte(`"}]}`)...)
+	req1, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", bytes.NewReader(huge))
+	req1.Header.Set("Authorization", "Bearer "+tok)
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec1.Body.String(), `"body_too_large"`) {
+		t.Fatalf("expected 413 body_too_large, got code=%d body=%q", rec1.Code, rec1.Body.String())
+	}
+
+	// 2. Truncated upload (unexpected EOF) -> 408 request_body_read_error (NOT 413).
+	req2, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions", failingReadCloser{err: io.ErrUnexpectedEOF})
+	req2.Header.Set("Authorization", "Bearer "+tok)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusRequestTimeout || !strings.Contains(rec2.Body.String(), `"request_body_read_error"`) {
+		t.Fatalf("expected 408 request_body_read_error, got code=%d body=%q", rec2.Code, rec2.Body.String())
+	}
+
+	// 3. Canceled context -> 499 client_disconnected.
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	cancel3()
+	req3, _ := http.NewRequestWithContext(ctx3, http.MethodPost, "http://gatehouse.local/v1/chat/completions", failingReadCloser{err: errors.New("read aborted")})
+	req3.Header.Set("Authorization", "Bearer "+tok)
+	req3.Header.Set("Content-Type", "application/json")
+	rec3 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec3, req3)
+	if rec3.Code != 499 || !strings.Contains(rec3.Body.String(), `"client_disconnected"`) {
+		t.Fatalf("expected 499 client_disconnected, got code=%d body=%q", rec3.Code, rec3.Body.String())
+	}
+
+	// 4. Anthropic count_tokens truncated upload -> 408 (NOT 413).
+	req4, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/messages/count_tokens", failingReadCloser{err: io.ErrUnexpectedEOF})
+	req4.Header.Set("Authorization", "Bearer "+tok)
+	req4.Header.Set("Content-Type", "application/json")
+	rec4 := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusRequestTimeout {
+		t.Fatalf("expected 408 for truncated count_tokens body, got code=%d body=%q", rec4.Code, rec4.Body.String())
 	}
 }
 
