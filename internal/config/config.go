@@ -56,8 +56,30 @@ type Config struct {
 
 // Admin configures the optional web control plane.
 type Admin struct {
-	Listen     string   `yaml:"listen,omitempty" json:"listen,omitempty"`
-	SessionTTL Duration `yaml:"session_ttl,omitempty" json:"session_ttl,omitempty"` // default 12h
+	Listen      string   `yaml:"listen,omitempty" json:"listen,omitempty"`
+	SessionTTL  Duration `yaml:"session_ttl,omitempty" json:"session_ttl,omitempty"`   // default 12h
+	IdleTimeout Duration `yaml:"idle_timeout,omitempty" json:"idle_timeout,omitempty"` // default 1h; <0 disables
+}
+
+// EffectiveSessionTTL returns the configured admin login hard cap, defaulting
+// to 12h when unset or non-positive.
+func (a Admin) EffectiveSessionTTL() time.Duration {
+	if a.SessionTTL <= 0 {
+		return 12 * time.Hour
+	}
+	return time.Duration(a.SessionTTL)
+}
+
+// EffectiveIdleTimeout returns the configured admin inactivity timeout,
+// defaulting to 1h when unset (0) and returning 0 (disabled) when negative.
+func (a Admin) EffectiveIdleTimeout() time.Duration {
+	if a.IdleTimeout < 0 {
+		return 0
+	}
+	if a.IdleTimeout == 0 {
+		return time.Hour
+	}
+	return time.Duration(a.IdleTimeout)
 }
 
 // Updater configures built-in self-update checking, downloading, verification and cutover.

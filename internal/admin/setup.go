@@ -106,7 +106,7 @@ func (s *Server) completeSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ttl := s.sessionTTL()
-	tok, err := s.auth.createSession(user, storedPass, ttl, now)
+	tok, err := s.auth.createSession(user, storedPass, ttl, time.Now())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return

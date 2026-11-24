@@ -2,6 +2,8 @@ package admin
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -783,5 +785,157 @@ VALUES('req_slow_upload',1795523495,'2026-11-24','prod-key','chat','ds/m1',200,1
 	}
 	if parsed.Logs[1].RequestID != "req_legacy" || parsed.Logs[1].BodyReadMS != 0 || parsed.Logs[1].RequestBytes != 0 || parsed.Logs[1].TTFTMS != 1200 {
 		t.Fatalf("unexpected migrated legacy row: %+v", parsed.Logs[1])
+	}
+}
+
+func TestAdminSessionPersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	db1, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open 1: %v", err)
+	}
+	if err := SetPassword(db1, "admin", "password-123"); err != nil {
+		t.Fatalf("SetPassword: %v", err)
+	}
+
+	srv1 := New(Deps{DB: db1, SessionTTL: 12 * time.Hour, IdleTimeout: time.Hour})
+	loginReq, _ := http.NewRequest(http.MethodPost, "/admin/api/login", bytes.NewReader([]byte(`{"username":"admin","password":"password-123"}`)))
+	loginReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv1.ServeHTTP(rec, loginReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var sessionCookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cookieName {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil || sessionCookie.Value == "" {
+		t.Fatal("missing session cookie")
+	}
+
+	// Verify only hashed token is stored in admin_sessions (raw token must not appear).
+	var rawCount, hashCount int
+	_ = db1.QueryRow(`SELECT COUNT(*) FROM admin_sessions WHERE token_hash = ?`, sessionCookie.Value).Scan(&rawCount)
+	sum := sha256.Sum256([]byte(sessionCookie.Value))
+	tokHash := hex.EncodeToString(sum[:])
+	_ = db1.QueryRow(`SELECT COUNT(*) FROM admin_sessions WHERE token_hash = ?`, tokHash).Scan(&hashCount)
+	if rawCount != 0 || hashCount != 1 {
+		t.Fatalf("expected hashed token only (rawCount=%d, hashCount=%d)", rawCount, hashCount)
+	}
+
+	// Simulate process restart by closing DB 1 and opening fresh DB 2 + Server 2.
+	_ = db1.Close()
+	db2, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open 2: %v", err)
+	}
+	defer db2.Close()
+
+	srv2 := New(Deps{DB: db2, SessionTTL: 12 * time.Hour, IdleTimeout: time.Hour})
+	meReq, _ := http.NewRequest(http.MethodGet, "/admin/api/me", nil)
+	meReq.AddCookie(&http.Cookie{Name: cookieName, Value: sessionCookie.Value})
+	meRec := httptest.NewRecorder()
+	srv2.ServeHTTP(meRec, meReq)
+	if meRec.Code != http.StatusOK {
+		t.Fatalf("expected persisted session to stay valid across restart, got %d (%s)", meRec.Code, meRec.Body.String())
+	}
+
+	// Logout on restarted server removes the session from SQLite.
+	outReq, _ := http.NewRequest(http.MethodPost, "/admin/api/logout", nil)
+	outReq.Header.Set("X-Gatehouse-Admin", "1")
+	outReq.AddCookie(&http.Cookie{Name: cookieName, Value: sessionCookie.Value})
+	outRec := httptest.NewRecorder()
+	srv2.ServeHTTP(outRec, outReq)
+	if outRec.Code != http.StatusOK {
+		t.Fatalf("logout failed: %d", outRec.Code)
+	}
+
+	meReq2, _ := http.NewRequest(http.MethodGet, "/admin/api/me", nil)
+	meReq2.AddCookie(&http.Cookie{Name: cookieName, Value: sessionCookie.Value})
+	meRec2 := httptest.NewRecorder()
+	srv2.ServeHTTP(meRec2, meReq2)
+	if meRec2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after logout, got %d", meRec2.Code)
+	}
+}
+
+func TestAdminSessionIdleTimeoutAndBackgroundPoll(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+	if err := SetPassword(db, "admin", "password-123"); err != nil {
+		t.Fatalf("SetPassword: %v", err)
+	}
+
+	srv := New(Deps{DB: db, SessionTTL: 12 * time.Hour, IdleTimeout: 300 * time.Millisecond})
+	loginReq, _ := http.NewRequest(http.MethodPost, "/admin/api/login", bytes.NewReader([]byte(`{"username":"admin","password":"password-123"}`)))
+	loginReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, loginReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login failed: %d", rec.Code)
+	}
+	var tok string
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cookieName {
+			tok = c.Value
+		}
+	}
+
+	callMe := func(background bool) int {
+		req, _ := http.NewRequest(http.MethodGet, "/admin/api/me", nil)
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
+		if background {
+			req.Header.Set("X-Gatehouse-Background", "1")
+		}
+		r := httptest.NewRecorder()
+		srv.ServeHTTP(r, req)
+		return r.Code
+	}
+
+	// Active request after 150ms (> touchThrottle=75ms) extends the idle window.
+	time.Sleep(150 * time.Millisecond)
+	if code := callMe(false); code != http.StatusOK {
+		t.Fatalf("expected 200 at 150ms, got %d", code)
+	}
+
+	// 200ms after active request, session is still valid; background poll does NOT refresh idle timer.
+	time.Sleep(200 * time.Millisecond)
+	if code := callMe(true); code != http.StatusOK {
+		t.Fatalf("expected 200 for background poll at 200ms since active touch, got %d", code)
+	}
+
+	// Another 160ms (now 360ms since last active request > 300ms idle timeout): must expire!
+	time.Sleep(160 * time.Millisecond)
+	if code := callMe(true); code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after idle expiry despite background polls, got %d", code)
+	}
+
+	// Negative IdleTimeout disables idle expiry completely.
+	srvNoIdle := New(Deps{DB: db, SessionTTL: 12 * time.Hour, IdleTimeout: -1 * time.Second})
+	loginReq2, _ := http.NewRequest(http.MethodPost, "/admin/api/login", bytes.NewReader([]byte(`{"username":"admin","password":"password-123"}`)))
+	loginReq2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	srvNoIdle.ServeHTTP(rec2, loginReq2)
+	var tok2 string
+	for _, c := range rec2.Result().Cookies() {
+		if c.Name == cookieName {
+			tok2 = c.Value
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	req2, _ := http.NewRequest(http.MethodGet, "/admin/api/me", nil)
+	req2.AddCookie(&http.Cookie{Name: cookieName, Value: tok2})
+	r2 := httptest.NewRecorder()
+	srvNoIdle.ServeHTTP(r2, req2)
+	if r2.Code != http.StatusOK {
+		t.Fatalf("expected 200 with negative idle timeout, got %d", r2.Code)
 	}
 }

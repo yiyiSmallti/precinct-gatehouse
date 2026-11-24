@@ -105,25 +105,37 @@ func getSetting(db *sql.DB, k string) (string, error) {
 }
 
 type session struct {
-	user     string
-	passHash string
-	issued   time.Time
-	expires  time.Time
+	user       string
+	passHash   string
+	issued     time.Time
+	lastActive time.Time
+	expires    time.Time
 }
 
 type authStore struct {
 	ttl      time.Duration
+	idleTTL  time.Duration
+	db       *sessionDB
 	mu       sync.Mutex
 	sessions map[string]session
 	fails    map[string][]time.Time
 }
 
 func newAuthStore(ttl time.Duration) *authStore {
+	return newAuthStoreWithDB(ttl, time.Hour, nil)
+}
+
+func newAuthStoreWithDB(ttl, idleTTL time.Duration, db *sessionDB) *authStore {
 	if ttl <= 0 {
 		ttl = 12 * time.Hour
 	}
+	if idleTTL < 0 {
+		idleTTL = 0
+	}
 	return &authStore{
 		ttl:      ttl,
+		idleTTL:  idleTTL,
+		db:       db,
 		sessions: map[string]session{},
 		fails:    map[string][]time.Time{},
 	}
@@ -165,38 +177,73 @@ func (a *authStore) createSession(user, passHash string, ttl time.Duration, now 
 		return "", err
 	}
 	tok := hex.EncodeToString(b)
+	rec := session{
+		user:       user,
+		passHash:   passHash,
+		issued:     now,
+		lastActive: now,
+		expires:    now.Add(ttl),
+	}
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.db != nil {
+		if err := a.db.save(tok, rec, now); err != nil {
+			return "", err
+		}
+		return tok, nil
+	}
 	for k, s := range a.sessions {
 		if now.After(s.expires) {
 			delete(a.sessions, k)
 		}
 	}
-	a.sessions[tok] = session{user: user, passHash: passHash, issued: now, expires: now.Add(ttl)}
-	a.mu.Unlock()
+	a.sessions[hashSessionToken(tok)] = rec
 	return tok, nil
 }
 
-func (a *authStore) verifySession(tok, currentPassHash string, maxTTL time.Duration, now time.Time) (string, bool) {
+func (a *authStore) verifySession(tok, currentPassHash string, maxTTL, idleTTL time.Duration, touch bool, now time.Time) (string, bool) {
 	if tok == "" || currentPassHash == "" {
 		return "", false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	s, ok := a.sessions[tok]
+	var s session
+	var ok bool
+	if a.db != nil {
+		s, ok = a.db.load(tok)
+	} else {
+		s, ok = a.sessions[hashSessionToken(tok)]
+	}
 	if !ok {
 		return "", false
 	}
 	if now.After(s.expires) ||
 		(maxTTL > 0 && !s.issued.IsZero() && now.Sub(s.issued) > maxTTL) ||
+		(idleTTL > 0 && !s.lastActive.IsZero() && now.Sub(s.lastActive) > idleTTL) ||
 		subtle.ConstantTimeCompare([]byte(s.passHash), []byte(currentPassHash)) != 1 {
-		delete(a.sessions, tok)
+		if a.db != nil {
+			a.db.delete(tok)
+		} else {
+			delete(a.sessions, hashSessionToken(tok))
+		}
 		return "", false
+	}
+	if touch && idleTTL > 0 && now.Sub(s.lastActive) >= touchThrottle(idleTTL) {
+		s.lastActive = now
+		if a.db != nil {
+			a.db.touch(tok, now)
+		} else {
+			a.sessions[hashSessionToken(tok)] = s
+		}
 	}
 	return s.user, true
 }
 
 func (a *authStore) clearSessions() {
 	a.mu.Lock()
+	if a.db != nil {
+		a.db.clear()
+	}
 	a.sessions = map[string]session{}
 	a.mu.Unlock()
 }
@@ -206,7 +253,10 @@ func (a *authStore) deleteSession(tok string) {
 		return
 	}
 	a.mu.Lock()
-	delete(a.sessions, tok)
+	if a.db != nil {
+		a.db.delete(tok)
+	}
+	delete(a.sessions, hashSessionToken(tok))
 	a.mu.Unlock()
 }
 

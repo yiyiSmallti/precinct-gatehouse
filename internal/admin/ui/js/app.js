@@ -688,7 +688,7 @@ function startPolling() {
   state.pollTimer = setInterval(async () => {
     if (!state.user) return;
     try {
-      await store.refresh();
+      await store.refresh({ background: true });
     } catch {
       // handled by unauthorizedHandler on 401
     }

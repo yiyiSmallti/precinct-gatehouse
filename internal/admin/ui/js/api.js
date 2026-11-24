@@ -23,6 +23,9 @@ export async function request(method, path, body = undefined, opts = {}) {
   if (upper !== 'GET' && upper !== 'HEAD') {
     headers['X-Gatehouse-Admin'] = '1';
   }
+  if (opts && opts.background) {
+    headers['X-Gatehouse-Background'] = '1';
+  }
   const init = {
     method: upper,
     credentials: 'same-origin',
@@ -93,7 +96,7 @@ export const api = {
   redaction: () => request('GET', '/admin/api/redaction'),
   redactionTry: (data) => request('POST', '/admin/api/redaction/try', data),
 
-  getConfig: () => request('GET', '/admin/api/config'),
+  getConfig: (opts) => request('GET', '/admin/api/config', undefined, opts),
   putSections: (baseHash, sections) =>
     request('PUT', '/admin/api/config/sections', {
       base_hash: baseHash,
@@ -124,15 +127,15 @@ export const api = {
   deleteProviderKey: (name) =>
     request('DELETE', `/admin/api/providers/${encodeURIComponent(name)}/key`),
 
-  tieredStatus: () => request('GET', '/admin/api/tiered'),
-  tieredStarters: (provider) =>
-    request('GET', `/admin/api/tiered/${encodeURIComponent(provider)}/starters`),
+  tieredStatus: (opts) => request('GET', '/admin/api/tiered', undefined, opts),
+  tieredStarters: (provider, opts) =>
+    request('GET', `/admin/api/tiered/${encodeURIComponent(provider)}/starters`, undefined, opts),
   pinTieredStarter: (provider, data) =>
     request('POST', `/admin/api/tiered/${encodeURIComponent(provider)}/starters/pin`, data),
   deleteTieredStarter: (provider, hash) =>
     request('DELETE', `/admin/api/tiered/${encodeURIComponent(provider)}/starters/${encodeURIComponent(hash)}`),
-  tieredCheckpoints: (provider) =>
-    request('GET', `/admin/api/tiered/${encodeURIComponent(provider)}/checkpoints`),
+  tieredCheckpoints: (provider, opts) =>
+    request('GET', `/admin/api/tiered/${encodeURIComponent(provider)}/checkpoints`, undefined, opts),
   tieredDeleteCheckpoint: (provider, id) =>
     request('DELETE', `/admin/api/tiered/${encodeURIComponent(provider)}/checkpoints/${encodeURIComponent(id)}`),
   tieredClearCheckpoints: (provider) =>
@@ -142,7 +145,7 @@ export const api = {
   resetTieredShadow: (provider) =>
     request('POST', `/admin/api/tiered/${encodeURIComponent(provider)}/shadow/reset`, {}),
 
-  updaterStatus: () => request('GET', '/admin/api/updater'),
+  updaterStatus: (opts) => request('GET', '/admin/api/updater', undefined, opts),
   updaterCheck: () => request('POST', '/admin/api/updater/check', {}),
   updaterApply: (data = {}) => request('POST', '/admin/api/updater/apply', data),
   updaterRollback: (data = {}) => request('POST', '/admin/api/updater/rollback', data),
