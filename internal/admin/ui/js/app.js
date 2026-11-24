@@ -399,6 +399,7 @@ let pageHost = null;
 let alertsHost = null;
 let pillHost = null;
 let sidebarNavHost = null;
+let sidebarVerHost = null;
 let titleHost = null;
 
 function renderTopbarStatus() {
@@ -410,19 +411,23 @@ function renderTopbarStatus() {
   const hasErr = Boolean(cfg.last_error?.msg);
   const rr = cfg.restart_required || [];
   const hasWarn = !hasErr && rr.length > 0;
+  const appVer = cfg.app_version || '-';
 
   const pill = el('button', {
     type: 'button',
     className: `config-pill${hasErr ? ' has-err' : hasWarn ? ' has-warn' : ''}`,
-    title: hasErr ? `最近加载错误: ${cfg.last_error.msg}` : `程序版本: ${cfg.app_version || '-'} | 配置文件: ${cfg.path || ''}`,
-    onClick: () => navigate('settings'),
+    title: hasErr ? `最近加载错误: ${cfg.last_error.msg}` : `网关版本: ${appVer} | 配置 #${cfg.version || 1} (${(cfg.hash || '').slice(0, 7)}) | ${cfg.path || ''}`,
+    onClick: () => navigate(hasErr || hasWarn ? 'settings' : 'updates'),
   },
     el('span', { className: 'status-dot' }),
-    el('span', { className: 'mono num' }, `v${cfg.version || 1}`),
+    el('span', { className: 'mono num' }, appVer),
     el('span', { className: 'mono muted' }, (cfg.hash || '').slice(0, 7)),
     el('span', { className: 'config-pill-source muted' }, sourceLabel(cfg.source))
   );
   pillHost.appendChild(pill);
+  if (sidebarVerHost) {
+    sidebarVerHost.textContent = appVer;
+  }
 
   if (alertsHost) {
     clear(alertsHost);
@@ -511,7 +516,7 @@ function renderShell() {
     el('div', { className: 'sidebar-footer' },
       el('div', { className: 'sidebar-footer-row' },
         el('span', null, '程序版本'),
-        el('span', { className: 'mono' }, store.server?.app_version || '-')
+        (sidebarVerHost = el('span', { className: 'mono' }, store.server?.app_version || '-'))
       ),
       el('div', { className: 'sidebar-footer-row' },
         el('span', null, '运行模式'),
