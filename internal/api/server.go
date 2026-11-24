@@ -47,23 +47,42 @@ type Server struct {
 	Keys       *keys.Store
 	Limiter    *limit.Limiter
 	UserKey    []byte
+	Version    string
 	Missing    []string // required detectors that are unavailable
 	PolicyDown bool     // org mode: the policy plugin did not start
 	closers    []func()
 	otlp       *meter.OTLP
 }
 
+// Inflight returns the current number of active data-plane requests.
+func (s *Server) Inflight() int64 {
+	if s == nil || s.Pipeline == nil {
+		return 0
+	}
+	return s.Pipeline.Inflight()
+}
+
 // ResolveKey resolves a provider key_ref, reading db:NAME from settings and
 // delegating other references (env:, keychain:, file:) to keystore.Resolve.
 func ResolveKey(db *sql.DB, ref string) (string, error) {
+	return resolveDBOrKeystore(db, "provider_key:", "provider key", ref)
+}
+
+// ResolveUpdaterSecret resolves an updater secret reference (db:NAME from
+// updater_secret:NAME in settings, or env:/keychain:/file: via keystore).
+func ResolveUpdaterSecret(db *sql.DB, ref string) (string, error) {
+	return resolveDBOrKeystore(db, "updater_secret:", "updater secret", ref)
+}
+
+func resolveDBOrKeystore(db *sql.DB, prefix, label, ref string) (string, error) {
 	if name, ok := strings.CutPrefix(ref, "db:"); ok {
 		if db == nil {
 			return "", fmt.Errorf("database unavailable for key_ref %q", ref)
 		}
 		var v string
-		err := db.QueryRow(`SELECT v FROM settings WHERE k=?`, "provider_key:"+name).Scan(&v)
+		err := db.QueryRow(`SELECT v FROM settings WHERE k=?`, prefix+name).Scan(&v)
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("provider key %q is not set in database", name)
+			return "", fmt.Errorf("%s %q is not set in database", label, name)
 		}
 		if err != nil {
 			return "", err
@@ -79,7 +98,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{DB: db, closers: []func(){func() { db.Close() }}}
+	s := &Server{DB: db, Version: version, closers: []func(){func() { db.Close() }}}
 	cleanupOnErr := true
 	defer func() {
 		if cleanupOnErr {
@@ -640,7 +659,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	if len(missing) > 0 {
 		status = "degraded"
 	}
-	out := map[string]any{"status": status, "mode": snap.Cfg.Mode, "config_version": snap.Version, "detectors_unavailable": missing}
+	out := map[string]any{"status": status, "version": s.Version, "mode": snap.Cfg.Mode, "config_version": snap.Version, "detectors_unavailable": missing}
 	if pol := s.Pipeline.Policy; pol != nil {
 		out["policy"] = map[string]any{"plugin": pol.Name(), "available": pol.Available()}
 		if !pol.Available() {

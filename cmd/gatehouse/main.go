@@ -11,6 +11,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -32,6 +33,7 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keystore"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/live"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/logfmt"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/meter"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
@@ -39,6 +41,7 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/store"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/token"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/updater"
 )
 
 var version = "0.1.0-dev"
@@ -47,6 +50,8 @@ const usage = `gatehouse — Precinct model gateway (OpenAI-compatible)
 
 Usage:
   gatehouse serve                      run the gateway
+  gatehouse supervise                  run and supervise gatehouse with auto-rollback
+  gatehouse update <subcommand>        check|apply|rollback|status|list|keygen|sign|verify
   gatehouse apikey create --name N [--models a,b] [--groups g] [--rpm N] [--rpd N] [--concurrency N] [--tokens-daily N] [--tokens-monthly N] [--tokens-total N] [--ttl 0|720h] [--note s] [--json]
   gatehouse apikey list [--json]
   gatehouse apikey update <id> [--name N] [--models a,b] [--groups g] [--rpm N] [--rpd N] [--concurrency N] [--tokens-daily N] [--tokens-monthly N] [--tokens-total N] [--ttl 0|720h] [--note s]
@@ -75,6 +80,10 @@ func main() {
 	switch cmd {
 	case "serve":
 		err = serve(args)
+	case "supervise":
+		err = superviseCmd(args)
+	case "update":
+		err = updateCmd(args)
 	case "apikey":
 		err = apikeyCmd(args)
 	case "admin":
@@ -182,6 +191,28 @@ func serve(args []string) error {
 	if len(srv.Missing) > 0 {
 		log.Warn("required detectors unavailable; requests that need redaction will get 503", "detectors", srv.Missing)
 	}
+	restartCh := make(chan struct{}, 1)
+	updMgr := updater.NewManager(updater.Deps{
+		CurrentVersion: version,
+		ConfigPath:     *cfgPath,
+		Live:           srv.Live,
+		DB:             srv.DB,
+		Inflight:       srv.Inflight,
+		ResolveSecret: func(ref string) (string, error) {
+			return api.ResolveUpdaterSecret(srv.DB, ref)
+		},
+		RequestRestart: func() {
+			select {
+			case restartCh <- struct{}{}:
+			default:
+			}
+		},
+		Log: log,
+	})
+	srv.Live.AddOnSwap(func(_ *live.Snapshot) {
+		updMgr.NotifyConfigChange()
+	})
+
 	var admSrv *http.Server
 	if cfg.Admin.Listen != "" {
 		adm := admin.New(admin.Deps{
@@ -190,6 +221,8 @@ func serve(args []string) error {
 			Limiter:          srv.Limiter,
 			Live:             srv.Live,
 			Tiered:           srv.Tiered,
+			Updater:          updMgr,
+			Version:          version,
 			MissingDetectors: srv.Missing,
 			UserKey:          srv.UserKey,
 			SessionTTL:       cfg.Admin.SessionTTL.D(12 * time.Hour),
@@ -212,6 +245,11 @@ func serve(args []string) error {
 			}
 		}()
 	}
+	updMgr.ConfirmBoot()
+	updCtx, cancelUpd := context.WithCancel(context.Background())
+	defer cancelUpd()
+	updMgr.Start(updCtx)
+
 	errc := make(chan error, 1)
 	go func() { errc <- srv.HTTP.Serve(ln) }()
 	sig := make(chan os.Signal, 1)
@@ -220,10 +258,14 @@ func serve(args []string) error {
 	if hup != nil {
 		defer signal.Stop(hup)
 	}
+	restartRequested := false
 loop:
 	for {
 		select {
 		case <-sig:
+			break loop
+		case <-restartCh:
+			restartRequested = true
 			break loop
 		case <-hup:
 			res, changed, rerr := srv.Live.ReloadFromDisk("signal")
@@ -236,6 +278,7 @@ loop:
 			}
 		case err := <-errc:
 			if err != nil && !errors.Is(err, net.ErrClosed) {
+				cancelUpd()
 				if admSrv != nil {
 					_ = admSrv.Shutdown(context.Background())
 				}
@@ -245,13 +288,20 @@ loop:
 			break loop
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	cancelUpd()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if admSrv != nil {
 		_ = admSrv.Shutdown(ctx)
 	}
 	srv.Shutdown(ctx)
-	log.Info("gatehouse stopped")
+	log.Info("gatehouse stopped", "restart_requested", restartRequested)
+	if restartRequested {
+		if updater.IsSupervised() {
+			return exitErr(updater.ExitRestart)
+		}
+		log.Info("exiting for external service manager restart")
+	}
 	return nil
 }
 
@@ -373,26 +423,43 @@ func configCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	var dbCloser func()
-	resolve := keystore.Resolve
+	var db *sql.DB
+	needDB := false
 	for _, p := range cfg.Providers {
 		if strings.HasPrefix(p.KeyRef, "db:") {
-			db, derr := store.Open(cfg.DataDir)
-			if derr != nil {
-				return derr
-			}
-			dbCloser = func() { db.Close() }
-			resolve = func(ref string) (string, error) { return api.ResolveKey(db, ref) }
+			needDB = true
 			break
 		}
 	}
-	if dbCloser != nil {
-		defer dbCloser()
+	if !needDB && cfg.Updater.Enabled && (strings.HasPrefix(cfg.Updater.PasswordRef, "db:") || strings.HasPrefix(cfg.Updater.TokenRef, "db:")) {
+		needDB = true
+	}
+	resolve := keystore.Resolve
+	if needDB {
+		opened, derr := store.Open(cfg.DataDir)
+		if derr != nil {
+			return derr
+		}
+		db = opened
+		defer db.Close()
+		resolve = func(ref string) (string, error) { return api.ResolveKey(db, ref) }
 	}
 	var problems []string
 	for _, p := range cfg.Providers {
 		if _, err := resolve(p.KeyRef); err != nil {
 			problems = append(problems, fmt.Sprintf("providers.%s.key_ref: %v", p.Name, err))
+		}
+	}
+	if cfg.Updater.Enabled {
+		if cfg.Updater.PasswordRef != "" {
+			if _, err := api.ResolveUpdaterSecret(db, cfg.Updater.PasswordRef); err != nil {
+				problems = append(problems, fmt.Sprintf("updater.password_ref: %v", err))
+			}
+		}
+		if cfg.Updater.TokenRef != "" {
+			if _, err := api.ResolveUpdaterSecret(db, cfg.Updater.TokenRef); err != nil {
+				problems = append(problems, fmt.Sprintf("updater.token_ref: %v", err))
+			}
 		}
 	}
 	for _, pl := range cfg.Plugins {
@@ -815,4 +882,253 @@ func adminCmd(args []string) error {
 	}
 	fmt.Printf("admin password updated for %q\n", strings.TrimSpace(*user))
 	return nil
+}
+
+func superviseCmd(args []string) error {
+	fs, cfgPath := newFlags("supervise")
+	homeDir := fs.String("home", "", "installation root directory")
+	ordered := splitFlagsAndPos(args, nil)
+	if err := fs.Parse(ordered); err != nil {
+		return exitErr(2)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return updater.RunSupervisor(ctx, updater.SuperviseOptions{
+		ConfigPath: *cfgPath,
+		HomeDir:    *homeDir,
+	})
+}
+
+func updateCmd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("update: want check, apply, rollback, status, list, keygen, sign or verify")
+	}
+	sub := args[0]
+	switch sub {
+	case "keygen":
+		fs := flag.NewFlagSet("update keygen", flag.ContinueOnError)
+		asJSON := fs.Bool("json", false, "print JSON")
+		if err := fs.Parse(splitFlagsAndPos(args[1:], map[string]bool{"json": true})); err != nil {
+			return exitErr(2)
+		}
+		pub, priv, err := updater.GenerateKeypair()
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(map[string]string{
+				"public_key":  pub,
+				"private_key": priv,
+			})
+		}
+		fmt.Printf("public_key:  %s\nprivate_key: %s\n", pub, priv)
+		fmt.Fprintln(os.Stderr, "\nPut public_key in config.yaml under updater.public_key, and store private_key as GitHub Secret UPDATER_SIGNING_KEY.")
+		return nil
+
+	case "sign":
+		fs := flag.NewFlagSet("update sign", flag.ContinueOnError)
+		keyEnv := fs.String("key-env", "", "environment variable containing Ed25519 private key")
+		keyFile := fs.String("key-file", "", "path to file containing Ed25519 private key")
+		outFile := fs.String("out", "", "write signature to file instead of stdout")
+		if err := fs.Parse(splitFlagsAndPos(args[1:], nil)); err != nil {
+			return exitErr(2)
+		}
+		if fs.NArg() != 1 {
+			return fmt.Errorf("update sign: want <file>")
+		}
+		var rawKey string
+		switch {
+		case *keyEnv != "":
+			rawKey = os.Getenv(*keyEnv)
+			if strings.TrimSpace(rawKey) == "" {
+				return fmt.Errorf("update sign: environment variable %s is empty", *keyEnv)
+			}
+		case *keyFile != "":
+			b, err := os.ReadFile(*keyFile)
+			if err != nil {
+				return err
+			}
+			rawKey = string(b)
+		default:
+			b, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				return err
+			}
+			rawKey = string(b)
+		}
+		priv, err := updater.ParsePrivateKey(rawKey)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		sig := updater.SignBytes(priv, data)
+		if *outFile != "" {
+			return os.WriteFile(*outFile, []byte(sig+"\n"), 0o644)
+		}
+		fmt.Println(sig)
+		return nil
+
+	case "verify":
+		fs := flag.NewFlagSet("update verify", flag.ContinueOnError)
+		pubStr := fs.String("pub", "", "Ed25519 public key")
+		sigFile := fs.String("sig", "", "path to SIGNATURE file")
+		if err := fs.Parse(splitFlagsAndPos(args[1:], nil)); err != nil {
+			return exitErr(2)
+		}
+		if fs.NArg() != 1 || *pubStr == "" || *sigFile == "" {
+			return fmt.Errorf("update verify: want --pub <key> --sig <sig-file> <file>")
+		}
+		pub, err := updater.ParsePublicKey(*pubStr)
+		if err != nil {
+			return err
+		}
+		sigBytes, err := os.ReadFile(*sigFile)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		if err := updater.VerifyBytes(pub, data, string(sigBytes)); err != nil {
+			return err
+		}
+		fmt.Println("signature ok")
+		return nil
+
+	case "check", "apply", "rollback", "status", "list":
+		fs, cfgPath := newFlags("update " + sub)
+		tag := fs.String("tag", "", "override target tag (apply)")
+		force := fs.Bool("force", false, "skip waiting for active in-flight requests")
+		noRestart := fs.Bool("no-restart", false, "stage and swap binary without marking pending restart")
+		asJSON := fs.Bool("json", false, "print JSON")
+		ordered := splitFlagsAndPos(args[1:], map[string]bool{"force": true, "no-restart": true, "json": true})
+		if err := fs.Parse(ordered); err != nil {
+			return exitErr(2)
+		}
+		cfg, err := load(*cfgPath)
+		if err != nil {
+			return err
+		}
+		var db *sql.DB
+		dbPath := filepath.Join(cfg.DataDir, "gatehouse.db")
+		_, statErr := os.Stat(dbPath)
+		if statErr == nil || strings.HasPrefix(cfg.Updater.PasswordRef, "db:") || strings.HasPrefix(cfg.Updater.TokenRef, "db:") {
+			opened, derr := store.Open(cfg.DataDir)
+			if derr != nil {
+				return derr
+			}
+			db = opened
+			defer db.Close()
+		}
+		mgr := updater.NewManager(updater.Deps{
+			CurrentVersion: version,
+			ConfigPath:     *cfgPath,
+			StaticConfig:   &cfg.Updater,
+			DB:             db,
+			ResolveSecret: func(ref string) (string, error) {
+				return api.ResolveUpdaterSecret(db, ref)
+			},
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		switch sub {
+		case "check":
+			st, err := mgr.Check(ctx)
+			if err != nil {
+				return err
+			}
+			if *asJSON {
+				return json.NewEncoder(os.Stdout).Encode(st)
+			}
+			if st.Available != nil && st.Available.UpdateAvailable {
+				fmt.Printf("update available: %s (digest %s, current %s)\n", st.Available.Version, st.Available.Digest, st.CurrentVersion)
+			} else {
+				ver := st.CurrentVersion
+				if st.Available != nil && st.Available.Version != "" {
+					ver = st.Available.Version
+				}
+				fmt.Printf("up to date (%s)\n", ver)
+			}
+		case "apply":
+			res, err := mgr.Apply(ctx, updater.ApplyOptions{
+				Tag:       *tag,
+				Force:     *force,
+				NoRestart: *noRestart,
+			})
+			if err != nil {
+				return err
+			}
+			if *asJSON {
+				return json.NewEncoder(os.Stdout).Encode(res)
+			}
+			fmt.Printf("installed %s (previous: %s, sha256: %s)\n", res.Version, res.PreviousVersion, res.BinarySHA256)
+			if !*noRestart {
+				fmt.Fprintln(os.Stderr, "restart the gatehouse service to run the newly switched release")
+			}
+		case "rollback":
+			target := ""
+			if fs.NArg() > 0 {
+				target = fs.Arg(0)
+			}
+			res, err := mgr.Rollback(ctx, updater.RollbackOptions{
+				TargetVersion: target,
+				Force:         *force,
+				NoRestart:     *noRestart,
+			})
+			if err != nil {
+				return err
+			}
+			if *asJSON {
+				return json.NewEncoder(os.Stdout).Encode(res)
+			}
+			fmt.Printf("rolled back to %s (previous: %s)\n", res.Version, res.PreviousVersion)
+			if !*noRestart {
+				fmt.Fprintln(os.Stderr, "restart the gatehouse service to run the rolled-back release")
+			}
+		case "status":
+			st := mgr.Status()
+			if *asJSON {
+				return json.NewEncoder(os.Stdout).Encode(st)
+			}
+			fmt.Printf("Current version:  %s\n", st.CurrentVersion)
+			fmt.Printf("Active release:   %s\n", st.ActiveRelease)
+			fmt.Printf("Previous release: %s\n", st.PreviousRelease)
+			fmt.Printf("Current digest:   %s\n", st.CurrentDigest)
+			fmt.Printf("Home directory:   %s\n", st.HomeDir)
+			fmt.Printf("Source:           %s (enabled=%v, auto_apply=%v)\n", st.Config.Source, st.Config.Enabled, st.Config.AutoApply)
+			if st.Failed != nil {
+				fmt.Printf("Last failed:      %s (%s)\n", st.Failed.Version, st.Failed.Reason)
+			}
+		case "list":
+			rels := mgr.Store().ListReleases()
+			if *asJSON {
+				return json.NewEncoder(os.Stdout).Encode(rels)
+			}
+			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+			fmt.Fprintln(tw, "MARK\tVERSION\tSHA256\tSIGNED\tMODIFIED\tNOTE")
+			for _, r := range rels {
+				mark := ""
+				if r.Current {
+					mark = "*"
+				} else if r.Previous {
+					mark = "<-"
+				}
+				sha := r.BinarySHA256
+				if len(sha) > 12 {
+					sha = sha[:12]
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%v\t%s\t%s\n", mark, r.Version, sha, r.Signed, r.ModifiedAt, r.Note)
+			}
+			tw.Flush()
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("update: unknown subcommand %q", sub)
+	}
 }

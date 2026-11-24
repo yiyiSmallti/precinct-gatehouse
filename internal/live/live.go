@@ -96,6 +96,29 @@ type Manager struct {
 	restart   []string
 	lastMtime time.Time
 	lastSize  int64
+	onSwaps   []func(*Snapshot)
+}
+
+// AddOnSwap registers an additional callback invoked whenever a new Snapshot becomes active.
+func (m *Manager) AddOnSwap(fn func(*Snapshot)) {
+	if fn == nil {
+		return
+	}
+	m.stateMu.Lock()
+	m.onSwaps = append(m.onSwaps, fn)
+	m.stateMu.Unlock()
+}
+
+func (m *Manager) notifySwapped(snap *Snapshot) {
+	if m.OnSwap != nil {
+		m.OnSwap(snap)
+	}
+	m.stateMu.RLock()
+	cbs := append(([]func(*Snapshot))(nil), m.onSwaps...)
+	m.stateMu.RUnlock()
+	for _, fn := range cbs {
+		fn(snap)
+	}
 }
 
 // New builds the initial Snapshot and creates a Manager.
@@ -266,9 +289,7 @@ func (m *Manager) applyLocked(prev *Snapshot, newBytes []byte, source string) (A
 		m.lastSize = st.Size()
 	}
 	m.stateMu.Unlock()
-	if m.OnSwap != nil {
-		m.OnSwap(snap)
-	}
+	m.notifySwapped(snap)
 
 	if restart == nil {
 		restart = []string{}
@@ -330,9 +351,7 @@ func (m *Manager) reloadFromDiskLocked(source string) (ApplyResult, bool, error)
 		m.lastSize = st.Size()
 	}
 	m.stateMu.Unlock()
-	if m.OnSwap != nil {
-		m.OnSwap(snap)
-	}
+	m.notifySwapped(snap)
 
 	if restart == nil {
 		restart = []string{}

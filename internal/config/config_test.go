@@ -132,3 +132,99 @@ providers:
 		})
 	}
 }
+
+func TestUpdaterConfigValidationAndDefaults(t *testing.T) {
+	dir := t.TempDir()
+	validPub := "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+	t.Run("valid_oci", func(t *testing.T) {
+		y := `
+updater:
+  enabled: true
+  auto_apply: true
+  source: oci
+  image: registry.cn-chengdu.aliyuncs.com/smallti/gatehouse
+  tag: latest
+  username: ali
+  password_ref: db:password
+  interval: 2m
+  drain_timeout: 5m
+  health_timeout: 25s
+  keep_releases: 5
+  public_key: ` + validPub + `
+`
+		cfg, err := Parse([]byte(y), filepath.Join(dir, "oci.yaml"))
+		if err != nil {
+			t.Fatalf("Parse failed: %v", err)
+		}
+		if cfg.Updater.EffectiveSource() != "oci" {
+			t.Fatalf("EffectiveSource = %q, want oci", cfg.Updater.EffectiveSource())
+		}
+		if !cfg.Updater.RequireSig() {
+			t.Fatal("expected RequireSig() true when public_key is set")
+		}
+		if len(cfg.Updater.EffectiveFallbackDNS()) != 2 {
+			t.Fatalf("expected 2 default fallback DNS servers, got %v", cfg.Updater.EffectiveFallbackDNS())
+		}
+	})
+
+	t.Run("valid_github_with_empty_fallback_dns", func(t *testing.T) {
+		y := `
+updater:
+  enabled: true
+  github_repo: yiyiSmallti/precinct-gatehouse
+  github_api_url: https://api.github.com/
+  token_ref: env:GH_TOKEN
+  fallback_dns: []
+  prerelease: true
+`
+		cfg, err := Parse([]byte(y), filepath.Join(dir, "gh.yaml"))
+		if err != nil {
+			t.Fatalf("Parse failed: %v", err)
+		}
+		if cfg.Updater.EffectiveSource() != "github" {
+			t.Fatalf("EffectiveSource = %q, want github", cfg.Updater.EffectiveSource())
+		}
+		if cfg.Updater.GitHubAPIURL != "https://api.github.com" {
+			t.Fatalf("GitHubAPIURL = %q", cfg.Updater.GitHubAPIURL)
+		}
+		if len(cfg.Updater.EffectiveFallbackDNS()) != 0 {
+			t.Fatalf("expected empty fallback DNS when explicitly [], got %v", cfg.Updater.EffectiveFallbackDNS())
+		}
+	})
+
+	t.Run("updater_not_restart_required", func(t *testing.T) {
+		c1, err := Parse([]byte("listen: 127.0.0.1:7788\n"), filepath.Join(dir, "a.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c2, err := Parse([]byte("listen: 127.0.0.1:7788\nupdater:\n  enabled: true\n  github_repo: a/b\n"), filepath.Join(dir, "b.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rr := RestartRequiredDiff(c1, c2); len(rr) != 0 {
+			t.Fatalf("expected updater to be hot-reloadable, got restart_required=%v", rr)
+		}
+	})
+
+	invalidCases := []struct {
+		name string
+		yaml string
+	}{
+		{"bad_source", "updater:\n  source: s3\n"},
+		{"enabled_missing_target", "updater:\n  enabled: true\n"},
+		{"enabled_oci_missing_image", "updater:\n  enabled: true\n  source: oci\n"},
+		{"bad_github_repo", "updater:\n  enabled: true\n  github_repo: onlyone\n"},
+		{"interval_too_short", "updater:\n  interval: 10s\n"},
+		{"bad_password_ref", "updater:\n  password_ref: plain:123\n"},
+		{"bad_public_key", "updater:\n  public_key: not-base64!!\n"},
+		{"require_sig_without_key", "updater:\n  require_signature: true\n"},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Parse([]byte(tc.yaml), filepath.Join(dir, tc.name+".yaml")); err == nil {
+				t.Fatalf("expected Parse error for %s, got nil", tc.name)
+			}
+		})
+	}
+}

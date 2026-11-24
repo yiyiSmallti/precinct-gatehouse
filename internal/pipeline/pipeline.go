@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/audit"
@@ -67,6 +68,15 @@ type Pipeline struct {
 	Hooks                 []Hook           // OnRequest/OnResponse plugins, in config order
 	SSEKeepaliveInitDelay time.Duration    // delay before Gatehouse sends SSE keepalive during long prefill (0 = 20s, <0 disables)
 	SSEKeepaliveInterval  time.Duration    // interval between SSE keepalives (0 = 15s, <0 disables)
+	inflight              atomic.Int64
+}
+
+// Inflight returns the number of active requests currently inside the pipeline.
+func (p *Pipeline) Inflight() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.inflight.Load()
 }
 
 func (p *Pipeline) keepaliveInitDelay() time.Duration {
@@ -141,6 +151,8 @@ func (p *Pipeline) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Serve runs one request through the gateway pipeline using the supplied
 // protocol label and request decoder.
 func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string, decode func([]byte) (oai.Object, error)) {
+	p.inflight.Add(1)
+	defer p.inflight.Add(-1)
 	if decode == nil {
 		decode = oai.Decode
 	}
