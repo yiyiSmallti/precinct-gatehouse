@@ -251,3 +251,80 @@ func TestOCISourceCheckAndDownloadWithRedirectAndSignature(t *testing.T) {
 		t.Fatalf("unexpected downloaded artifact: %+v", art)
 	}
 }
+
+func TestOCISourceRejectsMismatchedPinnedManifestDigest(t *testing.T) {
+	goodManifest := []byte(`{"schemaVersion":2,"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":10}]}`)
+	goodSum := sha256.Sum256(goodManifest)
+	expectedDigest := "sha256:" + hex.EncodeToString(goodSum[:])
+
+	tamperedManifest := []byte(`{"schemaVersion":2,"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":10}]}`)
+
+	indexBytes, _ := json.Marshal(map[string]any{
+		"schemaVersion": 2,
+		"manifests": []map[string]any{
+			{
+				"mediaType": "application/vnd.oci.image.manifest.v1+json",
+				"digest":    expectedDigest,
+				"platform": map[string]string{
+					"os":           runtime.GOOS,
+					"architecture": runtime.GOARCH,
+				},
+			},
+		},
+	})
+
+	regSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/smallti/gatehouse/manifests/" + expectedDigest:
+			// Even with a spoofed Docker-Content-Digest header matching expectedDigest,
+			// tampered manifest bytes must be rejected.
+			w.Header().Set("Docker-Content-Digest", expectedDigest)
+			_, _ = w.Write(tamperedManifest)
+		case "/v2/smallti/gatehouse/manifests/latest":
+			_, _ = w.Write(indexBytes)
+		case "/v2/smallti/gatehouse/manifests/sha512:deadbeef":
+			_, _ = w.Write(tamperedManifest)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer regSrv.Close()
+
+	host := strings.TrimPrefix(regSrv.URL, "http://")
+
+	// 1. Direct pinned @sha256:... image ref mismatch must fail Check and Download.
+	pinned := &OCISource{
+		Image:        host + "/smallti/gatehouse@" + expectedDigest,
+		InsecureHTTP: true,
+		HTTPClient:   NewHTTPClient(0, nil),
+	}
+	if _, err := pinned.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "manifest digest mismatch") {
+		t.Fatalf("expected manifest digest mismatch on pinned Check, got: %v", err)
+	}
+	if _, err := pinned.Download(context.Background(), t.TempDir()); err == nil || !strings.Contains(err.Error(), "manifest digest mismatch") {
+		t.Fatalf("expected manifest digest mismatch on pinned Download, got: %v", err)
+	}
+
+	// 2. Unsupported digest algorithm must be rejected.
+	badAlgo := &OCISource{
+		Image:        host + "/smallti/gatehouse@sha512:deadbeef",
+		InsecureHTTP: true,
+		HTTPClient:   NewHTTPClient(0, nil),
+	}
+	if _, err := badAlgo.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "unsupported manifest digest algorithm") {
+		t.Fatalf("expected unsupported manifest digest algorithm error, got: %v", err)
+	}
+
+	// 3. Tag index pointing to child manifest digest must also reject tampered child bytes.
+	tagged := &OCISource{
+		Image:        host + "/smallti/gatehouse:latest",
+		InsecureHTTP: true,
+		HTTPClient:   NewHTTPClient(0, nil),
+	}
+	if _, err := tagged.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "manifest digest mismatch") {
+		t.Fatalf("expected manifest digest mismatch on index child Check, got: %v", err)
+	}
+	if _, err := tagged.Download(context.Background(), t.TempDir()); err == nil || !strings.Contains(err.Error(), "manifest digest mismatch") {
+		t.Fatalf("expected manifest digest mismatch on index child Download, got: %v", err)
+	}
+}

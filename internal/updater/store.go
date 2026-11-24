@@ -22,6 +22,7 @@ const (
 	prevVerFileName     = ".previous_version"
 	currentDigestFile   = ".current_digest"
 	prevDigestFile      = ".previous_digest"
+	releaseDigestFile   = ".digest"
 	deployLockFile      = ".deploy.lock"
 )
 
@@ -333,6 +334,11 @@ func (s *Store) Install(ctx context.Context, req InstallRequest) (InstallResult,
 			return InstallResult{}, err
 		}
 	}
+	if d := strings.TrimSpace(req.Digest); d != "" {
+		if err := atomicWriteFile(filepath.Join(tmpDir, releaseDigestFile), []byte(d+"\n"), 0o644); err != nil {
+			return InstallResult{}, err
+		}
+	}
 
 	releaseID := s.allocateReleaseID(req.Version, req.Digest, shaHex, prevVer)
 	targetDir := filepath.Join(s.ReleasesDir(), releaseID)
@@ -365,13 +371,17 @@ func (s *Store) Install(ctx context.Context, req InstallRequest) (InstallResult,
 		_ = atomicWriteFile(filepath.Join(s.HomeDir, prevVerFileName), []byte(prevVer+"\n"), 0o644)
 		if prevDigest != "" {
 			_ = atomicWriteFile(filepath.Join(s.HomeDir, prevDigestFile), []byte(prevDigest+"\n"), 0o644)
+		} else {
+			_ = os.Remove(filepath.Join(s.HomeDir, prevDigestFile))
 		}
 	}
 	if err := atomicWriteFile(filepath.Join(s.HomeDir, currentVerFileName), []byte(releaseID+"\n"), 0o644); err != nil {
 		return InstallResult{}, err
 	}
-	if strings.TrimSpace(req.Digest) != "" {
-		_ = atomicWriteFile(filepath.Join(s.HomeDir, currentDigestFile), []byte(strings.TrimSpace(req.Digest)+"\n"), 0o644)
+	if d := strings.TrimSpace(req.Digest); d != "" {
+		_ = atomicWriteFile(filepath.Join(s.HomeDir, currentDigestFile), []byte(d+"\n"), 0o644)
+	} else {
+		_ = os.Remove(filepath.Join(s.HomeDir, currentDigestFile))
 	}
 
 	keep := req.KeepReleases
@@ -480,10 +490,14 @@ func (s *Store) Rollback(ctx context.Context, targetVersion, configPath string, 
 
 	prevVer := s.PreviousVersion()
 	prevDigest := s.PreviousDigest()
+	targetDigest := s.releaseDigest(target)
+	if targetDigest == "" && target == prevVer {
+		targetDigest = prevDigest
+	}
 	if recordPending {
 		if err := s.WritePending(&PendingUpdate{
 			TargetVersion:   target,
-			TargetDigest:    prevDigest,
+			TargetDigest:    targetDigest,
 			PreviousVersion: curVer,
 			PreviousDigest:  curDigest,
 			RequestedAt:     time.Now().UTC(),
@@ -494,6 +508,9 @@ func (s *Store) Rollback(ctx context.Context, targetVersion, configPath string, 
 
 	relTarget := filepath.Join("..", "releases", target, filepath.Base(targetBin))
 	if err := atomicSwapBinary(s.BinLink(), relTarget, targetBin); err != nil {
+		if recordPending {
+			_ = s.ClearPending()
+		}
 		return InstallResult{}, err
 	}
 
@@ -501,13 +518,15 @@ func (s *Store) Rollback(ctx context.Context, targetVersion, configPath string, 
 		_ = atomicWriteFile(filepath.Join(s.HomeDir, prevVerFileName), []byte(curVer+"\n"), 0o644)
 		if curDigest != "" {
 			_ = atomicWriteFile(filepath.Join(s.HomeDir, prevDigestFile), []byte(curDigest+"\n"), 0o644)
+		} else {
+			_ = os.Remove(filepath.Join(s.HomeDir, prevDigestFile))
 		}
 	}
 	if err := atomicWriteFile(filepath.Join(s.HomeDir, currentVerFileName), []byte(target+"\n"), 0o644); err != nil {
 		return InstallResult{}, err
 	}
-	if target == prevVer && prevDigest != "" {
-		_ = atomicWriteFile(filepath.Join(s.HomeDir, currentDigestFile), []byte(prevDigest+"\n"), 0o644)
+	if targetDigest != "" {
+		_ = atomicWriteFile(filepath.Join(s.HomeDir, currentDigestFile), []byte(targetDigest+"\n"), 0o644)
 	} else {
 		_ = os.Remove(filepath.Join(s.HomeDir, currentDigestFile))
 	}
@@ -561,6 +580,13 @@ func (s *Store) releaseBinaryPath(ver string) string {
 		}
 	}
 	return ""
+}
+
+func (s *Store) releaseDigest(ver string) string {
+	if err := ValidateVersion(ver); err != nil {
+		return ""
+	}
+	return readTrimmedFile(filepath.Join(s.ReleasesDir(), ver, releaseDigestFile))
 }
 
 func (s *Store) resolveRollbackTarget(curVer string) string {

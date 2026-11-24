@@ -65,6 +65,10 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 	if exePath != "" {
 		exePath = absPath(exePath)
 	}
+	workDir, _ := os.Getwd()
+	if workDir != "" {
+		workDir = absPath(workDir)
+	}
 	resolveHome := func(prev string) string {
 		if configPath != "" {
 			cfg, err := config.Load(configPath)
@@ -146,8 +150,8 @@ func RunSupervisor(ctx context.Context, opts SuperviseOptions) error {
 		} else {
 			cmd.Stderr = os.Stderr
 		}
-		if st, err := os.Stat(homeDir); err == nil && st.IsDir() {
-			cmd.Dir = homeDir
+		if workDir != "" {
+			cmd.Dir = workDir
 		}
 
 		startedAt := time.Now()

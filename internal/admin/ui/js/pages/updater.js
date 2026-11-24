@@ -23,6 +23,18 @@ const ACTIVE_STATES = new Set([
   'restarting',
 ]);
 
+const RESTARTABLE_STATES = new Set([
+  'downloading',
+  'verifying',
+  'draining',
+  'applying',
+  'restarting',
+]);
+
+export function shouldRetryUpdaterPoll(fromPoll, state, reconnecting) {
+  return Boolean(fromPoll && (reconnecting || RESTARTABLE_STATES.has(state)));
+}
+
 function stateMeta(state) {
   switch (state) {
     case 'available':
@@ -147,14 +159,17 @@ export function renderUpdater(container, ctx) {
       }
 
       if (ACTIVE_STATES.has(res.state)) {
-        if (res.state === 'restarting' && !versionBeforeRestart) {
-          versionBeforeRestart = res.current_version || '';
+        if (RESTARTABLE_STATES.has(res.state) && !versionBeforeRestart) {
+          versionBeforeRestart = res.current_version || store.server?.app_version || '';
         }
         schedulePoll(1500);
       }
     } catch (e) {
       if (e.status === 401) return;
-      if (fromPoll && (status?.state === 'restarting' || reconnecting)) {
+      if (shouldRetryUpdaterPoll(fromPoll, status?.state, reconnecting)) {
+        if (!versionBeforeRestart) {
+          versionBeforeRestart = status?.current_version || store.server?.app_version || '';
+        }
         reconnecting = true;
         reconnectTries += 1;
         if (reconnectTries === 1) paint();
@@ -163,6 +178,9 @@ export function renderUpdater(container, ctx) {
           return;
         }
         reconnecting = false;
+        if (status && ACTIVE_STATES.has(status.state)) {
+          status = { ...status, state: 'error', last_error: '等待网关重启超时，请刷新页面确认服务状态' };
+        }
         toast('等待网关重启超时，请刷新页面确认服务状态', 'warn', 6000);
         paint();
         return;

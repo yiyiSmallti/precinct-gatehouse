@@ -52,6 +52,13 @@ func runSuperviseHelper(cfgPath string) {
 		_, _ = fmt.Fprintln(f, ver)
 		_ = f.Close()
 	}
+	if wd, wdErr := os.Getwd(); wdErr == nil {
+		absData, _ := filepath.Abs(cfg.DataDir)
+		if f, err := os.OpenFile(filepath.Join(filepath.Dir(cfgPath), "wd_log.txt"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+			_, _ = fmt.Fprintf(f, "%s|%s|%s\n", ver, wd, absData)
+			_ = f.Close()
+		}
+	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -1360,5 +1367,212 @@ func TestManagerConfirmBootVerifiesRunningBinary(t *testing.T) {
 	copyMgr.ConfirmBoot()
 	if p, err := st.ReadPending(); err != nil || p != nil {
 		t.Fatalf("expected .update_pending cleared for matching regular-file copy, got %+v err=%v", p, err)
+	}
+}
+
+func TestSupervisorPreservesWorkDirAcrossHomeDirChange(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink-based test helper uses unix symlinks")
+	}
+	t.Setenv("GATEHOUSE_SUPERVISE_HELPER", "1")
+	t.Setenv("GATEHOUSE_SUPERVISE_HOME", "")
+
+	base := t.TempDir()
+	workDir := filepath.Join(base, "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	homeA := filepath.Join(base, "homeA")
+	homeB := filepath.Join(base, "homeB")
+	stA := NewStore(homeA)
+	stB := NewStore(homeB)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, spec := range []struct {
+		st  *Store
+		ver string
+	}{
+		{stA, "v1"},
+		{stB, "v2"},
+	} {
+		if err := os.MkdirAll(spec.st.BinDir(), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		relDir := filepath.Join(spec.st.ReleasesDir(), spec.ver)
+		if err := os.MkdirAll(relDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(exe, filepath.Join(relDir, binaryFilename())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join("..", "releases", "v1", binaryFilename()), stA.BinLink()); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(homeA, currentVerFileName), []byte("v1\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(homeA, "hot_reload_home"), []byte(homeB+"\n"), 0o644)
+
+	addr := freeTCPAddr(t)
+	cfgPath := filepath.Join(base, "config.yaml")
+	cfgYAML := fmt.Sprintf("listen: %s\nmode: personal\ndata_dir: ./data\nupdater:\n  home_dir: %s\n  health_timeout: 2s\n", addr, homeA)
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(origWD)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RunSupervisor(ctx, SuperviseOptions{
+			ConfigPath:    cfgPath,
+			ProbeInterval: 50 * time.Millisecond,
+			HealthTimeout: 3 * time.Second,
+		})
+	}()
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(filepath.Join(homeB, "boot_log.txt"))
+		pending, _ := stB.ReadPending()
+		if strings.Contains(string(b), "v2\n") && pending == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RunSupervisor returned error: %v", err)
+	}
+
+	resolvedWorkDir, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		resolvedWorkDir = workDir
+	}
+	wantDataDir := filepath.Join(resolvedWorkDir, "data")
+
+	wdLogBytes, err := os.ReadFile(filepath.Join(base, "wd_log.txt"))
+	if err != nil {
+		t.Fatalf("read wd_log.txt: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(wdLogBytes)), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected >= 2 boot lines in wd_log.txt, got %q", string(wdLogBytes))
+	}
+	seen := map[string]bool{}
+	for _, line := range lines {
+		parts := strings.Split(line, "|")
+		if len(parts) != 3 {
+			t.Fatalf("malformed wd_log line %q", line)
+		}
+		ver, gotWD, gotData := parts[0], parts[1], parts[2]
+		seen[ver] = true
+		if resolvedWD, err := filepath.EvalSymlinks(gotWD); err == nil {
+			gotWD = resolvedWD
+		}
+		if resolvedData, err := filepath.EvalSymlinks(gotData); err == nil {
+			gotData = resolvedData
+		}
+		if gotWD != resolvedWorkDir || gotData != wantDataDir {
+			t.Fatalf("boot %s changed workdir/datadir: got wd=%q data=%q, want wd=%q data=%q",
+				ver, gotWD, gotData, resolvedWorkDir, wantDataDir)
+		}
+	}
+	if !seen["v1"] || !seen["v2"] {
+		t.Fatalf("expected both v1 and v2 boots in wd_log.txt, got %q", string(wdLogBytes))
+	}
+}
+
+func TestStoreRollbackPendingTargetDigestMatchesSelectedRelease(t *testing.T) {
+	ctx := context.Background()
+
+	// Case 1: Rolling back to an older installed release (v1.0.0, not .previous_version v2.0.0)
+	// must record v1.0.0's own digest rather than v2.0.0's .previous_digest.
+	st := NewStore(t.TempDir())
+	st.PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+	for _, item := range []struct{ v, d string }{
+		{"v1.0.0", "sha256:d1"},
+		{"v2.0.0", "sha256:d2"},
+		{"v3.0.0", "sha256:d3"},
+	} {
+		if _, err := st.Install(ctx, InstallRequest{
+			Version:      item.v,
+			Digest:       item.d,
+			Artifact:     makeStagedArtifact(t, item.v),
+			KeepReleases: 5,
+		}); err != nil {
+			t.Fatalf("Install %s: %v", item.v, err)
+		}
+	}
+
+	if _, err := st.Rollback(ctx, "v1.0.0", "", true); err != nil {
+		t.Fatalf("Rollback to v1.0.0: %v", err)
+	}
+	pending, err := st.ReadPending()
+	if err != nil || pending == nil {
+		t.Fatalf("ReadPending after Rollback to v1.0.0: pending=%+v err=%v", pending, err)
+	}
+	if pending.TargetVersion != "v1.0.0" || pending.TargetDigest != "sha256:d1" {
+		t.Fatalf("expected pending target v1.0.0 / sha256:d1, got %+v", pending)
+	}
+	if pending.PreviousVersion != "v3.0.0" || pending.PreviousDigest != "sha256:d3" {
+		t.Fatalf("expected pending previous v3.0.0 / sha256:d3, got %+v", pending)
+	}
+	if got := st.CurrentDigest(); got != "sha256:d1" {
+		t.Fatalf("expected CurrentDigest=sha256:d1, got %q", got)
+	}
+
+	// Case 2: Rolling back to an older release without a stored .digest must record an empty
+	// TargetDigest and remove stale .current_digest rather than borrowing .previous_digest.
+	st2 := NewStore(t.TempDir())
+	st2.PreflightFunc = func(_ context.Context, _ string, _ string) error { return nil }
+	legacyDir := filepath.Join(st2.ReleasesDir(), "v0.9.0")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, binaryFilename()), []byte("legacy-v0.9.0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct{ v, d string }{
+		{"v2.0.0", "sha256:d2"},
+		{"v3.0.0", "sha256:d3"},
+	} {
+		if _, err := st2.Install(ctx, InstallRequest{
+			Version:      item.v,
+			Digest:       item.d,
+			Artifact:     makeStagedArtifact(t, item.v),
+			KeepReleases: 5,
+		}); err != nil {
+			t.Fatalf("Install %s: %v", item.v, err)
+		}
+	}
+
+	if _, err := st2.Rollback(ctx, "v0.9.0", "", true); err != nil {
+		t.Fatalf("Rollback to v0.9.0: %v", err)
+	}
+	pending2, err := st2.ReadPending()
+	if err != nil || pending2 == nil {
+		t.Fatalf("ReadPending after Rollback to v0.9.0: pending=%+v err=%v", pending2, err)
+	}
+	if pending2.TargetVersion != "v0.9.0" || pending2.TargetDigest != "" {
+		t.Fatalf("expected pending target v0.9.0 with empty digest, got %+v", pending2)
+	}
+	if pending2.PreviousVersion != "v3.0.0" || pending2.PreviousDigest != "sha256:d3" {
+		t.Fatalf("expected pending previous v3.0.0 / sha256:d3, got %+v", pending2)
+	}
+	if got := st2.CurrentDigest(); got != "" {
+		t.Fatalf("expected empty CurrentDigest after digestless rollback, got %q", got)
 	}
 }

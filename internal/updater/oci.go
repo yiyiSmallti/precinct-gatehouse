@@ -47,6 +47,11 @@ func ParseImageRef(image, defaultTag string) (registry, repo, tag string, err er
 	if at := strings.IndexByte(repo, '@'); at >= 0 {
 		tag = repo[at+1:]
 		repo = repo[:at]
+		lastSlash := strings.LastIndexByte(repo, '/')
+		tail := repo[lastSlash+1:]
+		if colon := strings.LastIndexByte(tail, ':'); colon >= 0 {
+			repo = repo[:lastSlash+1+colon]
+		}
 	} else {
 		lastSlash := strings.LastIndexByte(repo, '/')
 		tail := repo[lastSlash+1:]
@@ -309,23 +314,31 @@ func (o *OCISource) fetchManifest(ctx context.Context, registry, repo, ref strin
 		return nil, "", err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (4<<20)+1))
 	if err != nil {
 		return nil, "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, "", fmt.Errorf("manifest %s HTTP %d: %s", ref, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
-	digest := strings.TrimSpace(resp.Header.Get("Docker-Content-Digest"))
-	if digest == "" {
-		sum := sha256.Sum256(raw)
-		digest = "sha256:" + hex.EncodeToString(sum[:])
+	if len(raw) > 4<<20 {
+		return nil, "", fmt.Errorf("manifest %s exceeds maximum size", ref)
+	}
+	sum := sha256.Sum256(raw)
+	computed := "sha256:" + hex.EncodeToString(sum[:])
+	if strings.Contains(ref, ":") {
+		if !strings.HasPrefix(ref, "sha256:") {
+			return nil, "", fmt.Errorf("unsupported manifest digest algorithm: %q", ref)
+		}
+		if !strings.EqualFold(computed, ref) {
+			return nil, "", fmt.Errorf("manifest digest mismatch for %s: got %s", ref, computed)
+		}
 	}
 	var doc ociManifest
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, "", fmt.Errorf("parse manifest %s: %w", ref, err)
 	}
-	return &doc, digest, nil
+	return &doc, computed, nil
 }
 
 func (o *OCISource) resolveTargetManifest(ctx context.Context, registry, repo, tag string) (*ociManifest, string, error) {
@@ -362,8 +375,13 @@ func (o *OCISource) fetchConfigLabels(ctx context.Context, registry, repo string
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return out
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxMetaSize))
-	if err != nil {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxMetaSize+1))
+	if err != nil || int64(len(raw)) > maxMetaSize {
+		return out
+	}
+	sum := sha256.Sum256(raw)
+	computed := "sha256:" + hex.EncodeToString(sum[:])
+	if !strings.EqualFold(computed, doc.Config.Digest) {
 		return out
 	}
 	_ = json.Unmarshal(raw, &out)
@@ -422,6 +440,10 @@ func (o *OCISource) Check(ctx context.Context) (*RemoteInfo, error) {
 	if created == "" {
 		created = cfg.Created
 	}
+	refSep := ":"
+	if strings.Contains(tag, ":") {
+		refSep = "@"
+	}
 	return &RemoteInfo{
 		Source:      "oci",
 		Version:     ver,
@@ -429,7 +451,7 @@ func (o *OCISource) Check(ctx context.Context) (*RemoteInfo, error) {
 		Tag:         tag,
 		Commit:      rev,
 		PublishedAt: created,
-		URL:         fmt.Sprintf("%s/%s:%s", registry, repo, tag),
+		URL:         fmt.Sprintf("%s/%s%s%s", registry, repo, refSep, tag),
 	}, nil
 }
 
