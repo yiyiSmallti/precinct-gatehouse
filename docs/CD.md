@@ -173,3 +173,30 @@ systemctl disable --now dsv41-gatehouse-pull.timer
    - 切换软链前先用新二进制执行 `gatehouse version` 与 `gatehouse config check --config config.yaml`，任一失败直接中止，不触碰线上进程。
 4. **自动秒级回滚**：重启 `dsv41-gatehouse.service` 后在 25 秒内持续校验 `systemd` 存活状态、`http://127.0.0.1:18011/healthz` 返回 `status: "ok"`、以及 `http://127.0.0.1:18002/admin/` 返回正常状态码；若未通过，打印最近 40 行日志并**自动切回上一个版本重新拉起服务**。
 5. **并发互斥与基线保护**：使用 `flock` 防止同时触发两次发布；保留最近 5 个版本，且永远不清理当前版本、上一版本及 `baseline-*` 初始基线版本。
+
+---
+
+## 8. 网关内置自动更新（推荐替代外部 timer）
+
+从内置更新器上线起，Gatehouse 自身已原生支持 **OCI 国内镜像** 与 **GitHub Releases** 检查、**Ed25519 验签**、**在途长请求排空后再切版**，以及 `gatehouse supervise` 守护进程在启动失败时**自动回滚**：
+
+1. **生成 Ed25519 发布签名密钥对**（只需一次）：
+   ```bash
+   gatehouse update keygen
+   ```
+   - 将输出的 `private_key` 写入 GitHub Secrets：`gh secret set UPDATER_SIGNING_KEY --repo yiyiSmallti/precinct-gatehouse`
+   - 将输出的 `public_key` 填入管理台 **「系统更新」**（或 `config.yaml` 的 `updater.public_key`），并开启 `require_signature: true`。
+2. **在管理台「系统更新」配置自动更新**（全部参数支持热重载）：
+   - 选择制品源（国内 OCI 镜像或 GitHub Releases），填好镜像地址/仓库与密码或 Token（加密保存在本地 SQLite `settings` 表，不以明文回传前端）。
+   - 开启「启用定时自动检查」与「发现新版后自动排空并升级」。网关拉取新包并完成 `config check` 预检后，会等待活跃流式请求数归零（或达到 `drain_timeout` 上限）再原子切换并重启。
+3. **从旧版 `dsv41-gatehouse-pull.timer` 迁移到内置更新（`gpu1`）**：
+   - 将 `dsv41-gatehouse.service` 的 `ExecStart` 更新为 `gatehouse supervise --config ...`（参见 [dsv41-gatehouse.service](../deploy/systemd/dsv41-gatehouse.service)）并执行 `systemctl daemon-reload && systemctl restart dsv41-gatehouse`。
+   - 停用旧的外部定时器避免双边拉取冲突：
+     ```bash
+     systemctl disable --now dsv41-gatehouse-pull.timer
+     ```
+4. **常用内置命令行子命令**：
+   - `gatehouse update check --config ...`
+   - `gatehouse update apply --config ... [--tag v0.1.2] [--force] [--no-restart]`
+   - `gatehouse update rollback --config ... [version]`
+   - `gatehouse update status --config ...` / `gatehouse update list --config ...`

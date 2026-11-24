@@ -114,6 +114,7 @@ jobs:
           COMMIT: ${{ steps.meta.outputs.commit }}
           SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
           BUILT_AT: ${{ steps.meta.outputs.built_at }}
+          UPDATER_SIGNING_KEY: ${{ secrets.UPDATER_SIGNING_KEY }}
         run: |
           set -euo pipefail
           mkdir -p dist/stage
@@ -135,6 +136,17 @@ jobs:
           BINARY_SHA256="$(sha256sum dist/stage/gatehouse | awk '{print $1}')"
           printf '%s  gatehouse\n' "${BINARY_SHA256}" > dist/stage/SHA256SUMS
 
+          SIGNED="false"
+          TAR_FILES=(gatehouse SHA256SUMS RELEASE_META)
+          if [ -n "${UPDATER_SIGNING_KEY}" ]; then
+            go run ./cmd/gatehouse update sign \
+              --key-env UPDATER_SIGNING_KEY \
+              --out dist/stage/SIGNATURE \
+              dist/stage/SHA256SUMS
+            SIGNED="true"
+            TAR_FILES+=(SIGNATURE)
+          fi
+
           jq -n \
             --arg version "${VERSION}" \
             --arg commit "${COMMIT}" \
@@ -142,22 +154,25 @@ jobs:
             --arg built_at "${BUILT_AT}" \
             --arg arch "linux/amd64" \
             --arg binary_sha256 "${BINARY_SHA256}" \
+            --argjson signed "${SIGNED}" \
             '{
               version: $version,
               commit: $commit,
               short_sha: $short_sha,
               built_at: $built_at,
               arch: $arch,
-              binary_sha256: $binary_sha256
+              binary_sha256: $binary_sha256,
+              signed: $signed
             }' > dist/stage/RELEASE_META
 
           TARBALL_NAME="gatehouse_${VERSION}_linux_amd64.tar.gz"
-          tar -C dist/stage -czf "dist/${TARBALL_NAME}" gatehouse SHA256SUMS RELEASE_META
+          tar -C dist/stage -czf "dist/${TARBALL_NAME}" "${TAR_FILES[@]}"
           (cd dist && sha256sum "${TARBALL_NAME}" > SHA256SUMS)
 
           {
             echo "binary_sha256=${BINARY_SHA256}"
             echo "tarball_name=${TARBALL_NAME}"
+            echo "signed=${SIGNED}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifacts
@@ -168,6 +183,7 @@ jobs:
             dist/gatehouse_*_linux_amd64.tar.gz
             dist/SHA256SUMS
             dist/stage/RELEASE_META
+            dist/stage/SIGNATURE*
 
       - name: Publish GitHub Release
         id: gh_release
@@ -184,6 +200,9 @@ jobs:
             "dist/SHA256SUMS"
             "dist/stage/RELEASE_META"
           )
+          if [ -f "dist/stage/SIGNATURE" ]; then
+            ASSETS+=("dist/stage/SIGNATURE")
+          fi
           if gh release view "${VERSION}" >/dev/null 2>&1; then
             gh release upload "${VERSION}" "${ASSETS[@]}" --clobber
           else
@@ -208,6 +227,8 @@ jobs:
           CN_REGISTRY_USERNAME: ${{ secrets.CN_REGISTRY_USERNAME }}
           CN_REGISTRY_PASSWORD: ${{ secrets.CN_REGISTRY_PASSWORD }}
           VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          BUILT_AT: ${{ steps.meta.outputs.built_at }}
           SHOULD_UPDATE_LATEST: ${{ steps.meta.outputs.should_update_latest }}
         run: |
           set -euo pipefail
@@ -225,6 +246,9 @@ jobs:
           IMAGE_VER="${CN_REGISTRY_IMAGE}:${VERSION}"
           BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker build \
             --platform linux/amd64 \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${COMMIT}" \
+            --label "org.opencontainers.image.created=${BUILT_AT}" \
             -f deploy/Dockerfile.artifact \
             -t "${IMAGE_VER}" \
             dist/stage
@@ -244,6 +268,7 @@ jobs:
           COMMIT: ${{ steps.meta.outputs.commit }}
           SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
           BINARY_SHA256: ${{ steps.build.outputs.binary_sha256 }}
+          SIGNED: ${{ steps.build.outputs.signed }}
           SHOULD_CREATE_RELEASE: ${{ steps.meta.outputs.should_create_release }}
           SHOULD_UPDATE_LATEST: ${{ steps.meta.outputs.should_update_latest }}
           MIRROR_PUSHED: ${{ steps.mirror.outputs.mirror_pushed }}
@@ -259,6 +284,7 @@ jobs:
             echo "| Commit | \`${COMMIT}\` (\`${SHORT_SHA}\`) |"
             echo "| Arch | \`linux/amd64\` |"
             echo "| Binary SHA256 | \`${BINARY_SHA256}\` |"
+            echo "| Signed (Ed25519) | \`${SIGNED:-false}\` |"
             echo "| GitHub Release | \`${GH_PUBLISHED:-false}\` (requested: \`${SHOULD_CREATE_RELEASE}\`) |"
             echo "| Domestic Mirror Pushed | \`${MIRROR_PUSHED:-false}\` (latest updated: \`${SHOULD_UPDATE_LATEST}\`) |"
             echo ""

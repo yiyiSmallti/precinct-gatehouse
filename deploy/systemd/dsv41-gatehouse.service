@@ -1,0 +1,16 @@
+[Unit]
+Description=Precinct Gatehouse LLM Gateway (Supervised)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/AIOS/sglang-kunlun-v0522-1017/deploy-dsv41-1017/gateway/gatehouse
+ExecStart=/AIOS/sglang-kunlun-v0522-1017/deploy-dsv41-1017/gateway/gatehouse/bin/gatehouse supervise --config /AIOS/sglang-kunlun-v0522-1017/deploy-dsv41-1017/gateway/gatehouse/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

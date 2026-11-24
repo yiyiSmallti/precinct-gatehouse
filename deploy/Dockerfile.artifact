@@ -1,7 +1,5 @@
 FROM scratch
 LABEL org.opencontainers.image.title="precinct-gatehouse-artifact" \
-      org.opencontainers.image.description="Prebuilt static linux/amd64 binary artifact for Precinct Gatehouse"
-COPY gatehouse /gatehouse
-COPY SHA256SUMS /SHA256SUMS
-COPY RELEASE_META /RELEASE_META
+      org.opencontainers.image.description="Prebuilt static binary artifact for Precinct Gatehouse"
+COPY . /
 ENTRYPOINT ["/gatehouse"]
