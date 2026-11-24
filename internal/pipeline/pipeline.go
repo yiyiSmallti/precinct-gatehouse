@@ -204,7 +204,11 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 	if err != nil {
 		var oe *oai.Error
 		if !errors.As(err, &oe) {
-			oe = oai.Errorf(http.StatusInternalServerError, "internal_error", "%v", err)
+			if isClientCanceled(r.Context()) {
+				oe = oai.Errorf(StatusClientClosedRequest, CodeClientDisconnected, "%v", r.Context().Err())
+			} else {
+				oe = oai.Errorf(http.StatusInternalServerError, "internal_error", "%v", err)
+			}
 		}
 		st.rec.Status = oe.Status
 		st.errorCode = oe.Code
@@ -212,16 +216,18 @@ func (p *Pipeline) Serve(w http.ResponseWriter, r *http.Request, protocol string
 		if !st.written {
 			oai.WriteError(w, oe)
 		} else if st.keepaliveOnly {
-			errBody := oai.Encode(map[string]any{
-				"error": map[string]any{
-					"message": oe.Message,
-					"type":    "upstream_error",
-					"code":    oe.Code,
-				},
-			})
-			fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", errBody)
-			if fl, ok := w.(http.Flusher); ok {
-				fl.Flush()
+			if oe.Status != StatusClientClosedRequest {
+				errBody := oai.Encode(map[string]any{
+					"error": map[string]any{
+						"message": oe.Message,
+						"type":    "upstream_error",
+						"code":    oe.Code,
+					},
+				})
+				fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", errBody)
+				if fl, ok := w.(http.Flusher); ok {
+					fl.Flush()
+				}
 			}
 			st.keepaliveOnly = false
 		}
@@ -461,6 +467,17 @@ func (p *Pipeline) orgAllowed(snap *live.Snapshot, pc *policy.Context) map[strin
 	return out
 }
 
+const (
+	// StatusClientClosedRequest is the non-standard HTTP status (499) recorded when
+	// the client disconnects or cancels the request context before completion.
+	StatusClientClosedRequest = 499
+	CodeClientDisconnected    = "client_disconnected"
+)
+
+func isClientCanceled(ctx context.Context) bool {
+	return ctx != nil && errors.Is(ctx.Err(), context.Canceled)
+}
+
 // BodyReadError classifies request-body read failures into accurate HTTP status
 // and error codes so upload timeouts and client disconnects are not misreported
 // as HTTP 413 payload-too-large errors.
@@ -469,8 +486,8 @@ func BodyReadError(ctx context.Context, err error) *oai.Error {
 	if errors.As(err, &mbe) {
 		return oai.Errorf(http.StatusRequestEntityTooLarge, "body_too_large", "%v", err)
 	}
-	if errors.Is(err, context.Canceled) || (ctx != nil && errors.Is(ctx.Err(), context.Canceled)) {
-		return oai.Errorf(499, "client_disconnected", "%v", err)
+	if errors.Is(err, context.Canceled) || isClientCanceled(ctx) {
+		return oai.Errorf(StatusClientClosedRequest, CodeClientDisconnected, "%v", err)
 	}
 	return oai.Errorf(http.StatusRequestTimeout, "request_body_read_error", "%v", err)
 }
@@ -661,8 +678,16 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 			if !errors.As(err, &ue) {
 				ue = &provider.UpstreamError{Err: err}
 			}
-			st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: ue.Status, Error: ue.Error()})
-			p.meterRecord(st, ref, prov.Target, oai.Usage{}, 0, statusOf(ue), time.Since(callStart))
+			stCode := statusOf(ctx, ue)
+			attemptStatus := ue.Status
+			if attemptStatus == 0 && stCode == StatusClientClosedRequest {
+				attemptStatus = StatusClientClosedRequest
+			}
+			st.rec.Attempts = append(st.rec.Attempts, audit.Attempt{Model: ref, Status: attemptStatus, Error: ue.Error()})
+			p.meterRecord(st, ref, prov.Target, oai.Usage{}, 0, stCode, time.Since(callStart))
+			if ue.Status == 0 && isClientCanceled(ctx) {
+				return oai.Errorf(StatusClientClosedRequest, CodeClientDisconnected, "%s: %s", ref, ue.Error())
+			}
 			if ue.Retryable {
 				st.snap.Reg.MarkFailed(ref)
 				lastErr = ue
@@ -673,11 +698,11 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 				return oai.Errorf(http.StatusBadGateway, "upstream_redirect", "%s: provider answered with a redirect (%d); redirects are not followed", ref, ue.Status)
 			}
 			if ue.Status == 0 {
-				// no upstream response (e.g. the client went away)
+				// no upstream response (e.g. dial failure or upstream timeout)
 				return oai.Errorf(http.StatusBadGateway, "upstream_unavailable", "%s: %s", ref, ue.Error())
 			}
 			if st.written {
-				return oai.Errorf(statusOf(ue), "upstream_error", "%s", ue.Error())
+				return oai.Errorf(stCode, "upstream_error", "%s", ue.Error())
 			}
 			// a client error from the provider is returned as is
 			copyRouterHeaders(st, ue.Header)
@@ -697,7 +722,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 		if upStream {
 			usage, err = p.relayStream(reqCtx, st, resp, clientUsage, p.keepaliveIntervalFor(prov))
 		} else {
-			usage, err = p.relayBuffered(st, resp, vaultKey, clientStream, clientUsage)
+			usage, err = p.relayBuffered(reqCtx, st, resp, vaultKey, clientStream, clientUsage)
 		}
 		resp.Body.Close()
 		applyRouteMeta(st, routeMeta)
@@ -781,9 +806,16 @@ func (p *Pipeline) meterClassifier(st *reqState, dec route.Decision) {
 
 // relayBuffered reads a full JSON response, restores placeholders and writes
 // it either as JSON or, when the client asked for a stream, as SSE.
-func (p *Pipeline) relayBuffered(st *reqState, resp *http.Response, vaultKey string, clientStream, clientUsage bool) (oai.Usage, error) {
+func (p *Pipeline) relayBuffered(ctx context.Context, st *reqState, resp *http.Response, vaultKey string, clientStream, clientUsage bool) (oai.Usage, error) {
+	if ctx != nil {
+		stop := context.AfterFunc(ctx, func() { _ = resp.Body.Close() })
+		defer stop()
+	}
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if isClientCanceled(ctx) {
+			return oai.Usage{}, oai.Errorf(StatusClientClosedRequest, CodeClientDisconnected, "%v", err)
+		}
 		return oai.Usage{}, oai.Errorf(http.StatusBadGateway, "upstream_read", "%v", err)
 	}
 	o, err := oai.Decode(raw)
@@ -970,6 +1002,9 @@ func (p *Pipeline) relayStream(ctx context.Context, st *reqState, resp *http.Res
 				if done {
 					return usage, nil
 				}
+				if isClientCanceled(ctx) {
+					return usage, oai.Errorf(StatusClientClosedRequest, CodeClientDisconnected, "%v", ctx.Err())
+				}
 				return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "stream ended before completion")
 			}
 			if len(item.ev) > 0 {
@@ -1000,7 +1035,13 @@ func (p *Pipeline) relayStream(ctx context.Context, st *reqState, resp *http.Res
 					if done {
 						return usage, nil
 					}
+					if isClientCanceled(ctx) {
+						return usage, oai.Errorf(StatusClientClosedRequest, CodeClientDisconnected, "%v", ctx.Err())
+					}
 					return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "stream ended before completion")
+				}
+				if isClientCanceled(ctx) {
+					return usage, oai.Errorf(StatusClientClosedRequest, CodeClientDisconnected, "%v", item.err)
 				}
 				// the client already has a partial stream; report the failure so it is metered and audited
 				return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "%v", item.err)
@@ -1014,6 +1055,9 @@ func (p *Pipeline) relayStream(ctx context.Context, st *reqState, resp *http.Res
 		case <-ctx.Done():
 			stopReader()
 			_ = resp.Body.Close()
+			if isClientCanceled(ctx) {
+				return usage, oai.Errorf(StatusClientClosedRequest, CodeClientDisconnected, "%v", ctx.Err())
+			}
 			return usage, oai.Errorf(http.StatusBadGateway, "upstream_stream_interrupted", "%v", ctx.Err())
 		}
 	}
@@ -1098,9 +1142,12 @@ func effortParam(e string) string {
 	return ""
 }
 
-func statusOf(e *provider.UpstreamError) int {
+func statusOf(ctx context.Context, e *provider.UpstreamError) int {
 	if e.Status != 0 {
 		return e.Status
+	}
+	if isClientCanceled(ctx) {
+		return StatusClientClosedRequest
 	}
 	return http.StatusBadGateway
 }

@@ -1666,3 +1666,387 @@ providers:
 		t.Fatalf("expected /healthz body to include version v0.2.0, got %s", recOK.Body.String())
 	}
 }
+
+type syncStreamWriter struct {
+	mu      sync.Mutex
+	header  http.Header
+	code    int
+	buf     bytes.Buffer
+	onWrite func([]byte)
+}
+
+func newSyncStreamWriter(onWrite func([]byte)) *syncStreamWriter {
+	return &syncStreamWriter{
+		header:  make(http.Header),
+		onWrite: onWrite,
+	}
+}
+
+func (s *syncStreamWriter) Header() http.Header { return s.header }
+
+func (s *syncStreamWriter) WriteHeader(code int) {
+	s.mu.Lock()
+	if s.code == 0 {
+		s.code = code
+	}
+	s.mu.Unlock()
+}
+
+func (s *syncStreamWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	if s.code == 0 {
+		s.code = http.StatusOK
+	}
+	n, err := s.buf.Write(p)
+	s.mu.Unlock()
+	if s.onWrite != nil {
+		s.onWrite(p)
+	}
+	return n, err
+}
+
+func (s *syncStreamWriter) Flush() {}
+
+func (s *syncStreamWriter) bodyString() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func assertLatestLogsAndAudit(t *testing.T, srv *Server, wantStatus int, wantErrCode string) {
+	t.Helper()
+	var reqStatus int
+	var reqErrCode string
+	if err := srv.DB.QueryRow(`SELECT status, error_code FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&reqStatus, &reqErrCode); err != nil {
+		t.Fatalf("query request_log failed: %v", err)
+	}
+	if reqStatus != wantStatus || reqErrCode != wantErrCode {
+		t.Fatalf("request_log mismatch: got status=%d error_code=%q, want status=%d error_code=%q",
+			reqStatus, reqErrCode, wantStatus, wantErrCode)
+	}
+
+	var usageStatus int
+	if err := srv.DB.QueryRow(`SELECT status FROM usage ORDER BY id DESC LIMIT 1`).Scan(&usageStatus); err != nil {
+		t.Fatalf("query usage failed: %v", err)
+	}
+	if usageStatus != wantStatus {
+		t.Fatalf("usage status mismatch: got %d, want %d", usageStatus, wantStatus)
+	}
+
+	auditDir := filepath.Join(srv.Live.Current().Cfg.DataDir, "audit")
+	files, err := filepath.Glob(filepath.Join(auditDir, "*.jsonl"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("expected audit jsonl files in %s, got err=%v", auditDir, err)
+	}
+	raw, err := os.ReadFile(files[len(files)-1])
+	if err != nil {
+		t.Fatalf("read audit file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	var auditRec struct {
+		Status int    `json:"status"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &auditRec); err != nil {
+		t.Fatalf("decode audit record: %v", err)
+	}
+	if auditRec.Status != wantStatus {
+		t.Fatalf("audit status mismatch: got %d (err=%q), want %d", auditRec.Status, auditRec.Error, wantStatus)
+	}
+	if wantErrCode != "" && !strings.HasPrefix(auditRec.Error, wantErrCode+":") {
+		t.Fatalf("expected audit error prefix %q, got %q", wantErrCode+":", auditRec.Error)
+	}
+}
+
+func TestClientCancelClassifiedAs499AcrossStages(t *testing.T) {
+	t.Run("header_wait_canceled", func(t *testing.T) {
+		started := make(chan struct{})
+		var startedOnce sync.Once
+		release := make(chan struct{})
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			startedOnce.Do(func() { close(started) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}))
+		defer up.Close()
+		defer close(release)
+
+		srv, tok := newMidStreamTestServer(t, up.URL, 0)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://gatehouse.local/v1/chat/completions",
+			bytes.NewReader([]byte(`{"model":"p/m1","messages":[{"role":"user","content":"hi"}]}`)))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			srv.HTTP.Handler.ServeHTTP(rec, req)
+		}()
+
+		<-started
+		cancel()
+		<-done
+
+		if rec.Code != 499 {
+			t.Fatalf("expected status 499, got %d body=%q", rec.Code, rec.Body.String())
+		}
+		if !srv.Live.Current().Reg.Healthy("p/m1") {
+			t.Fatal("client cancel must not mark upstream p/m1 unhealthy")
+		}
+		assertLatestLogsAndAudit(t, srv, 499, "client_disconnected")
+	})
+
+	t.Run("header_wait_canceled_after_keepalive_responses", func(t *testing.T) {
+		started := make(chan struct{})
+		var startedOnce sync.Once
+		release := make(chan struct{})
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			startedOnce.Do(func() { close(started) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}))
+		defer up.Close()
+		defer close(release)
+
+		srv, tok := newMidStreamTestServer(t, up.URL, 0)
+		srv.Pipeline.SSEKeepaliveInitDelay = 15 * time.Millisecond
+		srv.Pipeline.SSEKeepaliveInterval = 15 * time.Millisecond
+
+		keepaliveSeen := make(chan struct{})
+		var kaOnce sync.Once
+		sw := newSyncStreamWriter(func(b []byte) {
+			if bytes.Contains(b, []byte(": keepalive")) {
+				kaOnce.Do(func() { close(keepaliveSeen) })
+			}
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://gatehouse.local/v1/responses",
+			bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"input":"hi"}`)))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			srv.HTTP.Handler.ServeHTTP(sw, req)
+		}()
+
+		<-started
+		<-keepaliveSeen
+		cancel()
+		<-done
+
+		body := sw.bodyString()
+		if !strings.Contains(body, ": keepalive") {
+			t.Fatalf("expected keepalive comment before cancel, got %q", body)
+		}
+		if strings.Contains(body, `"upstream_error"`) || strings.Contains(body, "response.failed") {
+			t.Fatalf("did not expect synthetic upstream failure frames on client cancel, got %q", body)
+		}
+		assertLatestLogsAndAudit(t, srv, 499, "client_disconnected")
+	})
+
+	t.Run("mid_stream_canceled", func(t *testing.T) {
+		firstSent := make(chan struct{})
+		var firstSentOnce sync.Once
+		release := make(chan struct{})
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			fl, _ := w.(http.Flusher)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"part1\"}}]}\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+			firstSentOnce.Do(func() { close(firstSent) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}))
+		defer up.Close()
+		defer close(release)
+
+		srv, tok := newMidStreamTestServer(t, up.URL, 0)
+		srv.Pipeline.SSEKeepaliveInitDelay = 0
+		srv.Pipeline.SSEKeepaliveInterval = 0
+
+		chunkSeen := make(chan struct{})
+		var cOnce sync.Once
+		sw := newSyncStreamWriter(func(b []byte) {
+			if bytes.Contains(b, []byte("part1")) {
+				cOnce.Do(func() { close(chunkSeen) })
+			}
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://gatehouse.local/v1/chat/completions",
+			bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			srv.HTTP.Handler.ServeHTTP(sw, req)
+		}()
+
+		<-firstSent
+		<-chunkSeen
+		cancel()
+		<-done
+
+		assertLatestLogsAndAudit(t, srv, 499, "client_disconnected")
+	})
+
+	t.Run("buffered_body_read_canceled", func(t *testing.T) {
+		bodyStarted := make(chan struct{})
+		var bodyStartedOnce sync.Once
+		release := make(chan struct{})
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			fl, _ := w.(http.Flusher)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"1"`)
+			if fl != nil {
+				fl.Flush()
+			}
+			bodyStartedOnce.Do(func() { close(bodyStarted) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}))
+		defer up.Close()
+		defer close(release)
+
+		srv, tok := newMidStreamTestServer(t, up.URL, 0)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://gatehouse.local/v1/chat/completions",
+			bytes.NewReader([]byte(`{"model":"p/m1","stream":false,"messages":[{"role":"user","content":"hi"}]}`)))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			srv.HTTP.Handler.ServeHTTP(rec, req)
+		}()
+
+		<-bodyStarted
+		cancel()
+		<-done
+
+		assertLatestLogsAndAudit(t, srv, 499, "client_disconnected")
+	})
+
+	t.Run("real_upstream_failures_stay_502", func(t *testing.T) {
+		// 1. Upstream premature EOF mid-stream -> 502 upstream_stream_interrupted.
+		eofSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			fl, _ := w.(http.Flusher)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+		}))
+		defer eofSrv.Close()
+
+		srvEOF, tokEOF := newMidStreamTestServer(t, eofSrv.URL, 0)
+		srvEOF.Pipeline.SSEKeepaliveInitDelay = 0
+		srvEOF.Pipeline.SSEKeepaliveInterval = 0
+		reqEOF, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions",
+			bytes.NewReader([]byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+		reqEOF.Header.Set("Authorization", "Bearer "+tokEOF)
+		reqEOF.Header.Set("Content-Type", "application/json")
+		recEOF := httptest.NewRecorder()
+		srvEOF.HTTP.Handler.ServeHTTP(recEOF, reqEOF)
+		assertLatestLogsAndAudit(t, srvEOF, 502, "upstream_stream_interrupted")
+
+		// 2. Upstream provider timeout (context.DeadlineExceeded, client ctx intact) -> 502 upstream_unavailable.
+		slowRelease := make(chan struct{})
+		slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-r.Context().Done():
+			case <-slowRelease:
+			}
+		}))
+		defer slowSrv.Close()
+		defer close(slowRelease)
+
+		dir := t.TempDir()
+		cfgRaw := fmt.Sprintf(`
+listen: 127.0.0.1:0
+mode: personal
+data_dir: %s
+providers:
+  - name: p
+    base_url: %s/v1
+    target: local
+    timeout: 50ms
+    models: [m1]
+default_group: main
+routing_groups:
+  main:
+    type: order
+    members: [p/m1]
+`, dir, slowSrv.URL)
+		cfgPath := filepath.Join(dir, "config.yaml")
+		if err := os.WriteFile(cfgPath, []byte(cfgRaw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Parse([]byte(cfgRaw), cfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srvTO, err := New(cfg, "test", slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srvTO.Shutdown(context.Background())
+		tokTO, _, err := srvTO.LocalToken()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqTO, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions",
+			bytes.NewReader([]byte(`{"model":"p/m1","stream":false,"messages":[{"role":"user","content":"hi"}]}`)))
+		reqTO.Header.Set("Authorization", "Bearer "+tokTO)
+		reqTO.Header.Set("Content-Type", "application/json")
+		recTO := httptest.NewRecorder()
+		srvTO.HTTP.Handler.ServeHTTP(recTO, reqTO)
+		if recTO.Code != http.StatusBadGateway {
+			t.Fatalf("expected 502 on upstream timeout, got %d body=%q", recTO.Code, recTO.Body.String())
+		}
+		assertLatestLogsAndAudit(t, srvTO, 502, "upstream_unavailable")
+
+		// 3. Upstream connection refused -> 502 upstream_unavailable.
+		srvEOF.Live.Current().Reg.MarkOK("p/m1")
+		eofSrv.Close()
+		reqConn, _ := http.NewRequest(http.MethodPost, "http://gatehouse.local/v1/chat/completions",
+			bytes.NewReader([]byte(`{"model":"p/m1","stream":false,"messages":[{"role":"user","content":"hi"}]}`)))
+		reqConn.Header.Set("Authorization", "Bearer "+tokEOF)
+		reqConn.Header.Set("Content-Type", "application/json")
+		recConn := httptest.NewRecorder()
+		srvEOF.HTTP.Handler.ServeHTTP(recConn, reqConn)
+		if recConn.Code != http.StatusBadGateway {
+			t.Fatalf("expected 502 on connection refused, got %d body=%q", recConn.Code, recConn.Body.String())
+		}
+		assertLatestLogsAndAudit(t, srvEOF, 502, "upstream_unavailable")
+	})
+}
