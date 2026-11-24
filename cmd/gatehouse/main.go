@@ -32,6 +32,7 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/keystore"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/logfmt"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/meter"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/oai"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/plugin"
@@ -149,7 +150,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo, ReplaceAttr: logfmt.ReplaceAttr}))
 	srv, err := api.New(cfg, version, log)
 	if err != nil {
 		return err
