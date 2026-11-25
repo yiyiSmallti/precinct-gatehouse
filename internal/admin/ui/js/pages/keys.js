@@ -44,6 +44,18 @@ const TOKEN_PRESETS = [
   { value: 100_000_000, label: '1 亿' },
 ];
 
+const TOKEN_UNITS = [
+  { mult: 10_000, label: '万' },
+  { mult: 1_000_000, label: '百万' },
+  { mult: 100_000_000, label: '亿' },
+];
+
+function splitCustomQuota(val) {
+  if (val % 100_000_000 === 0) return { amount: String(val / 100_000_000), mult: 100_000_000 };
+  if (val % 1_000_000 === 0) return { amount: String(val / 1_000_000), mult: 1_000_000 };
+  return { amount: String(+(val / 10_000).toFixed(4)), mult: 10_000 };
+}
+
 function fmtTokens(n) {
   const v = Number(n || 0);
   if (v >= 1e8) return `${+(v / 1e8).toFixed(2)} 亿`;
@@ -51,43 +63,80 @@ function fmtTokens(n) {
   return fmtNum(v);
 }
 
-// Option-style quota picker: preset chips plus a custom amount, so nobody has
-// to type raw token counts for the common cases.
+// Option-style quota picker: preset chips plus a custom amount with unit
+// selector (万 / 百万 / 亿), so nobody has to type raw token counts.
 function quotaPicker(label, hint, initial) {
   let value = Math.max(0, Number(initial || 0));
+  const isPreset = TOKEN_PRESETS.some((p) => p.value === value);
+  const initCustom = !isPreset && value > 0 ? splitCustomQuota(value) : { amount: '', mult: 10_000 };
+  let unitMult = initCustom.mult;
+
   const custom = el('input', {
     className: 'input num input-sm',
     type: 'number',
     min: 0,
-    step: 1000,
+    step: 'any',
     placeholder: '自定义数量',
-    value: TOKEN_PRESETS.some((p) => p.value === value) ? '' : String(value),
-    style: { width: '140px' },
+    value: initCustom.amount,
+    style: { width: '104px' },
   });
-  const chips = el('div', { className: 'quota-presets' });
-  const paint = () => {
-    clear(chips);
-    TOKEN_PRESETS.forEach((p) => {
-      chips.appendChild(el('button', {
-        type: 'button',
-        className: 'btn btn-sm',
-        'aria-pressed': p.value === value ? 'true' : 'false',
-        onClick: () => {
-          value = p.value;
-          custom.value = '';
-          paint();
-        },
-      }, p.label));
+
+  const unitSel = el('select', {
+    className: 'select input-sm quota-unit-select',
+    'aria-label': '自定义配额单位',
+  },
+    ...TOKEN_UNITS.map((u) =>
+      el('option', { value: String(u.mult), selected: u.mult === unitMult }, u.label)
+    )
+  );
+
+  const presetBtns = TOKEN_PRESETS.map((p) => ({
+    preset: p,
+    btn: el('button', {
+      type: 'button',
+      className: 'btn btn-sm',
+      'aria-pressed': !initCustom.amount && p.value === value ? 'true' : 'false',
+      onClick: () => {
+        value = p.value;
+        custom.value = '';
+        syncPressed();
+      },
+    }, p.label),
+  }));
+
+  function syncPressed() {
+    const hasCustom = custom.value.trim() !== '';
+    presetBtns.forEach(({ preset, btn }) => {
+      btn.setAttribute('aria-pressed', !hasCustom && preset.value === value ? 'true' : 'false');
     });
-    chips.appendChild(custom);
-  };
-  custom.addEventListener('input', () => {
-    const n = Math.trunc(Number(custom.value));
-    value = Number.isFinite(n) && n > 0 ? n : 0;
-    paint();
-    custom.focus();
+  }
+
+  function recalcFromCustom() {
+    const rawStr = custom.value.trim();
+    if (!rawStr) {
+      value = 0;
+    } else {
+      const raw = Number(rawStr);
+      value = Number.isFinite(raw) && raw > 0
+        ? Math.min(Number.MAX_SAFE_INTEGER, Math.round(raw * unitMult))
+        : 0;
+    }
+    syncPressed();
+  }
+
+  custom.addEventListener('input', recalcFromCustom);
+  unitSel.addEventListener('change', () => {
+    unitMult = Number(unitSel.value) || 10_000;
+    if (custom.value.trim() !== '') {
+      recalcFromCustom();
+    }
   });
-  paint();
+
+  const chips = el('div', { className: 'quota-presets' },
+    ...presetBtns.map((x) => x.btn),
+    el('div', { className: 'quota-custom-group' }, custom, unitSel)
+  );
+
   return {
     node: el('div', { className: 'field' },
       el('label', { className: 'field-label' }, label),

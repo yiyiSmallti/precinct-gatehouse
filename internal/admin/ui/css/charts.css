@@ -507,6 +507,20 @@
   color: var(--brass-text);
 }
 
+.quota-custom-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.quota-unit-select {
+  width: auto;
+  min-width: 64px;
+  height: 28px;
+  padding: 2px 8px;
+  font-size: var(--fs-12);
+}
+
 /* Onboarding */
 .onboard {
   display: grid;
