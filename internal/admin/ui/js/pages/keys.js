@@ -157,24 +157,46 @@ function showRenderedTemplateModal(keyInfo, text) {
   });
 }
 
+function cacheSessionSecret(keyInfo, plainKey) {
+  if (!keyInfo?.id || !plainKey) return;
+  sessionSecrets.set(keyInfo.id, {
+    key: plainKey,
+    prefix: keyInfo.key_prefix || plainKey.slice(0, 9),
+  });
+}
+
+function getCachedSessionSecret(keyObj) {
+  if (!keyObj?.id) return '';
+  const entry = sessionSecrets.get(keyObj.id);
+  if (!entry) return '';
+  if (keyObj.key_prefix && entry.prefix && entry.prefix !== keyObj.key_prefix) {
+    sessionSecrets.delete(keyObj.id);
+    return '';
+  }
+  return entry.key;
+}
+
 async function copyKeyConfig(keyObj, triggerBtn = null, knownPlain = '') {
   if (triggerBtn) triggerBtn.disabled = true;
   try {
     await branding.ensureSettingsLoaded().catch(() => {});
-    let plainKey = knownPlain || (keyObj?.id ? sessionSecrets.get(keyObj.id) || '' : '');
+    let plainKey = knownPlain || '';
     let isPlaceholder = false;
     if (!plainKey && keyObj?.id && keyObj?.has_secret) {
       try {
         const res = await api.getKeySecret(keyObj.id);
         if (res?.has_secret && res.key) {
           plainKey = res.key;
-          sessionSecrets.set(keyObj.id, plainKey);
+          cacheSessionSecret(keyObj, plainKey);
         }
       } catch (e) {
         if (e.status !== 401) {
           toast(`读取密钥明文失败，已回退占位符: ${e.message}`, 'warn');
         }
       }
+    }
+    if (!plainKey) {
+      plainKey = getCachedSessionSecret(keyObj);
     }
     if (!plainKey) {
       isPlaceholder = true;
@@ -255,9 +277,7 @@ export function normalizeKeyScopes(models, groups, raw = {}) {
 }
 
 function showSecretModal(plainKey, keyInfo) {
-  if (keyInfo?.id && plainKey) {
-    sessionSecrets.set(keyInfo.id, plainKey);
-  }
+  cacheSessionSecret(keyInfo, plainKey);
   openModal({
     title: '访问密钥已签发',
     body: el('div', { style: { display: 'flex', flexDirection: 'column', gap: '12px' } },

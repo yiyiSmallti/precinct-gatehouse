@@ -347,6 +347,7 @@ export function renderBranding(container) {
           draftPublicUrl = res.public_url || '';
           draftTemplate = res.dist_template || DEFAULT_DIST_TEMPLATE;
           branding.applyUpdate(res);
+          savingTemplate = false;
           toast('分发配置模板已保存', 'ok');
           paint();
         } catch (e) {

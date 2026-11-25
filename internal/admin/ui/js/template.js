@@ -31,8 +31,15 @@ export ANTHROPIC_API_KEY="{{API_KEY}}"
 
 3. Codex CLI（OpenAI Responses）
 # ~/.codex/config.toml
+model_provider = "gatehouse"
+model = "{{DEFAULT_MODEL}}"
+
+[model_providers.gatehouse]
+name = "{{DISPLAY_NAME}}"
 base_url = "{{OPENAI_BASE_URL}}"
 wire_api = "responses"
+env_key = "OPENAI_API_KEY"
+
 # 环境变量
 export OPENAI_API_KEY="{{API_KEY}}"`;
 
