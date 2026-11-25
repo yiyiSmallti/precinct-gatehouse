@@ -26,12 +26,15 @@ func Unavailable(name string) func(context.Context, []byte) (*http.Response, err
 // ProviderChat adapts a provider plugin to provider.Provider's Chat: the
 // streamed messages become an *http.Response body. timeout bounds the whole
 // call, like providers[].timeout does for HTTP providers.
+// The plugin's current process is looked up on every call, so a restarted
+// plugin is used as soon as it is back.
 func ProviderChat(s *Started, timeout time.Duration) func(context.Context, []byte) (*http.Response, error) {
-	pc := s.Impl.(*sdk.ProviderClient)
 	return func(ctx context.Context, body []byte) (*http.Response, error) {
-		if s.Exited() {
-			return nil, &provider.UpstreamError{Err: fmt.Errorf("provider plugin %s exited", s.Name), Retryable: true}
+		raw, ok := s.Impl()
+		if !ok {
+			return nil, &provider.UpstreamError{Err: fmt.Errorf("provider plugin %s is not running", s.Name), Retryable: true}
 		}
+		pc := raw.(*sdk.ProviderClient)
 		var head struct {
 			Model string `json:"model"`
 		}
@@ -108,4 +111,23 @@ func grpcUpstream(ctx context.Context, err error) error {
 	}
 	// only the status code: plugin error text may echo the request
 	return &provider.UpstreamError{Err: fmt.Errorf("provider plugin: %s", st.Code()), Retryable: true}
+}
+
+// AuditSink adapts an AuditSink plugin to the audit forwarder. While the
+// plugin is not running, writes fail and the forwarder keeps the batch queued
+// and retries with backoff.
+func AuditSink(s *Started) interface {
+	Write(ctx context.Context, records [][]byte) (int, error)
+} {
+	return auditSink{s}
+}
+
+type auditSink struct{ s *Started }
+
+func (a auditSink) Write(ctx context.Context, records [][]byte) (int, error) {
+	raw, ok := a.s.Impl()
+	if !ok {
+		return 0, fmt.Errorf("audit sink plugin %s is not running", a.s.Name)
+	}
+	return raw.(sdk.AuditSink).Write(ctx, records)
 }

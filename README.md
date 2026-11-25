@@ -199,6 +199,7 @@ redaction:
   mode_by_target:
     local: off                    # 纯内网自建模型关闭脱敏扫描
     external: mask
+  # vault_persist: true           # 可选：占位符对照表加密（AES-256-GCM）落盘到 gatehouse.db，重启 / 热升级后仍可回填；默认关闭
 ```
 
 ---
@@ -216,7 +217,7 @@ redaction:
 
 ## `org` 模式
 
-`mode: org` 时令牌交给 `auth_policy` 插件解析（租户、用户、部门、数据分级、允许的路由组、预算），插件不可用时对所有请求返回 `503`。最小配置示例：
+`mode: org` 时令牌交给 `auth_policy` 插件解析（租户、用户、部门、数据分级、允许的路由组、预算），插件不可用时对所有请求返回 `503`。插件进程崩溃后由 supervisor 按 1 s 起、上限 30 s 的指数退避自动重启，窗口内仍返回 `503`；各插件状态与重启次数见 `/healthz` 的 `plugins`。最小配置示例：
 
 ```yaml
 mode: org
@@ -238,6 +239,6 @@ plugins:
 | 阶段 | 已实现能力 |
 | --- | --- |
 | **首期（MVP）** | `G1` 路由组与意图路由 · `G2` 脱敏与回填 · `G3` fail-closed · `G4` 短时效令牌 · `G5` `org` 模式与五类插件扩展点 · `G6` 计量与 OTLP 导出 |
-| **扩展能力** | `G7` 多 `sk-` API Key 与次数限额 · `G8` Anthropic / Responses 协议适配 · `G9` Web 控制面板 · `G10` 在线配置热重载 · `G11` New-API 密钥/用量兼容迁移 · `G12` 内置智能分层路由 |
+| **扩展能力** | `G7` 多 `sk-` API Key 与次数限额 · `G8` Anthropic / Responses 协议适配 · `G9` Web 控制面板 · `G10` 在线配置热重载 · `G11` New-API 密钥/用量兼容迁移 · `G12` 内置智能分层路由 · `G16` Vault 加密落盘 · `G17` 插件崩溃自动重启 |
 
 参考实现：magpie（路由组、意图路由、Privacy masking） · 许可：MIT

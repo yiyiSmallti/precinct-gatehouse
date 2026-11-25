@@ -14,11 +14,12 @@ import (
 // HookTimeout bounds one hook call.
 const HookTimeout = 5 * time.Second
 
-// Hook is a running Hooks plugin.
+// Hook is a Hooks plugin. Current returns its running implementation, or
+// false while the plugin process is down (it is looked up per call so a
+// restarted plugin is picked up).
 type Hook struct {
-	Name   string
-	Impl   sdk.Hooks
-	Exited func() bool
+	Name    string
+	Current func() (sdk.Hooks, bool)
 }
 
 func (p *Pipeline) hookCtx(st *reqState, dataClass string) *sdk.HookContext {
@@ -35,11 +36,12 @@ func (p *Pipeline) hookCtx(st *reqState, dataClass string) *sdk.HookContext {
 // rejected with 500.
 func (p *Pipeline) runRequestHooks(ctx context.Context, st *reqState, req oai.Object, dataClass string) error {
 	for _, h := range p.Hooks {
-		if h.Exited() {
+		impl, ok := h.Current()
+		if !ok {
 			return oai.Errorf(http.StatusServiceUnavailable, "hook_unavailable", "hook plugin %s is not running", h.Name)
 		}
 		cctx, cancel := context.WithTimeout(ctx, HookTimeout)
-		res, err := h.Impl.OnRequest(cctx, &sdk.HookRequest{Ctx: p.hookCtx(st, dataClass), Body: oai.Encode(req)})
+		res, err := impl.OnRequest(cctx, &sdk.HookRequest{Ctx: p.hookCtx(st, dataClass), Body: oai.Encode(req)})
 		cancel()
 		if err != nil {
 			return oai.Errorf(http.StatusServiceUnavailable, "hook_failed", "hook plugin %s failed", h.Name)
@@ -75,11 +77,12 @@ func (p *Pipeline) runResponseHooks(hc *sdk.HookContext, body []byte, status int
 		return
 	}
 	for _, h := range p.Hooks {
-		if h.Exited() {
+		impl, ok := h.Current()
+		if !ok {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), HookTimeout)
-		if err := h.Impl.OnResponse(ctx, &sdk.HookResponse{Ctx: hc, Body: body, Status: int32(status)}); err != nil {
+		if err := impl.OnResponse(ctx, &sdk.HookResponse{Ctx: hc, Body: body, Status: int32(status)}); err != nil {
 			p.Log.Warn("response hook failed", "hook", h.Name, "err", fmt.Sprint(err))
 		}
 		cancel()

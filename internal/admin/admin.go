@@ -1108,6 +1108,7 @@ func (s *Server) redactionInfo(w http.ResponseWriter, _ *http.Request, _ string)
 		"fail_closed":           rc.FailClosedOn(),
 		"strip_fields":          stripFields,
 		"vault_ttl":             rc.VaultTTL.D(24 * time.Hour).String(),
+		"vault_persist":         rc.VaultPersistOn(),
 		"providers":             provs,
 		"stats_24h":             stats,
 	})

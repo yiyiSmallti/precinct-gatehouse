@@ -1,9 +1,11 @@
 // Command fakedetector is a detector plugin for the end-to-end tests. It
 // reports PERSON for a fixed list of names, the way a NER plugin would.
+// Text containing "#crash-detector" makes the process exit (G17).
 package main
 
 import (
 	"context"
+	"os"
 	"strings"
 	"unicode/utf8"
 
@@ -15,6 +17,9 @@ var names = []string{"张三", "李四", "王五"}
 type det struct{}
 
 func (det) Detect(_ context.Context, text, _ string, _ map[string]string) ([]plugin.Finding, error) {
+	if strings.Contains(text, "#crash-detector") {
+		os.Exit(3)
+	}
 	var out []plugin.Finding
 	for _, n := range names {
 		for off := 0; ; {

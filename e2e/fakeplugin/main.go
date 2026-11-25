@@ -4,9 +4,11 @@
 //	fakeplugin policy <tokens.json>  AuthPolicy: token -> context from the file;
 //	                                 "deny" -> 401, "forbid" -> 403, "crash" exits the process
 //	fakeplugin audit <out.jsonl>     AuditSink: appends every record to the file
-//	fakeplugin provider              Provider: echoes the last user message, JSON or SSE
+//	fakeplugin provider              Provider: echoes the last user message, JSON or SSE;
+//	                                 "#crash-provider" in it exits the process
 //	fakeplugin hooks                 Hooks: appends " [hooked]" to the last user message;
-//	                                 "#hookmodel" in it makes the hook (illegally) change the model
+//	                                 "#hookmodel" in it makes the hook (illegally) change the model,
+//	                                 "#crash-hook" exits the process
 package main
 
 import (
@@ -127,6 +129,9 @@ func (provider) Chat(_ context.Context, r *plugin.ChatRequest, send func(*plugin
 	if err := json.Unmarshal(r.Body, &body); err != nil {
 		return send(&plugin.ChatResponse{Status: 400, Data: []byte(`{"error":{"message":"bad json"}}`)})
 	}
+	if strings.Contains(lastUser(body), "#crash-provider") {
+		os.Exit(3)
+	}
 	content := fmt.Sprintf("[plugin/%s] %s", r.Model, lastUser(body))
 	usage := map[string]any{"prompt_tokens": len(r.Body) / 10, "completion_tokens": len(content) / 4, "total_tokens": len(r.Body)/10 + len(content)/4}
 	if s, _ := body["stream"].(bool); s {
@@ -167,6 +172,9 @@ func (hooks) OnRequest(_ context.Context, r *plugin.HookRequest) (*plugin.HookRe
 		m, _ := ms[i].(map[string]any)
 		if m["role"] == "user" {
 			s, _ := m["content"].(string)
+			if strings.Contains(s, "#crash-hook") {
+				os.Exit(3)
+			}
 			if strings.Contains(s, "#hookmodel") {
 				body["model"] = "local/b"
 			}

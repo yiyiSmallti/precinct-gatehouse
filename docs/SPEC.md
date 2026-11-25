@@ -49,7 +49,7 @@ e2e/                       假提供方、假策略插件、报告模板
 ### 3.2 占位符与 Vault
 
 - **占位符格式**：`{{<KIND>_<8 位哈希>}}`，哈希 = `HMAC(user_key, normalized_value)` 截断；`user_key` 由租户与用户 ID 派生，`personal` 模式为本机随机密钥。
-- **Vault 存储**：内存 map（key: `tenant + user + session`），TTL 跟随会话标签，默认 24 h 无活动清除；可选 SQLite 加密落盘以支持重启后回填。
+- **Vault 存储**：内存 map（key: `tenant + user + session`），TTL 跟随会话标签，默认 24 h 无活动清除；`redaction.vault_persist: true` 时同时加密写入 SQLite，重启和 FD 热切换之后仍能回填（见 3.7）。
 - **回填范围**：按占位符正则扫描，容忍花括号内空白与大小写；覆盖 `choices[].message.content`、`tool_calls[].function.arguments`（JSON 字符串内替换后校验仍为合法 JSON）与 `thinking` 字段。
 - **增量检测**：多轮请求对历史消息复用上次检测结果（按消息哈希缓存），仅扫描新增消息。
 
@@ -141,8 +141,8 @@ redaction:
 
 | 扩展点 | RPC | 宿主行为 |
 | --- | --- | --- |
-| **Detector**<br>(`detector.proto`) | `Detect(text, lang, hints) → findings{kind, start, end, confidence}`（偏移为 Unicode 码点，`end` 不含） | `redaction.detectors` 列出必需检测器：禁用、启动失败或进程退出时，需要脱敏（`mask/warn/block`）的请求返回 `503`，`audit` 模式仅记告警 |
-| **AuthPolicy**<br>(`policy.proto`) | `Resolve(token, request_meta{model, route_group, client_ip, request_id, source}) → GatewayContext` | 仅 `org` 模式使用且必须恰好一个。字段与 Cloister `gateway-context.schema.json` 一一对应（`expires_at` 改为 `expires_at_unix`，预算用 `has_*` 区分 `0` 与不限）。gRPC `UNAUTHENTICATED` → `401 invalid_token`，`PERMISSION_DENIED` → `403 policy_denied`，其余错误、超时（`org.policy_timeout`，默认 3 s）或进程不在 → `503 policy_unavailable`。上下文按 `(令牌, 请求模型, 路由组)` 缓存，至多 `org.policy_cache`（默认 5 s）且不超过 `expires_at`；插件进程不在时不用缓存（fail-closed） |
+| **Detector**<br>(`detector.proto`) | `Detect(text, lang, hints) → findings{kind, start, end, confidence}`（偏移为 Unicode 码点，`end` 不含） | `redaction.detectors` 列出必需检测器：禁用时，或启动失败、进程退出后自动重启完成前，需要脱敏（`mask/warn/block`）的请求返回 `503`，`audit` 模式仅记告警 |
+| **AuthPolicy**<br>(`policy.proto`) | `Resolve(token, request_meta{model, route_group, client_ip, request_id, source}) → GatewayContext` | 仅 `org` 模式使用且必须恰好一个。字段与 Cloister `gateway-context.schema.json` 一一对应（`expires_at` 改为 `expires_at_unix`，预算用 `has_*` 区分 `0` 与不限）。gRPC `UNAUTHENTICATED` → `401 invalid_token`，`PERMISSION_DENIED` → `403 policy_denied`，其余错误、超时（`org.policy_timeout`，默认 3 s）或进程不在（含自动重启窗口）→ `503 policy_unavailable`。上下文按 `(令牌, 请求模型, 路由组)` 缓存，至多 `org.policy_cache`（默认 5 s）且不超过 `expires_at`；插件进程不在时不用缓存（fail-closed） |
 | **AuditSink**<br>(`audit.proto`) | `Write(records_json[]) → accepted` | 每条审计记录先写本地 JSONL 文件（内置始终开启），再入队异步批量发往各 AuditSink 插件（每批至多 200 条）；失败指数退避重试，队列上限 10,000 条，溢出丢最旧并告警。记录以 `request_id` 唯一去重 |
 | **Provider**<br>(`provider.proto`) | `Chat(model, body) → stream {status, content_type, data}` | `providers[].plugin: <名字>` 代替 `base_url`。首条消息带状态码与类型；JSON 一次返回，SSE 分多条。插件不在或 gRPC 失败按可重试上游错误处理（触发故障转移），错误信息仅记状态码 |
 | **Hooks**<br>(`hooks.proto`) | `OnRequest(ctx, body) → body'`<br>`OnResponse(ctx, body, status)` | `OnRequest` 在策略之后、路由之前按序执行，可改写请求但不可改 `model`、`stream`、`tools`（违规返回 `500 hook_invalid`）；插件不在或报错返回 `503`。`OnResponse` 只读，在缓冲响应回填后异步调用。钩子在脱敏前运行、可见明文，仅安装可信钩子 |
@@ -168,6 +168,15 @@ redaction:
 - **路由与请求增强**：支持 `max_body_mb` 配置（`0` 为不限）、移除 `ght1.` 令牌 `MaxTokens` 整请求串行锁、支持 `model_aliases` 别名映射、provider 级 `system_prompt` 拼接与 `extra_body` 合并、`cached_tokens` 与 `ttft_ms` 统计。
 - **内嵌 Web 控制面板与管理 API**：`admin.listen`，提供 PBKDF2 密码哈希、Cookie 会话、`X-Gatehouse-Admin` CSRF 校验与密码修改。
 - **配置热重载与全量在线配置管理**：基于快照句柄的原子切换（`internal/live`，在途请求绑定进入时快照不受影响），支持渠道/路由与别名/脱敏/常规参数分节保存（带 `base_hash` 乐观锁冲突检测）、原始 YAML 编辑与语法校验、外部文件监听与 `SIGHUP` 自动重载、`<data_dir>/config-history/` 最多 30 份历史备份与逐行 Diff 回滚、`db:<name>` 上游密钥数据库存储、`providers/test` 连通探测及 `/admin/api/flow` 门禁流统计；其中 `listen`、`mode`、`data_dir`、`admin.*`、`meter.*`、`audit.*`、`org.*`、`plugins.*` 等启动基础设施字段修改后返回 `restart_required` 提示需重启生效，且 Web 写回 YAML 会剥离手写注释。
+- **Vault 加密落盘（`redaction.vault_persist`，默认 `false`）**：开启后占位符对照表写穿（write-through）到 `<data_dir>/gatehouse.db` 的 `vault_buckets` / `vault_entries` 表，内存未命中时回查磁盘，因此重启后、以及 FD 热切换期间新旧两个进程共用同一库时，都能回填对方或重启前写入的占位符。
+  - **加密**：值为 AES-256-GCM 密文（随机 nonce，AAD 绑定桶与占位符）；桶 id 为会话键的 HMAC，库里不存用户、会话或任何明文。两把密钥都由 `<data_dir>/user.key`（本机 32 字节随机密钥，0600）经 HMAC 域分离派生，不新增密钥文件。占位符哈希同样用 `user.key`，它跨重启不变，所以同一值在重启前后得到同一占位符。
+  - **过期**：沿用 `redaction.vault_ttl`（默认 24 h 无活动）。活动时间写入 `vault_buckets.seen_at`（至多每 `min(1 min, ttl/4)` 更新一次），后台清扫和桶重新打开时都按磁盘上的活动时间删除过期行，两个进程看到同一份时间。
+  - **并发**：复用 `store.Open` 的 WAL + `busy_timeout`；落盘语句全部是单条自动提交语句（不用"先读后写"事务，避免另一进程提交后出现 `SQLITE_BUSY_SNAPSHOT`），并由触发器保证每条对照都有桶记录。落盘失败只记告警、不影响当次请求（对照仍在内存）。
+  - **默认关闭的理由**：开启后敏感值会以密文形式长期留在磁盘上，而解密密钥 `user.key` 与数据库在同一目录，加密主要防的是单独拷走、备份或误传数据库文件，挡不住拿到整个 `data_dir` 的人；是否接受这一点由部署方决定。修改该项返回 `restart_required`。验收见 `e2e/g16_vault_persist_test.go`（`e2e/report/G16-vault-persist.md`）。
+- **插件崩溃自动重启**：每个启用的插件由一个 supervisor 监控（含启动即失败的插件），进程退出后按指数退避重启（1 s 起、翻倍、上限 30 s；稳定运行满 30 s 后回到 1 s），成功后原子替换 go-plugin client 与实现。策略解析、检测器、Hooks、Provider 与 AuditSink 每次调用都经 `Started.Impl()` 取当前实例，不缓存旧实例。
+  - **重启窗口**：保持 fail-closed。需要脱敏的请求返回 `503 redaction_unavailable`；`org` 模式返回 `503 policy_unavailable`，且不使用策略缓存；Hooks 返回 `503 hook_unavailable`；Provider 按可重试上游错误处理（触发故障转移）；AuditSink 记录留在队列里按退避重试。
+  - **状态**：重启事件写日志（`plugin process exited; restarting` / `plugin restarted` / `plugin restart failed`）。`/healthz` 新增 `plugins[]{name, kind, state(running|restarting|stopped), restarts, last_exit, last_error}`；有插件不在运行时 `status` 为 `degraded`，必需检测器同时列入 `detectors_unavailable`。
+  - **关停与交接**：网关关停和 FD 热切换交接一开始就停止所有 supervisor（在途请求仍可使用正在运行的插件），随后 `Host.Close` 杀掉全部子进程，并等待正在进行的重启结束后再杀掉，不留孤儿进程。`plugins.*` 修改仍返回 `restart_required`，supervisor 不处理配置变更。验收见 `e2e/g17_plugin_restart_test.go`（`e2e/report/G17-plugin-restart.md`）。
 - **内置智能分层路由（`providers[].tiered`）**：
   - **配置 Schema**：`mode`（`shadow` | `active`）、`heavy_miss_threshold`、`health_interval_sec`、`zh_think_anchor`、`backends[]`（`id`, `url`, `tier`, `max_context_tokens`, `max_safe_input`, `promote_at`, `demote_below`, `speed_score`）、`starter_cache`（`enabled`, `canonicalize_tools`, `min_tokens`, `max_tokens`, `min_hits`, `max_entries`, `keepalive_sec`, `check_interval_sec`, `startup_delay_sec`, `entry_ttl_hours`, `persist_path`）。`shadow` 模式要求保留非空 `base_url`；`active` 模式可省略 `base_url`。
   - **运行模式与热重载**：`internal/tiered.Hub` 按 provider 名称维护常驻 `Router` 实例；`buildSnapshot`（含配置校验/预览）无副作用，`live.Manager.OnSwap` 仅在真实快照切换时调用 `Hub.Activate` 原地更新后端与 Starter 参数，完整保留内存前缀缓存、会话滞回表及后台探测协程；响应传播 `X-Router-*` 头并在 SQLite `request_log` 写入 `route_backend` / `route_reason`。
@@ -175,7 +184,7 @@ redaction:
 
 #### 尚未实现或受限项
 
-- Vault 加密落盘、多轮增量检测缓存、NER 模块（M5）、插件进程崩溃后自动重启（当前需重启 Gatehouse）、插件包（`.tgz` + `gatehouse` 字段）安装命令。
+- 多轮增量检测缓存、NER 模块（M5）、插件包（`.tgz` + `gatehouse` 字段）安装命令。
 - Gemini 原生协议互转；OpenAI Responses 的 `previous_response_id` 有状态续聊（返回 `400 previous_response_not_supported`）；Responses 中 `web_search`、`custom` 等非 `function` 内置工具会被丢弃并在 `X-Gatehouse-Dropped-Tools` 响应头中列出。
 - `org` 模式暂不使用 `byo_api` 与策略下发的 `redaction` 段（脱敏仍按本机配置）；`budget.period` 仅透传不解释；`sk-` API Key 仅限 `personal` 模式使用。
 - 外部目标含图请求归类为 `image`，默认动作同其他类别（`mask` 模式下视为 `warn`，原样发出并告警），可配置 `image: block`。
