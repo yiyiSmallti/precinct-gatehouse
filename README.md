@@ -200,7 +200,7 @@ redaction:
     local: off                    # 纯内网自建模型关闭脱敏扫描
     external: mask
   # vault_persist: true           # 可选：占位符对照表加密（AES-256-GCM）落盘到 gatehouse.db，重启 / 热升级后仍可回填；默认关闭
-  # sources:                      # 可选：按检测器插件调整（模型类 NER 检测器建议如下）
+  # sources:                      # 可选：按检测器插件调整（NER 插件见 plugins/astrlink-detector/README.md）
   #   ner:
   #     min_confidence: { default: 0.8, person: 0.9, date: 0.9, account: 0.7 }
   #     max_action: mask            # NER 结果最多脱敏、不拦截；先用 audit 影子运行观察误报

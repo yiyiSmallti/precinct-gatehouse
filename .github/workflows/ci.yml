@@ -29,6 +29,18 @@ jobs:
             GOOS=${t%/*} GOARCH=${t#*/} go build -trimpath -ldflags "-s -w" -o /dev/null ./cmd/gatehouse
             echo "built $t"
           done
+      - name: NER plugin (cgo, linux/amd64; G19 needs the model and runs locally)
+        working-directory: plugins/astrlink-detector
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go vet ./...
+          go build -trimpath -ldflags "-s -w" -o astrlink-detector-linux-amd64 .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: astrlink-detector-linux-amd64
+          path: plugins/astrlink-detector/astrlink-detector-linux-amd64
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         if: always()
         with:

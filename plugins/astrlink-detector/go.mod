@@ -1,0 +1,29 @@
+module github.com/yiyiSmallti/precinct-gatehouse/plugins/astrlink-detector
+
+go 1.26.0
+
+require github.com/rivo/uniseg v0.4.7
+
+require (
+	github.com/yalue/onnxruntime_go v1.31.0
+	github.com/yiyiSmallti/precinct-gatehouse v0.0.0-00010101000000-000000000000
+)
+
+require (
+	github.com/fatih/color v1.13.0 // indirect
+	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/hashicorp/go-hclog v1.6.3 // indirect
+	github.com/hashicorp/go-plugin v1.8.0 // indirect
+	github.com/hashicorp/yamux v0.1.2 // indirect
+	github.com/mattn/go-colorable v0.1.12 // indirect
+	github.com/mattn/go-isatty v0.0.24 // indirect
+	github.com/oklog/run v1.1.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260928230214-8a89bd6388cc // indirect
+	google.golang.org/grpc v1.85.0 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
+)
+
+replace github.com/yiyiSmallti/precinct-gatehouse => ../..

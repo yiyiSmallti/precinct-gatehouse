@@ -1,0 +1,2652 @@
+{
+ "examples": {
+  "full": [
+   "FP | pos-private_person-zh-01 | private_date | 0.889 | 麻烦把报销单转给财务的汪海燕，她【今天下午】在。",
+   "FP | pos-private_person-zh-13 | private_date | 0.886 | 麻烦把报销单转给财务的严佳琪，她【今天下午】在。",
+   "FP | pos-private_person-zh-25 | private_date | 0.900 | 麻烦把报销单转给财务的龙春梅，她【今天下午】在。",
+   "FP | pos-private_person-en-03 | private_date | 0.945 |  interned with us 【last summer】.",
+   "FP | pos-private_person-en-15 | private_date | 0.941 |  interned with us 【last summer】.",
+   "FP | pos-private_person-en-27 | private_date | 0.943 |  interned with us 【last summer】.",
+   "FP | pos-private_address-zh-02 | private_date | 0.885 | 我【下个月】搬到重庆市渝北区梧桐大道670号青松",
+   "FP | pos-private_address-zh-14 | private_date | 0.867 | 我【下个月】搬到武汉市洪山区长青中路217号，帮",
+   "FP | pos-private_address-zh-26 | private_date | 0.918 | 我【下个月】搬到厦门市思明区梧桐北路892号翠微",
+   "FP | pos-private_address-mixed-07 | private_date | 0.941 | 0号长青华庭16栋6单元1806室 【next month】, 帮我做个 checklist。",
+   "FP | pos-private_address-mixed-19 | private_date | 0.900 | to 广州市天河区望湖北路252号 【next month】, 帮我做个 checklist。",
+   "FP | pos-private_address-mixed-31 | private_date | 0.847 | to 杭州市西湖区星河北路377号 【next month】, 帮我做个 checklist。",
+   "FP | pos-account-en-25 | common_secret | 0.889 | Add me on WeChat: 【li8ciqvhcqr】.",
+   "FP | pos-account-mixed-19 | common_secret | 0.811 | t password for 用户 【lucastiger90】，他忘记了。",
+   "FP | pos-account-mixed-31 | common_secret | 0.972 | t password for 用户 【harbor_t5756】，他忘记了。",
+   "FP | pos-common_secret-en-10 | account | 0.843 | :⏎```bash⏎curl -u 【admin】:xnwp-8meAts-RCDC-",
+   "FP | pos-common_secret-en-10 | url | 0.997 | -RCDC-p63Jz-IMh3u 【https://staging.example.test/health】⏎```⏎and got 401.",
+   "FP | pos-common_secret-en-22 | account | 0.807 | :⏎```bash⏎curl -u 【admin】:dUKdE-yEEB-v3pxtM",
+   "FP | pos-common_secret-en-22 | url | 0.996 | yEEB-v3pxtM-CgnHy 【https://staging.example.test/health】⏎```⏎and got 401.",
+   "FP | pos-private_date-en-00 | private_date | 0.827 | I was born 【on】 Aug 1, 1984; how ",
+   "FP | pos-private_date-en-00 | private_date | 0.957 | how old will I be 【next year】?",
+   "FP | pos-private_date-en-12 | private_date | 0.948 | how old will I be 【next year】?",
+   "FP | pos-private_date-en-24 | private_date | 0.952 | how old will I be 【next year】?",
+   "FP | neg-en-005 | ip_address | 0.994 | er listening addr=【127.0.0.1】:8080 mode=persona",
+   "FP | neg-en-025 | private_person | 0.883 | Compare 【Hugo】, Gatsby and Astro",
+   "FP | neg-en-048 | ip_address | 0.994 | nect ECONNREFUSED 【127.0.0.1】:8443⏎    at TCPCo",
+   "FP | neg-zh-003 | ip_address | 0.993 | 47Z INFO  启动完成 监听 【127.0.0.1】:3000⏎2026-09-22T0",
+   "FP | neg-zh-005 | private_person | 0.922 | 李代数和【李】群在机器人姿态估计里分别起什么作用？",
+   "FP | neg-zh-035 | private_person | 0.842 | 【王】者荣耀的匹配机制是怎么设计的？从分布",
+   "FP | neg-zh-035 | private_person | 0.879 | 王者【荣耀】的匹配机制是怎么设计的？从分布式系统",
+   "FP | neg-zh-036 | private_person | 0.872 | 【江湖】上说 Rust 的所有权很难学，给我",
+   "FP | neg-zh-048 | ip_address | 0.985 | nect ECONNREFUSED 【127.0.0.1】:9090⏎```⏎本地 Redis",
+   "FP | req-002 | ip_address | 0.994 | er listening addr=【127.0.0.1】:5432 mode=persona",
+   "FP | req-003 | ip_address | 0.994 | er listening addr=【127.0.0.1】:3000 mode=persona",
+   "FP | req-005 | ip_address | 0.990 | nect ECONNREFUSED 【127.0.0.1】:3000⏎```⏎本地 Redis",
+   "FP | req-015 | ip_address | 0.994 | er listening addr=【127.0.0.1】:7788 mode=persona",
+   "FP | req-022 | ip_address | 0.994 | er listening addr=【127.0.0.1】:3000 mode=persona",
+   "FN | pos-private_person-zh-07 | private_person | 帮我润色一下：尊敬的【诸葛敏】老师，您好，我是您去年带过的学生。 | private_person 0.57「诸葛敏老师」",
+   "FN | pos-private_person-zh-19 | private_person | 帮我润色一下：尊敬的【任振华】老师，您好，我是您去年带过的学生。 | private_person 0.59「任振华老师」",
+   "FN | pos-private_person-zh-31 | private_person | 帮我润色一下：尊敬的【范敏】老师，您好，我是您去年带过的学生。 | private_person 0.67「范敏老师」",
+   "FN | pos-private_person-mixed-00 | private_person | 这个 PR 是 【Zheng Fang】 提的，帮我 review 一下 e | account 0.51「Zheng」",
+   "FN | pos-private_person-mixed-06 | private_person | am 新来了一个 intern 叫 【Zhiqiang Xie】，帮我写个欢迎词。 | account 0.62「Zhiqiang」; private_person 0.67「Xie」",
+   "FN | pos-private_person-mixed-12 | private_person | 这个 PR 是 【Min Cao】 提的，帮我 review 一下 e | ",
+   "FN | pos-account-zh-04 | account | 会员卡号【4648 4937 5009】，积分怎么一直没到账？ | account 0.49「4648」; account 0.50「4937」; payment_card 0.50「5009」",
+   "FN | pos-account-zh-28 | account | 会员卡号【9779 5461 4889】，积分怎么一直没到账？ | account 0.76「9779 5461 4889」",
+   "FN | pos-account-zh-30 | private_person | 【高强】的微信号是wxid_oj8bnz31 | private_person 0.65「高强」",
+   "FN | pos-account-en-01 | account | Add me on WeChat: 【wxid_kvi9fav8id8lcc】. | common_secret 0.51「wxid_kvi9fav8id8lcc」",
+   "FN | pos-account-en-05 | account | lores's handle is 【paultiger14】; tag him in the r | account 0.41「paultiger14」",
+   "FN | pos-account-en-25 | account | Add me on WeChat: 【li8ciqvhcqr】. | common_secret 0.89「li8ciqvhcqr」",
+   "FN | pos-account-mixed-01 | account | WeChat 加我 【j8rvyhrz3】，有 update 就发我。 | account 0.57「j8rvyhrz3」",
+   "FN | pos-account-mixed-06 | account | 付冬雪 的 handle 是 【min.sun91】，在 Slack 里 @ 一下。 | ",
+   "FN | pos-account-mixed-07 | account | t password for 用户 【meganharbor19】，他忘记了。 | account 0.71「meganharbor19」",
+   "FN | pos-account-mixed-10 | account | `json⏎{\"wechat\": \"【n10txd】\"}⏎```⏎validate 一下 | ",
+   "FN | pos-account-mixed-13 | account | WeChat 加我 【wxid_v04zolj5fq0rq9】，有 update 就发我。 | account 0.48「wxid_v04zolj5fq0rq9」",
+   "FN | pos-account-mixed-14 | account | My 工号 is 【1497960】，HR 系统里查不到。 | account 0.79「1497960」",
+   "FN | pos-account-mixed-18 | account | 史平 的 handle 是 【matthew_copper7】，在 Slack 里 @ 一下。 | common_secret 0.50「matthew_copper7」",
+   "FN | pos-account-mixed-19 | account | t password for 用户 【lucastiger90】，他忘记了。 | common_secret 0.81「lucastiger90」",
+   "FN | pos-account-mixed-22 | account | `json⏎{\"wechat\": \"【ku-4fj】\"}⏎```⏎validate 一下 | ",
+   "FN | pos-account-mixed-30 | account | 陶敏 的 handle 是 【ashley_lunar96】，在 Slack 里 @ 一下。 | account 0.78「ashley_lunar96」",
+   "FN | pos-account-mixed-31 | account | t password for 用户 【harbor_t5756】，他忘记了。 | common_secret 0.97「harbor_t5756」",
+   "FN | pos-common_secret-zh-01 | common_secret | 我把 【Pepper67@aw】 贴在这，你帮我测一下这个接口能不能 | common_secret 0.76「Pepper67@aw」",
+   "FN | pos-common_secret-zh-32 | common_secret | 用 【Falcon330?QQ】 签名之后服务端一直返回 401，哪 | common_secret 0.70「Falcon330」",
+   "FN | pos-common_secret-en-01 | common_secret | I pasted 【yn4ES0zrKpd4qBKH7mw2VbGp】 into the header a | ",
+   "FN | pos-common_secret-en-16 | common_secret | The vendor sent 【Copper2775%UH】 over chat; is tha | common_secret 0.76「Copper2775%UH」",
+   "FN | pos-private_date-mixed-27 | private_date | 郑嘉怡 的 DOB 是 【2013.04.05】，帮我填 form。 | private_date 0.51「.」"
+  ],
+  "skip_fenced": [
+   "FP | pos-private_person-zh-01 | private_date | 0.889 | 麻烦把报销单转给财务的汪海燕，她【今天下午】在。",
+   "FP | pos-private_person-zh-13 | private_date | 0.886 | 麻烦把报销单转给财务的严佳琪，她【今天下午】在。",
+   "FP | pos-private_person-zh-25 | private_date | 0.900 | 麻烦把报销单转给财务的龙春梅，她【今天下午】在。",
+   "FP | pos-private_person-en-03 | private_date | 0.945 |  interned with us 【last summer】.",
+   "FP | pos-private_person-en-15 | private_date | 0.941 |  interned with us 【last summer】.",
+   "FP | pos-private_person-en-27 | private_date | 0.943 |  interned with us 【last summer】.",
+   "FP | pos-private_address-zh-02 | private_date | 0.885 | 我【下个月】搬到重庆市渝北区梧桐大道670号青松",
+   "FP | pos-private_address-zh-14 | private_date | 0.867 | 我【下个月】搬到武汉市洪山区长青中路217号，帮",
+   "FP | pos-private_address-zh-26 | private_date | 0.918 | 我【下个月】搬到厦门市思明区梧桐北路892号翠微",
+   "FP | pos-private_address-mixed-07 | private_date | 0.941 | 0号长青华庭16栋6单元1806室 【next month】, 帮我做个 checklist。",
+   "FP | pos-private_address-mixed-19 | private_date | 0.900 | to 广州市天河区望湖北路252号 【next month】, 帮我做个 checklist。",
+   "FP | pos-private_address-mixed-31 | private_date | 0.847 | to 杭州市西湖区星河北路377号 【next month】, 帮我做个 checklist。",
+   "FP | pos-account-en-25 | common_secret | 0.889 | Add me on WeChat: 【li8ciqvhcqr】.",
+   "FP | pos-account-mixed-19 | common_secret | 0.811 | t password for 用户 【lucastiger90】，他忘记了。",
+   "FP | pos-account-mixed-31 | common_secret | 0.972 | t password for 用户 【harbor_t5756】，他忘记了。",
+   "FP | pos-private_date-en-00 | private_date | 0.827 | I was born 【on】 Aug 1, 1984; how ",
+   "FP | pos-private_date-en-00 | private_date | 0.957 | how old will I be 【next year】?",
+   "FP | pos-private_date-en-12 | private_date | 0.948 | how old will I be 【next year】?",
+   "FP | pos-private_date-en-24 | private_date | 0.952 | how old will I be 【next year】?",
+   "FP | neg-en-005 | ip_address | 0.994 | er listening addr=【127.0.0.1】:8080 mode=persona",
+   "FP | neg-en-025 | private_person | 0.883 | Compare 【Hugo】, Gatsby and Astro",
+   "FP | neg-en-048 | ip_address | 0.994 | nect ECONNREFUSED 【127.0.0.1】:8443⏎    at TCPCo",
+   "FP | neg-zh-003 | ip_address | 0.993 | 47Z INFO  启动完成 监听 【127.0.0.1】:3000⏎2026-09-22T0",
+   "FP | neg-zh-005 | private_person | 0.922 | 李代数和【李】群在机器人姿态估计里分别起什么作用？",
+   "FP | neg-zh-035 | private_person | 0.842 | 【王】者荣耀的匹配机制是怎么设计的？从分布",
+   "FP | neg-zh-035 | private_person | 0.879 | 王者【荣耀】的匹配机制是怎么设计的？从分布式系统",
+   "FP | neg-zh-036 | private_person | 0.872 | 【江湖】上说 Rust 的所有权很难学，给我",
+   "FP | req-002 | ip_address | 0.994 | er listening addr=【127.0.0.1】:5432 mode=persona",
+   "FP | req-003 | ip_address | 0.994 | er listening addr=【127.0.0.1】:3000 mode=persona",
+   "FP | req-015 | ip_address | 0.994 | er listening addr=【127.0.0.1】:7788 mode=persona",
+   "FP | req-022 | ip_address | 0.994 | er listening addr=【127.0.0.1】:3000 mode=persona",
+   "FN | pos-private_person-zh-07 | private_person | 帮我润色一下：尊敬的【诸葛敏】老师，您好，我是您去年带过的学生。 | private_person 0.57「诸葛敏老师」",
+   "FN | pos-private_person-zh-10 | private_person | ```json⏎{\"name\": \"【陶秋生】\", \"dept\": \"销售部\"}⏎ | ",
+   "FN | pos-private_person-zh-11 | private_person | 的表格：⏎```⏎姓名,部门,级别⏎【杨芳】,研发部,P6⏎```⏎统计一下每个 | ",
+   "FN | pos-private_person-zh-19 | private_person | 帮我润色一下：尊敬的【任振华】老师，您好，我是您去年带过的学生。 | private_person 0.59「任振华老师」",
+   "FN | pos-private_person-zh-22 | private_person | ```json⏎{\"name\": \"【叶芳】\", \"dept\": \"销售部\"}⏎ | ",
+   "FN | pos-private_person-zh-23 | private_person | 的表格：⏎```⏎姓名,部门,级别⏎【诸葛冬雪】,研发部,P6⏎```⏎统计一下每个 | ",
+   "FN | pos-private_person-zh-31 | private_person | 帮我润色一下：尊敬的【范敏】老师，您好，我是您去年带过的学生。 | private_person 0.67「范敏老师」",
+   "FN | pos-private_person-en-10 | private_person | son⏎{\"customer\": \"【Charles Johnson】\", \"tier\": \"gold\"} | ",
+   "FN | pos-private_person-en-11 | private_person | is:⏎```⏎name,team⏎【Lucas Johnson】,platform⏎```⏎Why  | ",
+   "FN | pos-private_person-en-22 | private_person | son⏎{\"customer\": \"【Ivy Adams】\", \"tier\": \"gold\"} | ",
+   "FN | pos-private_person-en-23 | private_person | is:⏎```⏎name,team⏎【Patricia Brown】,platform⏎```⏎Why  | ",
+   "FN | pos-private_person-mixed-00 | private_person | 这个 PR 是 【Zheng Fang】 提的，帮我 review 一下 e | account 0.51「Zheng」",
+   "FN | pos-private_person-mixed-06 | private_person | am 新来了一个 intern 叫 【Zhiqiang Xie】，帮我写个欢迎词。 | account 0.62「Zhiqiang」; private_person 0.67「Xie」",
+   "FN | pos-private_person-mixed-10 | private_person | 据：⏎```yaml⏎owner: 【吕建国】⏎team: infra⏎```⏎帮 | ",
+   "FN | pos-private_person-mixed-11 | private_person | rs(name) VALUES ('【Lisa White】');⏎```⏎为什么插入失败？ | ",
+   "FN | pos-private_person-mixed-12 | private_person | 这个 PR 是 【Min Cao】 提的，帮我 review 一下 e | ",
+   "FN | pos-private_person-mixed-22 | private_person | 据：⏎```yaml⏎owner: 【金欣怡】⏎team: infra⏎```⏎帮 | ",
+   "FN | pos-private_person-mixed-23 | private_person | rs(name) VALUES ('【Mark Roberts】');⏎```⏎为什么插入失败？ | ",
+   "FN | pos-private_address-zh-10 | private_address | json⏎{\"address\": \"【上海市浦东新区银杏北路230号金桂家园7栋3单元3105室】\"}⏎```⏎帮我校验地址字段。 | ",
+   "FN | pos-private_address-zh-11 | private_address | 里这一行：⏎```⏎ship_to=【上海市徐汇区翠微街826号海棠小区29栋1单元1806室】 status=pending⏎`` | ",
+   "FN | pos-private_address-zh-22 | private_address | json⏎{\"address\": \"【厦门市思明区翠微大道916号星河花园12栋4单元2008室】\"}⏎```⏎帮我校验地址字段。 | ",
+   "FN | pos-private_address-zh-23 | private_address | 里这一行：⏎```⏎ship_to=【深圳市南山区枫林南路349号】 status=pending⏎`` | ",
+   "FN | pos-private_address-en-10 | private_address | ipping_address\": \"【1873 Maple Street, Apt 40B, Salem, MA 62721】\"}⏎```⏎Why does va | ",
+   "FN | pos-private_address-en-11 | private_address | m the export:⏎```⏎【1782 Chestnut St, Madison, WI 10703】\\|pending\\|2⏎```⏎spl | ",
+   "FN | pos-private_address-en-22 | private_address | ipping_address\": \"【601 Cedar Lane, Apt 34D, Brookfield, WI 13009】\"}⏎```⏎Why does va | ",
+   "FN | pos-private_address-en-23 | private_address | m the export:⏎```⏎【9226 Willow Street, Apt 12A, Riverton, WY 67816】\\|pending\\|2⏎```⏎spl | ",
+   "FN | pos-private_address-mixed-10 | private_address | ```json⏎{\"addr\": \"【深圳市南山区海棠中路397号梧桐名邸13栋4单元906室】\"}⏎```⏎parse 一下省市区 | ",
+   "FN | pos-private_address-mixed-11 | private_address | 有一行：⏎```⏎address: 【3482 Chestnut Avenue, Apt 24B, Georgetown, TX 64261】⏎```⏎帮我改成多行格式。 | ",
+   "FN | pos-private_address-mixed-22 | private_address | ```json⏎{\"addr\": \"【武汉市洪山区金桂西路540号】\"}⏎```⏎parse 一下省市区 | ",
+   "FN | pos-private_address-mixed-23 | private_address | 有一行：⏎```⏎address: 【7944 Sycamore Ave, Apt 33D, Milford, CT 81978】⏎```⏎帮我改成多行格式。 | ",
+   "FN | pos-account-zh-04 | account | 会员卡号【4648 4937 5009】，积分怎么一直没到账？ | account 0.49「4648」; account 0.50「4937」; payment_card 0.50「5009」",
+   "FN | pos-account-zh-10 | account | ：⏎```json⏎{\"qq\": \"【3792967225】\", \"level\": 3}⏎``` | ",
+   "FN | pos-account-zh-11 | account | ml⏎owner_account: 【lunar_v2177】⏎```⏎这个字段在哪里用到了？ | ",
+   "FN | pos-account-zh-22 | account | ：⏎```json⏎{\"qq\": \"【1572606131】\", \"level\": 3}⏎``` | ",
+   "FN | pos-account-zh-23 | account | ml⏎owner_account: 【jiayi.lin87】⏎```⏎这个字段在哪里用到了？ | ",
+   "FN | pos-account-zh-28 | account | 会员卡号【9779 5461 4889】，积分怎么一直没到账？ | account 0.76「9779 5461 4889」",
+   "FN | pos-account-zh-30 | private_person | 【高强】的微信号是wxid_oj8bnz31 | private_person 0.65「高强」",
+   "FN | pos-account-en-01 | account | Add me on WeChat: 【wxid_kvi9fav8id8lcc】. | common_secret 0.51「wxid_kvi9fav8id8lcc」",
+   "FN | pos-account-en-05 | account | lores's handle is 【paultiger14】; tag him in the r | account 0.41「paultiger14」",
+   "FN | pos-account-en-10 | account | ``json⏎{\"login\": \"【yuxuan.lin81】\", \"active\": true} | ",
+   "FN | pos-account-en-11 | account | et:⏎```⏎member_no=【5990 3038 5994】⏎```⏎should this b | ",
+   "FN | pos-account-en-22 | account | ``json⏎{\"login\": \"【david_tiger47】\", \"active\": true} | ",
+   "FN | pos-account-en-23 | account | et:⏎```⏎member_no=【8667 1949 9694 1392】⏎```⏎should this b | ",
+   "FN | pos-account-en-25 | account | Add me on WeChat: 【li8ciqvhcqr】. | common_secret 0.89「li8ciqvhcqr」",
+   "FN | pos-account-mixed-01 | account | WeChat 加我 【j8rvyhrz3】，有 update 就发我。 | account 0.57「j8rvyhrz3」",
+   "FN | pos-account-mixed-06 | account | 付冬雪 的 handle 是 【min.sun91】，在 Slack 里 @ 一下。 | ",
+   "FN | pos-account-mixed-07 | account | t password for 用户 【meganharbor19】，他忘记了。 | account 0.71「meganharbor19」",
+   "FN | pos-account-mixed-10 | account | `json⏎{\"wechat\": \"【n10txd】\"}⏎```⏎validate 一下 | ",
+   "FN | pos-account-mixed-11 | account | ```⏎login ok user=【falcon_u7857】⏎```⏎这个 user 为什么会重 | ",
+   "FN | pos-account-mixed-13 | account | WeChat 加我 【wxid_v04zolj5fq0rq9】，有 update 就发我。 | account 0.48「wxid_v04zolj5fq0rq9」",
+   "FN | pos-account-mixed-14 | account | My 工号 is 【1497960】，HR 系统里查不到。 | account 0.79「1497960」",
+   "FN | pos-account-mixed-18 | account | 史平 的 handle 是 【matthew_copper7】，在 Slack 里 @ 一下。 | common_secret 0.50「matthew_copper7」",
+   "FN | pos-account-mixed-19 | account | t password for 用户 【lucastiger90】，他忘记了。 | common_secret 0.81「lucastiger90」",
+   "FN | pos-account-mixed-22 | account | `json⏎{\"wechat\": \"【ku-4fj】\"}⏎```⏎validate 一下 | ",
+   "FN | pos-account-mixed-23 | account | ```⏎login ok user=【jing.wu88】⏎```⏎这个 user 为什么会重 | ",
+   "FN | pos-account-mixed-30 | account | 陶敏 的 handle 是 【ashley_lunar96】，在 Slack 里 @ 一下。 | account 0.78「ashley_lunar96」",
+   "FN | pos-account-mixed-31 | account | t password for 用户 【harbor_t5756】，他忘记了。 | common_secret 0.97「harbor_t5756」",
+   "FN | pos-common_secret-zh-01 | common_secret | 我把 【Pepper67@aw】 贴在这，你帮我测一下这个接口能不能 | common_secret 0.76「Pepper67@aw」",
+   "FN | pos-common_secret-zh-10 | common_secret | deploy.sh --token 【Lunar2917@JrhC】⏎```⏎结果报权限错误。 | ",
+   "FN | pos-common_secret-zh-11 | common_secret | 配置文件：⏎```⏎【f6l44jAJOcGtWX4bqrsiC67ZIb6NABA】⏎```⏎这一行是第三方给的，放哪里 | ",
+   "FN | pos-common_secret-zh-22 | common_secret | deploy.sh --token 【aqOUpihPbvN12xTSnyKOH6XlJRH3j7GNa】⏎```⏎结果报权限错误。 | ",
+   "FN | pos-common_secret-zh-23 | common_secret | 配置文件：⏎```⏎【opEftjlfoePIQASheZD3r9R4Wzxf6PHZ45jZnMQ】⏎```⏎这一行是第三方给的，放哪里 | ",
+   "FN | pos-common_secret-zh-32 | common_secret | 用 【Falcon330?QQ】 签名之后服务端一直返回 401，哪 | common_secret 0.70「Falcon330」",
+   "FN | pos-common_secret-en-01 | common_secret | I pasted 【yn4ES0zrKpd4qBKH7mw2VbGp】 into the header a | ",
+   "FN | pos-common_secret-en-10 | common_secret | ash⏎curl -u admin:【xnwp-8meAts-RCDC-p63Jz-IMh3u】 https://staging.e | ",
+   "FN | pos-common_secret-en-11 | common_secret | has one line:⏎```⏎【Pepper6101#EH】⏎```⏎where should  | ",
+   "FN | pos-common_secret-en-16 | common_secret | The vendor sent 【Copper2775%UH】 over chat; is tha | common_secret 0.76「Copper2775%UH」",
+   "FN | pos-common_secret-en-22 | common_secret | ash⏎curl -u admin:【dUKdE-yEEB-v3pxtM-CgnHy】 https://staging.e | ",
+   "FN | pos-common_secret-en-23 | common_secret | has one line:⏎```⏎【GsNZz-8XI13-draHZ-b2WBL】⏎```⏎where should  | ",
+   "FN | pos-common_secret-mixed-10 | common_secret | ⏎export APP_TOKEN=【UaxXL-YkG3-uuOm-H96M】⏎```⏎但是 app 读不到。 | ",
+   "FN | pos-common_secret-mixed-11 | common_secret | secret 文件：⏎```⏎【aiKGSII3RwLvL5gHC3wTaFBE3+ZrdFP7/8/HcTv8yNKL】⏎```⏎应该放在哪个目录？ | ",
+   "FN | pos-common_secret-mixed-22 | common_secret | ⏎export APP_TOKEN=【PfF1N-kIHi-qDjF-V8Ea1d】⏎```⏎但是 app 读不到。 | ",
+   "FN | pos-common_secret-mixed-23 | common_secret | secret 文件：⏎```⏎【fJremHpdkODbaVF60lTxKsNcA0UiZQX73cp】⏎```⏎应该放在哪个目录？ | ",
+   "FN | pos-private_date-zh-10 | private_date | son⏎{\"birthday\": \"【1978年3月1日】\"}⏎```⏎帮我算年龄。 | ",
+   "FN | pos-private_date-zh-11 | private_date | 患者记录：⏎```⏎预约日期: 【2019年5月8日】⏎```⏎帮我生成提醒短信。 | ",
+   "FN | pos-private_date-zh-22 | private_date | son⏎{\"birthday\": \"【1971年11月26号】\"}⏎```⏎帮我算年龄。 | ",
+   "FN | pos-private_date-zh-23 | private_date | 患者记录：⏎```⏎预约日期: 【1983/4/4】⏎```⏎帮我生成提醒短信。 | ",
+   "FN | pos-private_date-en-10 | private_date | ⏎```json⏎{\"dob\": \"【2011-04-19】\"}⏎```⏎compute the | ",
+   "FN | pos-private_date-en-11 | private_date | ⏎```⏎appointment: 【2006-11-24】⏎```⏎format it for | ",
+   "FN | pos-private_date-en-22 | private_date | ⏎```json⏎{\"dob\": \"【16 August 2009】\"}⏎```⏎compute the | ",
+   "FN | pos-private_date-en-23 | private_date | ⏎```⏎appointment: 【1 May 2013】⏎```⏎format it for | ",
+   "FN | pos-private_date-mixed-10 | private_date | ⏎```json⏎{\"dob\": \"【2011-02-08】\"}⏎```⏎算一下 age。 | ",
+   "FN | pos-private_date-mixed-11 | private_date | ：⏎```⏎birth_date: 【1983.11.20】⏎```⏎转成 ISO format | ",
+   "FN | pos-private_date-mixed-22 | private_date | ⏎```json⏎{\"dob\": \"【10 July 1971】\"}⏎```⏎算一下 age。 | ",
+   "FN | pos-private_date-mixed-23 | private_date | ：⏎```⏎birth_date: 【2004年5月11日】⏎```⏎转成 ISO format | ",
+   "FN | pos-private_date-mixed-27 | private_date | 郑嘉怡 的 DOB 是 【2013.04.05】，帮我填 form。 | private_date 0.51「.」"
+  ]
+ },
+ "results": [
+  {
+   "scope": "full",
+   "threshold": 0.7,
+   "cells": {
+    "all": {
+     "account": {
+      "Strict": {
+       "TP": 93,
+       "FP": 3,
+       "FN": 12
+      },
+      "Overlap": {
+       "TP": 93,
+       "FP": 3,
+       "FN": 12
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 102,
+       "FP": 3,
+       "FN": 2
+      },
+      "Overlap": {
+       "TP": 102,
+       "FP": 3,
+       "FN": 2
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 104,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 104,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 94,
+       "FP": 28,
+       "FN": 10
+      },
+      "Overlap": {
+       "TP": 103,
+       "FP": 19,
+       "FN": 1
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 132,
+       "FP": 7,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 132,
+       "FP": 7,
+       "FN": 7
+      }
+     }
+    },
+    "en": {
+     "account": {
+      "Strict": {
+       "TP": 31,
+       "FP": 3,
+       "FN": 3
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 3,
+       "FN": 3
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 33,
+       "FP": 1,
+       "FN": 1
+      },
+      "Overlap": {
+       "TP": 33,
+       "FP": 1,
+       "FN": 1
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 31,
+       "FP": 10,
+       "FN": 3
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 7,
+       "FN": 0
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 46,
+       "FP": 2,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 46,
+       "FP": 2,
+       "FN": 0
+      }
+     }
+    },
+    "mixed": {
+     "account": {
+      "Strict": {
+       "TP": 26,
+       "FP": 0,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 26,
+       "FP": 0,
+       "FN": 8
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 34,
+       "FP": 2,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 2,
+       "FN": 0
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 35,
+       "FP": 3,
+       "FN": 1
+      },
+      "Overlap": {
+       "TP": 35,
+       "FP": 3,
+       "FN": 1
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 39,
+       "FP": 0,
+       "FN": 3
+      },
+      "Overlap": {
+       "TP": 39,
+       "FP": 0,
+       "FN": 3
+      }
+     }
+    },
+    "zh": {
+     "account": {
+      "Strict": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 1
+      },
+      "Overlap": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 1
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 35,
+       "FP": 0,
+       "FN": 1
+      },
+      "Overlap": {
+       "TP": 35,
+       "FP": 0,
+       "FN": 1
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 28,
+       "FP": 15,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 9,
+       "FN": 0
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 47,
+       "FP": 5,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 47,
+       "FP": 5,
+       "FN": 4
+      }
+     }
+    }
+   },
+   "Covered": {
+    "all": 537,
+    "en": 179,
+    "mixed": 170,
+    "zh": 188
+   },
+   "Gold": {
+    "all": 556,
+    "en": 182,
+    "mixed": 180,
+    "zh": 194
+   },
+   "FenceFound": 58,
+   "FenceGold": 60,
+   "CleanAny": {
+    "all": 11,
+    "en": 6,
+    "negative": 9,
+    "request": 2,
+    "zh": 5
+   },
+   "CleanNoURLIP": {
+    "all": 5,
+    "en": 2,
+    "negative": 5,
+    "zh": 3
+   },
+   "CleanTotal": {
+    "all": 178,
+    "en": 95,
+    "negative": 166,
+    "request": 12,
+    "zh": 83
+   },
+   "CleanTokens": {
+    "all": 16025,
+    "en": 12722,
+    "negative": 8160,
+    "request": 7865,
+    "zh": 3303
+   },
+   "CleanSpansNoURLIP": {
+    "all": 8,
+    "en": 3,
+    "negative": 8,
+    "request": 0,
+    "zh": 5
+   },
+   "CleanFPByLabel": {
+    "account": 1,
+    "ip_address": 6,
+    "private_person": 7
+   },
+   "OtherLabels": {
+    "url": 2
+   },
+   "ScanMS": 4580.567
+  },
+  {
+   "scope": "full",
+   "threshold": 0.8,
+   "cells": {
+    "all": {
+     "account": {
+      "Strict": {
+       "TP": 89,
+       "FP": 2,
+       "FN": 16
+      },
+      "Overlap": {
+       "TP": 89,
+       "FP": 2,
+       "FN": 16
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 100,
+       "FP": 3,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 100,
+       "FP": 3,
+       "FN": 4
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 104,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 104,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 94,
+       "FP": 25,
+       "FN": 10
+      },
+      "Overlap": {
+       "TP": 103,
+       "FP": 16,
+       "FN": 1
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 132,
+       "FP": 5,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 132,
+       "FP": 5,
+       "FN": 7
+      }
+     }
+    },
+    "en": {
+     "account": {
+      "Strict": {
+       "TP": 31,
+       "FP": 2,
+       "FN": 3
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 2,
+       "FN": 3
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 32,
+       "FP": 1,
+       "FN": 2
+      },
+      "Overlap": {
+       "TP": 32,
+       "FP": 1,
+       "FN": 2
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 31,
+       "FP": 10,
+       "FN": 3
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 7,
+       "FN": 0
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 46,
+       "FP": 1,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 46,
+       "FP": 1,
+       "FN": 0
+      }
+     }
+    },
+    "mixed": {
+     "account": {
+      "Strict": {
+       "TP": 23,
+       "FP": 0,
+       "FN": 11
+      },
+      "Overlap": {
+       "TP": 23,
+       "FP": 0,
+       "FN": 11
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 34,
+       "FP": 2,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 2,
+       "FN": 0
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 35,
+       "FP": 3,
+       "FN": 1
+      },
+      "Overlap": {
+       "TP": 35,
+       "FP": 3,
+       "FN": 1
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 39,
+       "FP": 0,
+       "FN": 3
+      },
+      "Overlap": {
+       "TP": 39,
+       "FP": 0,
+       "FN": 3
+      }
+     }
+    },
+    "zh": {
+     "account": {
+      "Strict": {
+       "TP": 35,
+       "FP": 0,
+       "FN": 2
+      },
+      "Overlap": {
+       "TP": 35,
+       "FP": 0,
+       "FN": 2
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 2
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 2
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 28,
+       "FP": 12,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 6,
+       "FN": 0
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 47,
+       "FP": 4,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 47,
+       "FP": 4,
+       "FN": 4
+      }
+     }
+    }
+   },
+   "Covered": {
+    "all": 531,
+    "en": 178,
+    "mixed": 167,
+    "zh": 186
+   },
+   "Gold": {
+    "all": 556,
+    "en": 182,
+    "mixed": 180,
+    "zh": 194
+   },
+   "FenceFound": 58,
+   "FenceGold": 60,
+   "CleanAny": {
+    "all": 10,
+    "en": 5,
+    "negative": 8,
+    "request": 2,
+    "zh": 5
+   },
+   "CleanNoURLIP": {
+    "all": 4,
+    "en": 1,
+    "negative": 4,
+    "zh": 3
+   },
+   "CleanTotal": {
+    "all": 178,
+    "en": 95,
+    "negative": 166,
+    "request": 12,
+    "zh": 83
+   },
+   "CleanTokens": {
+    "all": 16025,
+    "en": 12722,
+    "negative": 8160,
+    "request": 7865,
+    "zh": 3303
+   },
+   "CleanSpansNoURLIP": {
+    "all": 5,
+    "en": 1,
+    "negative": 5,
+    "request": 0,
+    "zh": 4
+   },
+   "CleanFPByLabel": {
+    "ip_address": 6,
+    "private_person": 5
+   },
+   "OtherLabels": {
+    "url": 2
+   },
+   "ScanMS": 4580.567
+  },
+  {
+   "scope": "full",
+   "threshold": 0.9,
+   "cells": {
+    "all": {
+     "account": {
+      "Strict": {
+       "TP": 81,
+       "FP": 0,
+       "FN": 24
+      },
+      "Overlap": {
+       "TP": 81,
+       "FP": 0,
+       "FN": 24
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 100,
+       "FP": 1,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 100,
+       "FP": 1,
+       "FN": 4
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 104,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 104,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 94,
+       "FP": 16,
+       "FN": 10
+      },
+      "Overlap": {
+       "TP": 100,
+       "FP": 10,
+       "FN": 4
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 131,
+       "FP": 1,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 131,
+       "FP": 1,
+       "FN": 8
+      }
+     }
+    },
+    "en": {
+     "account": {
+      "Strict": {
+       "TP": 29,
+       "FP": 0,
+       "FN": 5
+      },
+      "Overlap": {
+       "TP": 29,
+       "FP": 0,
+       "FN": 5
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 2
+      },
+      "Overlap": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 2
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 31,
+       "FP": 6,
+       "FN": 3
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 6,
+       "FN": 3
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 46,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 46,
+       "FP": 0,
+       "FN": 0
+      }
+     }
+    },
+    "mixed": {
+     "account": {
+      "Strict": {
+       "TP": 19,
+       "FP": 0,
+       "FN": 15
+      },
+      "Overlap": {
+       "TP": 19,
+       "FP": 0,
+       "FN": 15
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 34,
+       "FP": 1,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 1,
+       "FN": 0
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 35,
+       "FP": 2,
+       "FN": 1
+      },
+      "Overlap": {
+       "TP": 35,
+       "FP": 2,
+       "FN": 1
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 38,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 38,
+       "FP": 0,
+       "FN": 4
+      }
+     }
+    },
+    "zh": {
+     "account": {
+      "Strict": {
+       "TP": 33,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 33,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 2
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 2
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 28,
+       "FP": 8,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 2,
+       "FN": 0
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 47,
+       "FP": 1,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 47,
+       "FP": 1,
+       "FN": 4
+      }
+     }
+    }
+   },
+   "Covered": {
+    "all": 517,
+    "en": 172,
+    "mixed": 161,
+    "zh": 184
+   },
+   "Gold": {
+    "all": 556,
+    "en": 182,
+    "mixed": 180,
+    "zh": 194
+   },
+   "FenceFound": 58,
+   "FenceGold": 60,
+   "CleanAny": {
+    "all": 7,
+    "en": 4,
+    "negative": 5,
+    "request": 2,
+    "zh": 3
+   },
+   "CleanNoURLIP": {
+    "all": 1,
+    "negative": 1,
+    "zh": 1
+   },
+   "CleanTotal": {
+    "all": 178,
+    "en": 95,
+    "negative": 166,
+    "request": 12,
+    "zh": 83
+   },
+   "CleanTokens": {
+    "all": 16025,
+    "en": 12722,
+    "negative": 8160,
+    "request": 7865,
+    "zh": 3303
+   },
+   "CleanSpansNoURLIP": {
+    "all": 1,
+    "en": 0,
+    "negative": 1,
+    "request": 0,
+    "zh": 1
+   },
+   "CleanFPByLabel": {
+    "ip_address": 6,
+    "private_person": 1
+   },
+   "OtherLabels": {
+    "url": 2
+   },
+   "ScanMS": 4580.567
+  },
+  {
+   "scope": "full",
+   "threshold": 0.95,
+   "cells": {
+    "all": {
+     "account": {
+      "Strict": {
+       "TP": 77,
+       "FP": 0,
+       "FN": 28
+      },
+      "Overlap": {
+       "TP": 77,
+       "FP": 0,
+       "FN": 28
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 99,
+       "FP": 1,
+       "FN": 5
+      },
+      "Overlap": {
+       "TP": 99,
+       "FP": 1,
+       "FN": 5
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 104,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 104,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 93,
+       "FP": 8,
+       "FN": 11
+      },
+      "Overlap": {
+       "TP": 99,
+       "FP": 2,
+       "FN": 5
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 131,
+       "FP": 0,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 131,
+       "FP": 0,
+       "FN": 8
+      }
+     }
+    },
+    "en": {
+     "account": {
+      "Strict": {
+       "TP": 28,
+       "FP": 0,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 28,
+       "FP": 0,
+       "FN": 6
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 31,
+       "FP": 0,
+       "FN": 3
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 0,
+       "FN": 3
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 31,
+       "FP": 2,
+       "FN": 3
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 2,
+       "FN": 3
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 46,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 46,
+       "FP": 0,
+       "FN": 0
+      }
+     }
+    },
+    "mixed": {
+     "account": {
+      "Strict": {
+       "TP": 19,
+       "FP": 0,
+       "FN": 15
+      },
+      "Overlap": {
+       "TP": 19,
+       "FP": 0,
+       "FN": 15
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 34,
+       "FP": 1,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 1,
+       "FN": 0
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 2
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 2
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 38,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 38,
+       "FP": 0,
+       "FN": 4
+      }
+     }
+    },
+    "zh": {
+     "account": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 7
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 2
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 2
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 0
+      },
+      "Overlap": {
+       "TP": 36,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 28,
+       "FP": 6,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 0
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 47,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 47,
+       "FP": 0,
+       "FN": 4
+      }
+     }
+    }
+   },
+   "Covered": {
+    "all": 511,
+    "en": 170,
+    "mixed": 160,
+    "zh": 181
+   },
+   "Gold": {
+    "all": 556,
+    "en": 182,
+    "mixed": 180,
+    "zh": 194
+   },
+   "FenceFound": 56,
+   "FenceGold": 60,
+   "CleanAny": {
+    "all": 6,
+    "en": 4,
+    "negative": 4,
+    "request": 2,
+    "zh": 2
+   },
+   "CleanNoURLIP": {},
+   "CleanTotal": {
+    "all": 178,
+    "en": 95,
+    "negative": 166,
+    "request": 12,
+    "zh": 83
+   },
+   "CleanTokens": {
+    "all": 16025,
+    "en": 12722,
+    "negative": 8160,
+    "request": 7865,
+    "zh": 3303
+   },
+   "CleanSpansNoURLIP": {
+    "all": 0,
+    "en": 0,
+    "negative": 0,
+    "request": 0,
+    "zh": 0
+   },
+   "CleanFPByLabel": {
+    "ip_address": 6
+   },
+   "OtherLabels": {
+    "url": 2
+   },
+   "ScanMS": 4580.567
+  },
+  {
+   "scope": "skip_fenced",
+   "threshold": 0.7,
+   "cells": {
+    "all": {
+     "account": {
+      "Strict": {
+       "TP": 83,
+       "FP": 1,
+       "FN": 22
+      },
+      "Overlap": {
+       "TP": 83,
+       "FP": 1,
+       "FN": 22
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 90,
+       "FP": 3,
+       "FN": 14
+      },
+      "Overlap": {
+       "TP": 90,
+       "FP": 3,
+       "FN": 14
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 92,
+       "FP": 0,
+       "FN": 12
+      },
+      "Overlap": {
+       "TP": 92,
+       "FP": 0,
+       "FN": 12
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 82,
+       "FP": 28,
+       "FN": 22
+      },
+      "Overlap": {
+       "TP": 91,
+       "FP": 19,
+       "FN": 13
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 120,
+       "FP": 7,
+       "FN": 19
+      },
+      "Overlap": {
+       "TP": 120,
+       "FP": 7,
+       "FN": 19
+      }
+     }
+    },
+    "en": {
+     "account": {
+      "Strict": {
+       "TP": 27,
+       "FP": 1,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 27,
+       "FP": 1,
+       "FN": 7
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 29,
+       "FP": 1,
+       "FN": 5
+      },
+      "Overlap": {
+       "TP": 29,
+       "FP": 1,
+       "FN": 5
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 27,
+       "FP": 10,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 7,
+       "FN": 4
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 42,
+       "FP": 2,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 42,
+       "FP": 2,
+       "FN": 4
+      }
+     }
+    },
+    "mixed": {
+     "account": {
+      "Strict": {
+       "TP": 24,
+       "FP": 0,
+       "FN": 10
+      },
+      "Overlap": {
+       "TP": 24,
+       "FP": 0,
+       "FN": 10
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 30,
+       "FP": 2,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 2,
+       "FN": 4
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 31,
+       "FP": 3,
+       "FN": 5
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 3,
+       "FN": 5
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 35,
+       "FP": 0,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 35,
+       "FP": 0,
+       "FN": 7
+      }
+     }
+    },
+    "zh": {
+     "account": {
+      "Strict": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 5
+      },
+      "Overlap": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 5
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 31,
+       "FP": 0,
+       "FN": 5
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 0,
+       "FN": 5
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 24,
+       "FP": 15,
+       "FN": 10
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 9,
+       "FN": 4
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 43,
+       "FP": 5,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 43,
+       "FP": 5,
+       "FN": 8
+      }
+     }
+    }
+   },
+   "Covered": {
+    "all": 479,
+    "en": 159,
+    "mixed": 152,
+    "zh": 168
+   },
+   "Gold": {
+    "all": 556,
+    "en": 182,
+    "mixed": 180,
+    "zh": 194
+   },
+   "FenceFound": 0,
+   "FenceGold": 60,
+   "CleanAny": {
+    "all": 10,
+    "en": 6,
+    "negative": 8,
+    "request": 2,
+    "zh": 4
+   },
+   "CleanNoURLIP": {
+    "all": 5,
+    "en": 2,
+    "negative": 5,
+    "zh": 3
+   },
+   "CleanTotal": {
+    "all": 178,
+    "en": 95,
+    "negative": 166,
+    "request": 12,
+    "zh": 83
+   },
+   "CleanTokens": {
+    "all": 16025,
+    "en": 12722,
+    "negative": 8160,
+    "request": 7865,
+    "zh": 3303
+   },
+   "CleanSpansNoURLIP": {
+    "all": 8,
+    "en": 3,
+    "negative": 8,
+    "request": 0,
+    "zh": 5
+   },
+   "CleanFPByLabel": {
+    "account": 1,
+    "ip_address": 5,
+    "private_person": 7
+   },
+   "OtherLabels": {},
+   "ScanMS": 4248.238
+  },
+  {
+   "scope": "skip_fenced",
+   "threshold": 0.8,
+   "cells": {
+    "all": {
+     "account": {
+      "Strict": {
+       "TP": 79,
+       "FP": 0,
+       "FN": 26
+      },
+      "Overlap": {
+       "TP": 79,
+       "FP": 0,
+       "FN": 26
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 88,
+       "FP": 3,
+       "FN": 16
+      },
+      "Overlap": {
+       "TP": 88,
+       "FP": 3,
+       "FN": 16
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 92,
+       "FP": 0,
+       "FN": 12
+      },
+      "Overlap": {
+       "TP": 92,
+       "FP": 0,
+       "FN": 12
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 82,
+       "FP": 25,
+       "FN": 22
+      },
+      "Overlap": {
+       "TP": 91,
+       "FP": 16,
+       "FN": 13
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 120,
+       "FP": 5,
+       "FN": 19
+      },
+      "Overlap": {
+       "TP": 120,
+       "FP": 5,
+       "FN": 19
+      }
+     }
+    },
+    "en": {
+     "account": {
+      "Strict": {
+       "TP": 27,
+       "FP": 0,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 27,
+       "FP": 0,
+       "FN": 7
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 28,
+       "FP": 1,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 28,
+       "FP": 1,
+       "FN": 6
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 27,
+       "FP": 10,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 7,
+       "FN": 4
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 42,
+       "FP": 1,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 42,
+       "FP": 1,
+       "FN": 4
+      }
+     }
+    },
+    "mixed": {
+     "account": {
+      "Strict": {
+       "TP": 21,
+       "FP": 0,
+       "FN": 13
+      },
+      "Overlap": {
+       "TP": 21,
+       "FP": 0,
+       "FN": 13
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 30,
+       "FP": 2,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 2,
+       "FN": 4
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 31,
+       "FP": 3,
+       "FN": 5
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 3,
+       "FN": 5
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 35,
+       "FP": 0,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 35,
+       "FP": 0,
+       "FN": 7
+      }
+     }
+    },
+    "zh": {
+     "account": {
+      "Strict": {
+       "TP": 31,
+       "FP": 0,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 0,
+       "FN": 6
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 6
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 24,
+       "FP": 12,
+       "FN": 10
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 6,
+       "FN": 4
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 43,
+       "FP": 4,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 43,
+       "FP": 4,
+       "FN": 8
+      }
+     }
+    }
+   },
+   "Covered": {
+    "all": 473,
+    "en": 158,
+    "mixed": 149,
+    "zh": 166
+   },
+   "Gold": {
+    "all": 556,
+    "en": 182,
+    "mixed": 180,
+    "zh": 194
+   },
+   "FenceFound": 0,
+   "FenceGold": 60,
+   "CleanAny": {
+    "all": 9,
+    "en": 5,
+    "negative": 7,
+    "request": 2,
+    "zh": 4
+   },
+   "CleanNoURLIP": {
+    "all": 4,
+    "en": 1,
+    "negative": 4,
+    "zh": 3
+   },
+   "CleanTotal": {
+    "all": 178,
+    "en": 95,
+    "negative": 166,
+    "request": 12,
+    "zh": 83
+   },
+   "CleanTokens": {
+    "all": 16025,
+    "en": 12722,
+    "negative": 8160,
+    "request": 7865,
+    "zh": 3303
+   },
+   "CleanSpansNoURLIP": {
+    "all": 5,
+    "en": 1,
+    "negative": 5,
+    "request": 0,
+    "zh": 4
+   },
+   "CleanFPByLabel": {
+    "ip_address": 5,
+    "private_person": 5
+   },
+   "OtherLabels": {},
+   "ScanMS": 4248.238
+  },
+  {
+   "scope": "skip_fenced",
+   "threshold": 0.9,
+   "cells": {
+    "all": {
+     "account": {
+      "Strict": {
+       "TP": 71,
+       "FP": 0,
+       "FN": 34
+      },
+      "Overlap": {
+       "TP": 71,
+       "FP": 0,
+       "FN": 34
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 88,
+       "FP": 1,
+       "FN": 16
+      },
+      "Overlap": {
+       "TP": 88,
+       "FP": 1,
+       "FN": 16
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 92,
+       "FP": 0,
+       "FN": 12
+      },
+      "Overlap": {
+       "TP": 92,
+       "FP": 0,
+       "FN": 12
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 82,
+       "FP": 16,
+       "FN": 22
+      },
+      "Overlap": {
+       "TP": 88,
+       "FP": 10,
+       "FN": 16
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 119,
+       "FP": 1,
+       "FN": 20
+      },
+      "Overlap": {
+       "TP": 119,
+       "FP": 1,
+       "FN": 20
+      }
+     }
+    },
+    "en": {
+     "account": {
+      "Strict": {
+       "TP": 25,
+       "FP": 0,
+       "FN": 9
+      },
+      "Overlap": {
+       "TP": 25,
+       "FP": 0,
+       "FN": 9
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 28,
+       "FP": 0,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 28,
+       "FP": 0,
+       "FN": 6
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 27,
+       "FP": 6,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 27,
+       "FP": 6,
+       "FN": 7
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 42,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 42,
+       "FP": 0,
+       "FN": 4
+      }
+     }
+    },
+    "mixed": {
+     "account": {
+      "Strict": {
+       "TP": 17,
+       "FP": 0,
+       "FN": 17
+      },
+      "Overlap": {
+       "TP": 17,
+       "FP": 0,
+       "FN": 17
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 30,
+       "FP": 1,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 1,
+       "FN": 4
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 31,
+       "FP": 2,
+       "FN": 5
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 2,
+       "FN": 5
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 8
+      }
+     }
+    },
+    "zh": {
+     "account": {
+      "Strict": {
+       "TP": 29,
+       "FP": 0,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 29,
+       "FP": 0,
+       "FN": 8
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 6
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 24,
+       "FP": 8,
+       "FN": 10
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 2,
+       "FN": 4
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 43,
+       "FP": 1,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 43,
+       "FP": 1,
+       "FN": 8
+      }
+     }
+    }
+   },
+   "Covered": {
+    "all": 459,
+    "en": 152,
+    "mixed": 143,
+    "zh": 164
+   },
+   "Gold": {
+    "all": 556,
+    "en": 182,
+    "mixed": 180,
+    "zh": 194
+   },
+   "FenceFound": 0,
+   "FenceGold": 60,
+   "CleanAny": {
+    "all": 6,
+    "en": 4,
+    "negative": 4,
+    "request": 2,
+    "zh": 2
+   },
+   "CleanNoURLIP": {
+    "all": 1,
+    "negative": 1,
+    "zh": 1
+   },
+   "CleanTotal": {
+    "all": 178,
+    "en": 95,
+    "negative": 166,
+    "request": 12,
+    "zh": 83
+   },
+   "CleanTokens": {
+    "all": 16025,
+    "en": 12722,
+    "negative": 8160,
+    "request": 7865,
+    "zh": 3303
+   },
+   "CleanSpansNoURLIP": {
+    "all": 1,
+    "en": 0,
+    "negative": 1,
+    "request": 0,
+    "zh": 1
+   },
+   "CleanFPByLabel": {
+    "ip_address": 5,
+    "private_person": 1
+   },
+   "OtherLabels": {},
+   "ScanMS": 4248.238
+  },
+  {
+   "scope": "skip_fenced",
+   "threshold": 0.95,
+   "cells": {
+    "all": {
+     "account": {
+      "Strict": {
+       "TP": 67,
+       "FP": 0,
+       "FN": 38
+      },
+      "Overlap": {
+       "TP": 67,
+       "FP": 0,
+       "FN": 38
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 88,
+       "FP": 1,
+       "FN": 16
+      },
+      "Overlap": {
+       "TP": 88,
+       "FP": 1,
+       "FN": 16
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 92,
+       "FP": 0,
+       "FN": 12
+      },
+      "Overlap": {
+       "TP": 92,
+       "FP": 0,
+       "FN": 12
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 82,
+       "FP": 8,
+       "FN": 22
+      },
+      "Overlap": {
+       "TP": 88,
+       "FP": 2,
+       "FN": 16
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 119,
+       "FP": 0,
+       "FN": 20
+      },
+      "Overlap": {
+       "TP": 119,
+       "FP": 0,
+       "FN": 20
+      }
+     }
+    },
+    "en": {
+     "account": {
+      "Strict": {
+       "TP": 24,
+       "FP": 0,
+       "FN": 10
+      },
+      "Overlap": {
+       "TP": 24,
+       "FP": 0,
+       "FN": 10
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 28,
+       "FP": 0,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 28,
+       "FP": 0,
+       "FN": 6
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 27,
+       "FP": 2,
+       "FN": 7
+      },
+      "Overlap": {
+       "TP": 27,
+       "FP": 2,
+       "FN": 7
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 42,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 42,
+       "FP": 0,
+       "FN": 4
+      }
+     }
+    },
+    "mixed": {
+     "account": {
+      "Strict": {
+       "TP": 17,
+       "FP": 0,
+       "FN": 17
+      },
+      "Overlap": {
+       "TP": 17,
+       "FP": 0,
+       "FN": 17
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 30,
+       "FP": 1,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 1,
+       "FN": 4
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 31,
+       "FP": 0,
+       "FN": 5
+      },
+      "Overlap": {
+       "TP": 31,
+       "FP": 0,
+       "FN": 5
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 34,
+       "FP": 0,
+       "FN": 8
+      }
+     }
+    },
+    "zh": {
+     "account": {
+      "Strict": {
+       "TP": 26,
+       "FP": 0,
+       "FN": 11
+      },
+      "Overlap": {
+       "TP": 26,
+       "FP": 0,
+       "FN": 11
+      }
+     },
+     "common_secret": {
+      "Strict": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 6
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 6
+      }
+     },
+     "private_address": {
+      "Strict": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 4
+      },
+      "Overlap": {
+       "TP": 32,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_date": {
+      "Strict": {
+       "TP": 24,
+       "FP": 6,
+       "FN": 10
+      },
+      "Overlap": {
+       "TP": 30,
+       "FP": 0,
+       "FN": 4
+      }
+     },
+     "private_person": {
+      "Strict": {
+       "TP": 43,
+       "FP": 0,
+       "FN": 8
+      },
+      "Overlap": {
+       "TP": 43,
+       "FP": 0,
+       "FN": 8
+      }
+     }
+    }
+   },
+   "Covered": {
+    "all": 455,
+    "en": 151,
+    "mixed": 143,
+    "zh": 161
+   },
+   "Gold": {
+    "all": 556,
+    "en": 182,
+    "mixed": 180,
+    "zh": 194
+   },
+   "FenceFound": 0,
+   "FenceGold": 60,
+   "CleanAny": {
+    "all": 5,
+    "en": 4,
+    "negative": 3,
+    "request": 2,
+    "zh": 1
+   },
+   "CleanNoURLIP": {},
+   "CleanTotal": {
+    "all": 178,
+    "en": 95,
+    "negative": 166,
+    "request": 12,
+    "zh": 83
+   },
+   "CleanTokens": {
+    "all": 16025,
+    "en": 12722,
+    "negative": 8160,
+    "request": 7865,
+    "zh": 3303
+   },
+   "CleanSpansNoURLIP": {
+    "all": 0,
+    "en": 0,
+    "negative": 0,
+    "request": 0,
+    "zh": 0
+   },
+   "CleanFPByLabel": {
+    "ip_address": 5
+   },
+   "OtherLabels": {},
+   "ScanMS": 4248.238
+  }
+ ]
+}
