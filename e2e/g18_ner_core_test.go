@@ -219,6 +219,40 @@ func TestG18NERCore(t *testing.T) {
 		alerted = strings.Contains(string(b), "on_error: rules_only")
 	}
 	rep.Check("最终审计记录仍含退化告警（失败发生在第一个候选）", alerted, "")
+
+	// classifier redaction shares the request scope
+	c6, cls := g18Calls(g.Dir), cloud3.ClassifierCalls()
+	start = time.Now()
+	r = g.Chat(t, g.Token, map[string]any{"model": "smart", "messages": msgs("user", "#hang-detector 电话 "+g18Phone2)}, nil)
+	el = time.Since(start)
+	sent = g18Last(cloud3)
+	rep.Check("意图路由：分类器脱敏时插件超时，正式请求不再等第二次", r.Status == 200 && cloud3.ClassifierCalls()-cls == 1 && g18Calls(g.Dir)-c6 == 1 && el < 1500*time.Millisecond && !strings.Contains(sent, g18Phone2),
+		"status=%d，分类器调用 %d 次，插件调用 %d 次，耗时 %v", r.Status, cloud3.ClassifierCalls()-cls, g18Calls(g.Dir)-c6, el.Round(time.Millisecond))
+	time.Sleep(200 * time.Millisecond)
+	recs, _ = g.AuditRecords(t)
+	alerted = false
+	if len(recs) > 0 {
+		b, _ := json.Marshal(recs[len(recs)-1]["redaction"])
+		alerted = strings.Contains(string(b), "on_error: rules_only")
+	}
+	rep.Check("审计记录含分类器阶段的退化告警", alerted, "")
+
+	// a NaN score must not cost the request its audit record
+	before := len(recs)
+	r = g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": msgs("user", "请联系孙七")}, nil)
+	sent = g18Last(cloud3)
+	time.Sleep(200 * time.Millisecond)
+	recs, _ = g.AuditRecords(t)
+	var nan map[string]any
+	if len(recs) > before {
+		red, _ := recs[len(recs)-1]["redaction"].(map[string]any)
+		ss, _ := red["samples"].([]any)
+		if len(ss) > 0 {
+			nan, _ = ss[0].(map[string]any)
+		}
+	}
+	rep.Check("插件返回 NaN 置信度：按未打分处理，照常脱敏且审计照常写入", r.Status == 200 && !strings.Contains(sent, "孙七") && nan != nil && nan["source"] == "ner" && nan["confidence"] == nil,
+		"status=%d，审计新增 %d 条，样本：%v", r.Status, len(recs)-before, nan)
 	g.Stop()
 
 	// ---------- reserved names ----------
@@ -250,6 +284,15 @@ routing_groups:
   pair:
     type: order
     members: [down/strong, cloud/strong]
+  smart:
+    type: order
+    members: [cloud/strong]
+    classifier: cloud/strong
+    classifier_timeout: 5s
+    rules:
+      - name: chat
+        intent: "闲聊、问候"
+        use: cloud/strong
 plugins:
   - name: ner
     kind: detector

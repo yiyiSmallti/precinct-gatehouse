@@ -607,7 +607,11 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 	if session == "" {
 		session = oai.Str(req, "user")
 	}
-	dec, err := st.snap.Router.Decide(ctx, req, route.Meta{Source: st.rec.Source, Session: session, DataClass: dataClass, Now: time.Now()})
+	// one redaction scope for the request: the classifier's redaction and every
+	// failover candidate's share it, so a detector that failed under
+	// on_error: rules_only is waited for once and every report names it
+	redactCtx := redact.WithRequestScope(ctx)
+	dec, err := st.snap.Router.Decide(redactCtx, req, route.Meta{Source: st.rec.Source, Session: session, DataClass: dataClass, Now: time.Now()})
 	if err != nil {
 		var um route.ErrUnknownModel
 		if errors.As(err, &um) {
@@ -648,9 +652,6 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 	vaultKey := st.claims.ID + "\x00" + session
 
 	var lastErr *provider.UpstreamError
-	// one redaction scope for all candidates: a detector that failed under
-	// on_error: rules_only is not waited for again on failover
-	redactCtx := redact.WithRequestScope(ctx)
 	for _, ref := range cands {
 		prov, model, _ := st.snap.Reg.Lookup(ref)
 		mode := st.snap.Redactor.Mode(prov.Target, dataClass)

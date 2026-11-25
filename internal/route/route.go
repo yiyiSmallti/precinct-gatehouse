@@ -46,7 +46,7 @@ type Decision struct {
 
 // PrepareFunc may rewrite text before it is sent to the classifier (redaction
 // when the classifier is an external model). An error aborts the request.
-type PrepareFunc func(text, target, dataClass string) (string, error)
+type PrepareFunc func(ctx context.Context, text, target, dataClass string) (string, error)
 
 // Router routes requests.
 type Router struct {
@@ -361,7 +361,7 @@ func (r *Router) classify(ctx context.Context, g *config.RoutingGroup, idx []int
 		return -1
 	}
 	if r.Prepare != nil {
-		t, err := r.Prepare(text, p.Target, dataClass)
+		t, err := r.Prepare(ctx, text, p.Target, dataClass)
 		if err != nil {
 			d.ClassifierError = "skipped: " + err.Error()
 			return -1

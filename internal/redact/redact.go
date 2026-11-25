@@ -396,6 +396,15 @@ type Result struct {
 // (400) or a fail-closed detector failure (503).
 func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey []byte, vaultKey string) (*Result, error) {
 	res := &Result{Mode: mode, Report: &audit.Redaction{Mode: mode, Counts: map[string]int{}}}
+	run := runFrom(ctx)
+	defer func() {
+		// every report of the request names the sources it went without,
+		// including those that failed for the classifier or an earlier
+		// failover candidate (so even an off-mode report carries them)
+		for _, name := range run.order {
+			res.Report.Alerts = append(res.Report.Alerts, run.degraded[name])
+		}
+	}()
 	if mode == ModeOff {
 		return res, nil
 	}
@@ -414,14 +423,6 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 		}
 		res.Report.Alerts = append(res.Report.Alerts, msg)
 	}
-	run := runFrom(ctx)
-	defer func() {
-		// every report of the request names the sources it went without,
-		// including those that failed during an earlier failover candidate
-		for _, name := range run.order {
-			res.Report.Alerts = append(res.Report.Alerts, run.degraded[name])
-		}
-	}()
 	bucket := e.Vault.BucketWithTTL(vaultKey, e.vaultTTL)
 	masked := map[string]string{} // value -> placeholder, for thinking text
 	var blocked []string

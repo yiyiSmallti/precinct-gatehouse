@@ -1,6 +1,6 @@
 // Command fakedetector is a detector plugin for the end-to-end tests. It
 // reports PERSON for a fixed list of names, the way a NER plugin would, each
-// with a fixed score. Text containing "#crash-detector" makes the process
+// with a fixed score (孙七 gets NaN, as a broken model might). Text containing "#crash-detector" makes the process
 // exit (G17); "#hang-detector" makes the call take 3 s (G18).
 //
 // With a directory as its first argument it appends one line per Detect call
@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,7 +24,7 @@ import (
 var names = []struct {
 	name  string
 	score float32
-}{{"张三", 0.99}, {"李四", 0.99}, {"王五", 0.99}, {"赵六", 0.6}}
+}{{"张三", 0.99}, {"李四", 0.99}, {"王五", 0.99}, {"赵六", 0.6}, {"孙七", float32(math.NaN())}}
 
 type det struct{ calls string }
 

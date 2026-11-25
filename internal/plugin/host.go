@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os/exec"
 	"sync"
 	"time"
@@ -391,7 +392,23 @@ func (d *detector) Detect(ctx context.Context, text string) ([]redact.Finding, e
 		if f.Start < 0 || f.End > len(idx)-1 || f.Start >= f.End || f.Kind == "" {
 			continue
 		}
-		out = append(out, redact.Finding{Kind: f.Kind, Start: idx[f.Start], End: idx[f.End], Source: d.s.Name, Confidence: f.Confidence})
+		out = append(out, redact.Finding{Kind: f.Kind, Start: idx[f.Start], End: idx[f.End], Source: d.s.Name, Confidence: score(f.Confidence)})
 	}
 	return out, nil
+}
+
+// score keeps a plugin's confidence within [0, 1]. A non-finite score
+// becomes 0 (unscored): min_confidence never drops it, so it is still acted
+// on, and NaN/Inf would make the audit record fail to encode.
+func score(c float32) float32 {
+	f := float64(c)
+	switch {
+	case math.IsNaN(f) || math.IsInf(f, 0):
+		return 0
+	case c < 0:
+		return 0
+	case c > 1:
+		return 1
+	}
+	return c
 }

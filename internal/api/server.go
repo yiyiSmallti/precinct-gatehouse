@@ -253,11 +253,13 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		red.Vault = vault
 		red.Cache = detectCache
 		rt := route.New(nextCfg, reg)
-		rt.Prepare = func(text, target, dataClass string) (string, error) {
+		rt.Prepare = func(ctx context.Context, text, target, dataClass string) (string, error) {
 			// the classifier sees the last user message: redact it like any other outbound text
 			mode := red.Mode(target, dataClass)
 			req := oai.Object{"messages": []any{map[string]any{"role": "user", "content": text}}}
-			if _, err := red.Apply(context.Background(), req, mode, userKey, "classifier"); err != nil {
+			// ctx carries the request's redaction scope: a detector that fails
+			// here is not waited for again when the request itself is redacted
+			if _, err := red.Apply(ctx, req, mode, userKey, "classifier"); err != nil {
 				return "", err
 			}
 			return oai.Text(oai.Messages(req)[0]), nil
