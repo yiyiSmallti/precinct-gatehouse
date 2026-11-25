@@ -165,11 +165,26 @@ func (e *Engine) action(kind, mode string) string {
 	return a
 }
 
+// Built-in detector sources; redaction.sources never applies to them.
+const (
+	SourceRules      = "rules"
+	SourceDictionary = "dictionary"
+)
+
+// source returns the redaction.sources settings of f's detector plugin.
+// Built-in findings get none, even if a plugin were named like them.
+func (e *Engine) source(f Finding) config.RedactionSource {
+	if f.Source == SourceRules || f.Source == SourceDictionary {
+		return config.RedactionSource{}
+	}
+	return e.cfg.Sources[f.Source]
+}
+
 // findingAction is action for f, capped by its source's max_action: a
 // model-based detector's findings can be kept from blocking a request.
 func (e *Engine) findingAction(f Finding, mode string) string {
 	a := e.action(f.Kind, mode)
-	if c := e.cfg.Sources[f.Source].MaxAction; c != "" && a != "keep" && actionRank[a] > actionRank[c] {
+	if c := e.source(f).MaxAction; c != "" && a != "keep" && actionRank[a] > actionRank[c] {
 		a = c
 	}
 	return a
@@ -178,7 +193,7 @@ func (e *Engine) findingAction(f Finding, mode string) string {
 // confident reports whether f meets its source's min_confidence. Unscored
 // findings always do.
 func (e *Engine) confident(f Finding) bool {
-	mc := e.cfg.Sources[f.Source].MinConfidence
+	mc := e.source(f).MinConfidence
 	if len(mc) == 0 || f.Confidence == 0 {
 		return true
 	}
@@ -209,12 +224,37 @@ func (e *Error) Error() string { return e.Msg }
 // every detector over a multi-megabyte image stalled requests for minutes.
 const inlineImageMin = 1024
 
-// detectRun is the detector state of one request: a source that failed
-// under on_error: rules_only is skipped for the rest of the request, so a
-// request with many texts waits for its timeout once, not once per text.
+// detectRun is the detector state of one client request: a source that
+// failed under on_error: rules_only is skipped for the rest of the request,
+// so a request with many texts, or redacted again for each failover
+// candidate, waits for its timeout once. It is used sequentially.
 type detectRun struct {
-	degraded map[string]bool
-	alerts   []string
+	degraded map[string]string // source -> alert
+	order    []string
+}
+
+func (r *detectRun) degrade(name string, err error) {
+	if _, ok := r.degraded[name]; ok {
+		return
+	}
+	r.degraded[name] = fmt.Sprintf("detector %s: %v; continued without it (on_error: rules_only)", name, err)
+	r.order = append(r.order, name)
+}
+
+type detectRunKey struct{}
+
+// WithRequestScope returns a context whose Apply calls share detector
+// degradation: pass it to every Apply of one client request (one per
+// failover candidate).
+func WithRequestScope(ctx context.Context) context.Context {
+	return context.WithValue(ctx, detectRunKey{}, &detectRun{degraded: map[string]string{}})
+}
+
+func runFrom(ctx context.Context) *detectRun {
+	if r, ok := ctx.Value(detectRunKey{}).(*detectRun); ok {
+		return r
+	}
+	return &detectRun{degraded: map[string]string{}}
 }
 
 // detect runs every detector on one string and reports whether it skipped an
@@ -258,7 +298,7 @@ func (e *Engine) detect(ctx context.Context, text string, run *detectRun) ([]Fin
 func (e *Engine) detectSegment(ctx context.Context, text string, run *detectRun) ([]Finding, error) {
 	var all []Finding
 	for _, f := range e.rules.Detect(text) {
-		all = append(all, Finding{Kind: f.Kind, Start: f.Start, End: f.End, Source: "rules"})
+		all = append(all, Finding{Kind: f.Kind, Start: f.Start, End: f.End, Source: SourceRules})
 	}
 	// case-insensitive for ASCII; fall back to exact matching when lower-casing
 	// would shift byte offsets
@@ -277,20 +317,19 @@ func (e *Engine) detectSegment(ctx context.Context, text string, run *detectRun)
 				break
 			}
 			s := off + i
-			all = append(all, Finding{Kind: Term, Start: s, End: s + len(lt), Source: "dictionary"})
+			all = append(all, Finding{Kind: Term, Start: s, End: s + len(lt), Source: SourceDictionary})
 			off = s + len(lt)
 		}
 	}
 	for _, d := range e.external {
 		name := d.Name()
-		if run.degraded[name] {
+		if _, ok := run.degraded[name]; ok {
 			continue
 		}
 		fs, err := e.detectExternal(ctx, d, text)
 		if err != nil {
 			if e.cfg.Sources[name].OnError == OnErrorRulesOnly {
-				run.degraded[name] = true
-				run.alerts = append(run.alerts, fmt.Sprintf("detector %s: %v; continued without it (on_error: rules_only)", name, err))
+				run.degrade(name, err)
 				continue
 			}
 			return nil, fmt.Errorf("detector %s: %w", name, err)
@@ -375,8 +414,14 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 		}
 		res.Report.Alerts = append(res.Report.Alerts, msg)
 	}
-	run := &detectRun{degraded: map[string]bool{}}
-	defer func() { res.Report.Alerts = append(res.Report.Alerts, run.alerts...) }()
+	run := runFrom(ctx)
+	defer func() {
+		// every report of the request names the sources it went without,
+		// including those that failed during an earlier failover candidate
+		for _, name := range run.order {
+			res.Report.Alerts = append(res.Report.Alerts, run.degraded[name])
+		}
+	}()
 	bucket := e.Vault.BucketWithTTL(vaultKey, e.vaultTTL)
 	masked := map[string]string{} // value -> placeholder, for thinking text
 	var blocked []string

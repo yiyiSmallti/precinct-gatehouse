@@ -943,6 +943,10 @@ func (c *Config) Validate() []string {
 		default:
 			add("plugins.%s.kind: must be detector, auth_policy, audit_sink, provider or hooks", pl.Name)
 		}
+		if pl.Kind == "detector" && (pl.Name == "rules" || pl.Name == "dictionary") {
+			// findings carry the detector name as their source; these two are the built-in detectors'
+			add("plugins.%s: name is reserved for the built-in detector", pl.Name)
+		}
 		if plugins[pl.Name] {
 			add("plugins.%s: duplicate name", pl.Name)
 		}

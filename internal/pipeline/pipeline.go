@@ -648,6 +648,9 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 	vaultKey := st.claims.ID + "\x00" + session
 
 	var lastErr *provider.UpstreamError
+	// one redaction scope for all candidates: a detector that failed under
+	// on_error: rules_only is not waited for again on failover
+	redactCtx := redact.WithRequestScope(ctx)
 	for _, ref := range cands {
 		prov, model, _ := st.snap.Reg.Lookup(ref)
 		mode := st.snap.Redactor.Mode(prov.Target, dataClass)
@@ -662,7 +665,7 @@ func (p *Pipeline) serve(ctx context.Context, st *reqState, r *http.Request, req
 		for k, v := range prov.ExtraBody {
 			out[k] = oai.Clone(v)
 		}
-		res, rerr := st.snap.Redactor.Apply(ctx, out, mode, userKey, vaultKey)
+		res, rerr := st.snap.Redactor.Apply(redactCtx, out, mode, userKey, vaultKey)
 		st.rec.Redaction = res.Report
 		st.rec.Model, st.rec.Target = ref, prov.Target
 		if rerr != nil {

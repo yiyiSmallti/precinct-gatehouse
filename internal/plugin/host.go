@@ -21,7 +21,6 @@ import (
 	sdk "github.com/yiyiSmallti/precinct-gatehouse/plugin"
 )
 
-
 // Restart backoff of a plugin whose process exited: it doubles from
 // RestartBackoffMin up to RestartBackoffMax and starts over once the plugin
 // has stayed up for RestartBackoffMax.

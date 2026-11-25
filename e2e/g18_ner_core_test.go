@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -196,7 +197,70 @@ func TestG18NERCore(t *testing.T) {
 	}
 	b, _ := json.Marshal(shadow)
 	rep.Check("影子运行的审计样本：source=ner、action=audit", ok, "%s", b)
+	g.Stop()
+
+	// ---------- gateway C: failover keeps the degraded state ----------
+	down := startFake(t, "down")
+	down.SetDown(true)
+	cloud3 := startFake(t, "cloud")
+	g = startGateway(t, fmt.Sprintf(g18FailoverConfig, down.URL, cloud3.URL), nil)
+	c5 := g18Calls(g.Dir)
+	start = time.Now()
+	r = g.Chat(t, g.Token, map[string]any{"model": "pair", "messages": msgs("user", "背景 #hang-detector 电话 "+g18Phone)}, nil)
+	el = time.Since(start)
+	sent = g18Last(cloud3)
+	rep.Check("故障转移到第二个候选时不再等检测器超时", r.Status == 200 && header(r, "X-Gatehouse-Model") == "cloud/strong" && len(down.Requests()) == 1 && g18Calls(g.Dir)-c5 == 1 && el < 1500*time.Millisecond && !strings.Contains(sent, g18Phone),
+		"status=%d 模型=%s，第一个候选收到 %d 次，插件调用 %d 次，耗时 %v", r.Status, header(r, "X-Gatehouse-Model"), len(down.Requests()), g18Calls(g.Dir)-c5, el.Round(time.Millisecond))
+	time.Sleep(200 * time.Millisecond)
+	recs, _ = g.AuditRecords(t)
+	alerted := false
+	if len(recs) > 0 {
+		b, _ := json.Marshal(recs[len(recs)-1]["redaction"])
+		alerted = strings.Contains(string(b), "on_error: rules_only")
+	}
+	rep.Check("最终审计记录仍含退化告警（失败发生在第一个候选）", alerted, "")
+	g.Stop()
+
+	// ---------- reserved names ----------
+	dir := t.TempDir()
+	cfg := strings.ReplaceAll(fmt.Sprintf(g18Config, local.URL, cloud.URL, "      max_action: audit"), "name: ner", "name: rules")
+	cfg = strings.ReplaceAll(cfg, "detectors: [ner]", "detectors: [rules]")
+	cfg = strings.ReplaceAll(cfg, "    ner:\n", "    rules:\n")
+	cfg = strings.ReplaceAll(strings.ReplaceAll(cfg, "{{LISTEN}}", "127.0.0.1:0"), "{{FAKEDET}}", fakeDetPath)
+	cfg = strings.ReplaceAll(cfg, "{{DIR}}", filepath.ToSlash(dir))
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte(cfg), 0o600)
+	out, err := exec.Command(gatehouse, "config", "check", "--config", cfgFile).CombinedOutput()
+	rep.Check("检测器插件不能命名为 rules / dictionary（否则其 max_action 会作用到内置规则）", err != nil && strings.Contains(string(out), "plugins.rules: name is reserved"), "%s", g18Problems(string(out)))
 }
+
+const g18FailoverConfig = `
+listen: {{LISTEN}}
+mode: personal
+providers:
+  - name: down
+    base_url: %s
+    target: external
+    models: [strong]
+  - name: cloud
+    base_url: %s
+    target: external
+    models: [strong]
+routing_groups:
+  pair:
+    type: order
+    members: [down/strong, cloud/strong]
+plugins:
+  - name: ner
+    kind: detector
+    path: {{FAKEDET}}
+    args: ["{{DIR}}"]
+redaction:
+  mode_by_target: { external: mask }
+  detectors: [ner]
+  sources:
+    ner: { timeout: 500ms, on_error: rules_only }
+`
 
 func g18Calls(dir string) int {
 	b, _ := os.ReadFile(filepath.Join(dir, "fakedetector.calls"))
@@ -254,4 +318,15 @@ func g18WaitLog(g *Gateway, s string, d time.Duration) bool {
 		}
 	}
 	return false
+}
+
+// g18Problems keeps the problem lines of `config check` output (not the temp path).
+func g18Problems(out string) string {
+	var ps []string
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimSpace(l); strings.HasPrefix(l, "- ") {
+			ps = append(ps, l)
+		}
+	}
+	return strings.Join(ps, "；")
 }
