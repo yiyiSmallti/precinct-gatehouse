@@ -12,15 +12,17 @@ import {
   toast,
 } from '/admin/js/ui.js';
 import { store } from '/admin/js/store.js';
+import { branding } from '/admin/js/branding.js';
 
 import { renderOverview } from '/admin/js/pages/overview.js';
-import { renderKeys } from '/admin/js/pages/keys.js';
+import { clearKeySecretCache, renderKeys } from '/admin/js/pages/keys.js';
 import { renderChannels } from '/admin/js/pages/channels.js';
 import { renderRouting } from '/admin/js/pages/routing.js';
 import { renderTiered } from '/admin/js/pages/tiered.js';
 import { renderRedaction } from '/admin/js/pages/redaction.js';
 import { renderLogs } from '/admin/js/pages/logs.js';
 import { renderUsage } from '/admin/js/pages/usage.js';
+import { renderBranding } from '/admin/js/pages/branding.js';
 import { renderSettings } from '/admin/js/pages/settings.js';
 import { renderUpdater } from '/admin/js/pages/updater.js';
 
@@ -41,6 +43,7 @@ const NAV_GROUPS = [
       { id: 'routing', title: '路由与别名', ic: 'routing', sec: ['routing', 'aliases'] },
       { id: 'tiered', title: '智能路由', ic: 'tiers', sec: 'providers' },
       { id: 'redaction', title: '隐私脱敏', ic: 'redaction', sec: 'redaction' },
+      { id: 'branding', title: '外观与模板', ic: 'brand' },
       { id: 'settings', title: '系统与配置', ic: 'settings', sec: 'general' },
       { id: 'updates', title: '系统更新', ic: 'download', sec: 'updater' },
     ],
@@ -56,6 +59,7 @@ const ROUTE_TITLES = {
   routing: '路由与别名',
   tiered: '智能路由',
   redaction: '隐私脱敏',
+  branding: '外观与模板',
   settings: '系统与配置',
   updates: '系统更新',
 };
@@ -116,10 +120,10 @@ function authLayout(card) {
   return el('div', { className: 'login-shell' },
     el('section', { className: 'login-hero', 'aria-hidden': 'true' },
       el('div', { className: 'login-hero-brand' },
-        el('img', { src: '/admin/img/icon-128.png', alt: '' }),
-        'Precinct Gatehouse'
+        el('img', { src: branding.getSmallLogoUrl(), alt: '' }),
+        branding.getDisplayName()
       ),
-      el('img', { className: 'login-hero-art', src: '/admin/img/icon-512.png', alt: '' }),
+      el('img', { className: 'login-hero-art', src: branding.getHeroLogoUrl(), alt: '' }),
       el('div', { className: 'login-hero-copy' },
         el('h2', null, '模型调用的唯一出口'),
         el('p', null, '多协议接入、路由分流、隐私脱敏、按 Token 计量与限额，一个控制台全部完成。')
@@ -163,7 +167,7 @@ function renderLogin() {
       try {
         const res = await api.login(userInput.value.trim() || 'admin', passInput.value);
         state.user = res.username || 'admin';
-        await store.refresh();
+        await Promise.all([store.refresh(), branding.loadSettings().catch(() => {})]);
         startPolling();
         renderApp();
       } catch (err) {
@@ -191,7 +195,7 @@ function renderLogin() {
     el('div', { className: 'login-card' },
       el('div', { className: 'login-head' },
         el('h1', { className: 'login-title' }, '欢迎回来'),
-        el('p', { className: 'login-sub' }, '登录门禁网关控制台')
+        el('p', { className: 'login-sub' }, branding.getLoginSub())
       ),
       form
     )
@@ -237,7 +241,7 @@ function renderSetup() {
       try {
         const res = await api.setup(codeInput.value.trim(), userInput.value.trim() || 'admin', passInput.value);
         state.user = res.username || 'admin';
-        await store.refresh();
+        await Promise.all([store.refresh(), branding.loadSettings().catch(() => {})]);
         startPolling();
         navigate(store.server?.raw?.providers?.length ? 'overview' : 'channels');
         renderApp();
@@ -400,7 +404,16 @@ let alertsHost = null;
 let pillHost = null;
 let sidebarNavHost = null;
 let sidebarVerHost = null;
+let sidebarBrandImg = null;
+let sidebarBrandTitle = null;
+let sidebarBrandSub = null;
 let titleHost = null;
+
+function renderBrandChrome() {
+  if (sidebarBrandImg) sidebarBrandImg.src = branding.getSmallLogoUrl();
+  if (sidebarBrandTitle) sidebarBrandTitle.textContent = branding.getSidebarTitle();
+  if (sidebarBrandSub) sidebarBrandSub.textContent = branding.getSidebarSub();
+}
 
 function renderTopbarStatus() {
   if (!pillHost) return;
@@ -506,10 +519,10 @@ function renderShell() {
 
   const sidebar = el('aside', { id: 'app-sidebar', className: 'sidebar' },
     el('div', { className: 'sidebar-brand' },
-      el('img', { className: 'brand-mark', src: '/admin/img/icon-128.png', alt: '' }),
+      (sidebarBrandImg = el('img', { className: 'brand-mark', src: branding.getSmallLogoUrl(), alt: '' })),
       el('div', { className: 'brand-text' },
-        el('span', { className: 'brand-title' }, '门禁网关'),
-        el('span', { className: 'brand-sub' }, 'Precinct Gatehouse')
+        (sidebarBrandTitle = el('span', { className: 'brand-title' }, branding.getSidebarTitle())),
+        (sidebarBrandSub = el('span', { className: 'brand-sub' }, branding.getSidebarSub()))
       )
     ),
     sidebarNavHost,
@@ -573,6 +586,7 @@ function renderShell() {
             // ignore
           }
           state.user = null;
+          clearKeySecretCache();
           store.discardAll();
           renderLogin();
         },
@@ -659,6 +673,9 @@ function renderPage() {
     case 'redaction':
       renderRedaction(pageHost, ctx);
       break;
+    case 'branding':
+      renderBranding(pageHost, ctx);
+      break;
     case 'logs':
       renderLogs(pageHost, ctx);
       break;
@@ -708,6 +725,10 @@ store.subscribe(() => {
   buildPendingBar();
 });
 
+branding.subscribe(() => {
+  renderBrandChrome();
+});
+
 window.addEventListener('hashchange', () => {
   if (!state.user) return;
   const { route, query } = parseHash();
@@ -719,6 +740,7 @@ window.addEventListener('hashchange', () => {
 setUnauthorizedHandler(() => {
   if (state.user !== null) {
     state.user = null;
+    clearKeySecretCache();
     store.discardAll();
     renderLogin();
   }
@@ -729,10 +751,11 @@ async function boot() {
   const { route, query } = parseHash();
   state.route = route;
   state.query = query;
+  await branding.loadPublic().catch(() => {});
   try {
     const me = await api.me();
     state.user = me.username || 'admin';
-    await store.refresh();
+    await Promise.all([store.refresh(), branding.loadSettings().catch(() => {})]);
     startPolling();
     renderShell();
   } catch {

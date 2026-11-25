@@ -75,6 +75,11 @@ export const api = {
   setupStatus: () => request('GET', '/admin/api/setup', undefined, { skipAuthRedirect: true }),
   setup: (code, username, password) =>
     request('POST', '/admin/api/setup', { code, username, password }, { skipAuthRedirect: true }),
+  getBranding: () => request('GET', '/admin/api/branding', undefined, { skipAuthRedirect: true }),
+  getBrandingSettings: () => request('GET', '/admin/api/branding/settings'),
+  putBrandingSettings: (data) => request('PUT', '/admin/api/branding/settings', data),
+  putBrandingLogo: (dataUrl) => request('PUT', '/admin/api/branding/logo', { data_url: dataUrl }),
+  deleteBrandingLogo: () => request('DELETE', '/admin/api/branding/logo', {}),
   stats: (params) => request('GET', `/admin/api/stats${buildQuery(params)}`),
   resetKeyUsage: (id) => request('POST', `/admin/api/keys/${encodeURIComponent(id)}/reset-usage`, {}),
   logout: () => request('POST', '/admin/api/logout', {}),
@@ -86,6 +91,7 @@ export const api = {
 
   listKeys: () => request('GET', '/admin/api/keys'),
   createKey: (data) => request('POST', '/admin/api/keys', data),
+  getKeySecret: (id) => request('GET', `/admin/api/keys/${encodeURIComponent(id)}/secret`),
   updateKey: (id, data) => request('PATCH', `/admin/api/keys/${encodeURIComponent(id)}`, data),
   resetKey: (id) => request('POST', `/admin/api/keys/${encodeURIComponent(id)}/reset`, {}),
   deleteKey: (id) => request('DELETE', `/admin/api/keys/${encodeURIComponent(id)}`),

@@ -89,11 +89,18 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /admin/api/login", s.login)
 	s.mux.HandleFunc("GET /admin/api/setup", s.setupStatus)
 	s.mux.HandleFunc("POST /admin/api/setup", s.completeSetup)
+	s.mux.HandleFunc("GET /admin/api/branding", s.getPublicBranding)
+	s.mux.HandleFunc("GET /admin/api/branding/logo", s.getBrandingLogo)
 	s.mux.HandleFunc("POST /admin/api/logout", s.guard(s.logout))
 	s.mux.HandleFunc("GET /admin/api/me", s.guard(s.me))
+	s.mux.HandleFunc("GET /admin/api/branding/settings", s.guard(s.getBrandingSettings))
+	s.mux.HandleFunc("PUT /admin/api/branding/settings", s.guard(s.putBrandingSettings))
+	s.mux.HandleFunc("PUT /admin/api/branding/logo", s.guard(s.putBrandingLogo))
+	s.mux.HandleFunc("DELETE /admin/api/branding/logo", s.guard(s.deleteBrandingLogo))
 	s.mux.HandleFunc("GET /admin/api/overview", s.guard(s.overview))
 	s.mux.HandleFunc("GET /admin/api/keys", s.guard(s.listKeys))
 	s.mux.HandleFunc("POST /admin/api/keys", s.guard(s.createKey))
+	s.mux.HandleFunc("GET /admin/api/keys/{id}/secret", s.guard(s.getKeySecret))
 	s.mux.HandleFunc("PATCH /admin/api/keys/{id}", s.guard(s.updateKey))
 	s.mux.HandleFunc("POST /admin/api/keys/{id}/reset", s.guard(s.resetKey))
 	s.mux.HandleFunc("POST /admin/api/keys/{id}/reset-usage", s.guard(s.resetKeyUsage))
@@ -583,6 +590,29 @@ func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func (s *Server) getKeySecret(w http.ResponseWriter, r *http.Request, _ string) {
+	if s.deps.Keys == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "key store unavailable")
+		return
+	}
+	id := r.PathValue("id")
+	plain, ok, err := s.deps.Keys.GetSecret(id)
+	if errors.Is(err, keys.ErrNotFound) {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":         id,
+		"has_secret": ok,
+		"key":        plain,
+	})
 }
 
 func (s *Server) logs(w http.ResponseWriter, r *http.Request, _ string) {

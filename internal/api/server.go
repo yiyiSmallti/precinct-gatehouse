@@ -175,7 +175,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	}
 	detectors, missing := host.StartDetectors(cfg, log)
 	s.Missing = missing
-	userKey, err := loadOrCreateKey(filepath.Join(cfg.DataDir, "user.key"))
+	userKey, err := LoadOrCreateUserKey(cfg.DataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -188,6 +188,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		return ResolveKey(db, ref)
 	}
 	hub.SetKeyResolver(resolveKey)
+	keyStore.SetSecretKey(userKey)
 	buildSnapshot := func(nextCfg *config.Config, prev *live.Snapshot) (*live.Snapshot, error) {
 		reg, err := provider.NewRegistry(nextCfg, resolveKey)
 		if err != nil {
@@ -701,6 +702,11 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Write(oai.Encode(out))
+}
+
+// LoadOrCreateUserKey loads or initializes the local symmetric key at <dataDir>/user.key.
+func LoadOrCreateUserKey(dataDir string) ([]byte, error) {
+	return loadOrCreateKey(filepath.Join(dataDir, "user.key"))
 }
 
 func loadOrCreateKey(path string) ([]byte, error) {
