@@ -182,6 +182,7 @@ redaction:
   - **重启窗口**：保持 fail-closed。需要脱敏的请求返回 `503 redaction_unavailable`；`org` 模式返回 `503 policy_unavailable`，且不使用策略缓存；Hooks 返回 `503 hook_unavailable`；Provider 按可重试上游错误处理（触发故障转移）；AuditSink 记录留在队列里按退避重试。
   - **状态**：重启事件写日志（`plugin process exited; restarting` / `plugin restarted` / `plugin restart failed`）。`/healthz` 新增 `plugins[]{name, kind, state(running|restarting|stopped), restarts, last_exit, last_error}`；有插件不在运行时 `status` 为 `degraded`，必需检测器同时列入 `detectors_unavailable`。
   - **关停与交接**：网关关停和 FD 热切换交接一开始就停止所有 supervisor（在途请求仍可使用正在运行的插件），随后 `Host.Close` 杀掉全部子进程，并等待正在进行的重启结束后再杀掉，不留孤儿进程。`plugins.*` 修改仍返回 `restart_required`，supervisor 不处理配置变更。验收见 `e2e/g17_plugin_restart_test.go`（`e2e/report/G17-plugin-restart.md`）。
+- **NER 检测器插件（`plugins/astrlink-detector`，M5）**：独立 Go module（需 cgo，网关主程序仍无 CGO），用 ONNX Runtime 运行 AstrLink Guard int8 模型，识别中英文人名、地址、账号、日期、电话、邮箱、银行卡与密钥；分词器复刻 HF XLM-R Unigram 流水线（与 HF tokenizers 逐 token 对拍一致），512 token 窗口、128 重叠。模型的密钥与银行卡判断输出为 `NER_SECRET`、`NER_CARD`，不复用规则的 `SECRET`、`BANK_CARD`；URL 与 IP 交给规则。插件只做标签映射和一个下限（`-min`，默认 0.5），阈值、动作上限与超时退化在 `redaction.sources.<名字>` 设置（见 3.2）。模型文件、构建与配置见插件 README，评测见 `plugins/astrlink-detector/eval/REPORT.md`，真实模型的端到端验收见 `e2e/g19_astrlink_test.go`（需本机模型，CI 只编译）。
 - **内置智能分层路由（`providers[].tiered`）**：
   - **配置 Schema**：`mode`（`shadow` | `active`）、`heavy_miss_threshold`、`health_interval_sec`、`zh_think_anchor`、`backends[]`（`id`, `url`, `tier`, `max_context_tokens`, `max_safe_input`, `promote_at`, `demote_below`, `speed_score`）、`starter_cache`（`enabled`, `canonicalize_tools`, `min_tokens`, `max_tokens`, `min_hits`, `max_entries`, `keepalive_sec`, `check_interval_sec`, `startup_delay_sec`, `entry_ttl_hours`, `persist_path`）。`shadow` 模式要求保留非空 `base_url`；`active` 模式可省略 `base_url`。
   - **运行模式与热重载**：`internal/tiered.Hub` 按 provider 名称维护常驻 `Router` 实例；`buildSnapshot`（含配置校验/预览）无副作用，`live.Manager.OnSwap` 仅在真实快照切换时调用 `Hub.Activate` 原地更新后端与 Starter 参数，完整保留内存前缀缓存、会话滞回表及后台探测协程；响应传播 `X-Router-*` 头并在 SQLite `request_log` 写入 `route_backend` / `route_reason`。
@@ -189,7 +190,7 @@ redaction:
 
 #### 尚未实现或受限项
 
-- NER 检测器插件本身（M5；核心侧的增量检测缓存、按来源阈值/动作上限/超时退化已实现，验收见 `e2e/g18_ner_core_test.go`），`Detect` 的 `hints` 尚未传消息角色；插件包（`.tgz` + `gatehouse` 字段）安装命令。
+- NER 插件（`plugins/astrlink-detector`）未进入发布产物：CI 只编译 linux/amd64 并上传为构建产物，模型与 ONNX Runtime 需部署方自备；`Detect` 的 `hints` 尚未传消息角色；插件包（`.tgz` + `gatehouse` 字段）安装命令。
 - Gemini 原生协议互转；OpenAI Responses 的 `previous_response_id` 有状态续聊（返回 `400 previous_response_not_supported`）；Responses 中 `web_search`、`custom` 等非 `function` 内置工具会被丢弃并在 `X-Gatehouse-Dropped-Tools` 响应头中列出。
 - `org` 模式暂不使用 `byo_api` 与策略下发的 `redaction` 段（脱敏仍按本机配置）；`budget.period` 仅透传不解释；`sk-` API Key 仅限 `personal` 模式使用。
 - 外部目标含图请求归类为 `image`，默认动作同其他类别（`mask` 模式下视为 `warn`，原样发出并告警），可配置 `image: block`。

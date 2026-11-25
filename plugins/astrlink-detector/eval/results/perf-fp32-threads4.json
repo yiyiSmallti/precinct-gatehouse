@@ -1,0 +1,30 @@
+{
+ "batch4_ms_per_window": 81.71424999999999,
+ "batch8_ms_per_window": 84.3227,
+ "cpus": 10,
+ "detect_131k": {
+  "detect_ms": 29186.555,
+  "tokenize_ms": 71.461,
+  "tokens": 131151
+ },
+ "detect_2k": {
+  "detect_ms": 399.755,
+  "tokenize_ms": 2.859,
+  "tokens": 2012
+ },
+ "detect_32k": {
+  "detect_ms": 7200.745,
+  "tokenize_ms": 17.816,
+  "tokens": 32034
+ },
+ "detect_8k": {
+  "detect_ms": 1818.857,
+  "tokenize_ms": 4.196,
+  "tokens": 8036
+ },
+ "max_rss_mb": 1175.890625,
+ "rss_mb": 704.375,
+ "window512_max_ms": 99.943,
+ "window512_p50_ms": 64.497,
+ "window512_p95_ms": 88.31
+}
