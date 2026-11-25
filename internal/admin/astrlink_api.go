@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/updater"
 )
 
 const (
@@ -280,6 +281,11 @@ func (s *Server) runAstrlinkInstall(spec astrlinkPlatformSpec, req astrlinkInsta
 
 	st := s.deps.Live.Status()
 	paths := resolveAstrlinkPaths(st.Snapshot.Cfg, spec)
+	fallbackDNS := []string{"223.5.5.5", "119.29.29.29"}
+	if st.Snapshot.Cfg.Updater.FallbackDNS != nil && len(*st.Snapshot.Cfg.Updater.FallbackDNS) > 0 {
+		fallbackDNS = *st.Snapshot.Cfg.Updater.FallbackDNS
+	}
+	httpClient := updater.NewHTTPClient(5*time.Minute, fallbackDNS)
 
 	fail := func(step, msg string, err error) {
 		s.astrlink.set(false, step, msg, err.Error())
@@ -295,7 +301,7 @@ func (s *Server) runAstrlinkInstall(spec astrlinkPlatformSpec, req astrlinkInsta
 	// 1. Install astrlink-detector binary
 	if req.Force || !fileReady(paths.BinPath) {
 		s.astrlink.set(true, "binary", "正在安装 astrlink-detector 插件程序...", "")
-		if err := ensureAstrlinkBinary(ctx, paths.BinPath, spec, s.deps.Version, req.GHMirror); err != nil {
+		if err := ensureAstrlinkBinary(ctx, httpClient, paths.BinPath, spec, s.deps.Version, req.GHMirror); err != nil {
 			fail("binary", "插件程序安装失败", err)
 			return
 		}
@@ -304,22 +310,27 @@ func (s *Server) runAstrlinkInstall(spec astrlinkPlatformSpec, req astrlinkInsta
 	// 2. Install ONNX Runtime shared library
 	if req.Force || !fileReady(paths.ORTPath) {
 		s.astrlink.set(true, "ort", fmt.Sprintf("正在下载 ONNX Runtime %s...", astrlinkORTVersion), "")
-		if err := ensureAstrlinkORT(ctx, paths.ORTPath, spec, req.GHMirror); err != nil {
+		if err := ensureAstrlinkORT(ctx, httpClient, paths.ORTPath, spec, req.GHMirror); err != nil {
 			fail("ort", "ONNX Runtime 下载安装失败", err)
 			return
 		}
 	}
 
 	// 3. Install AstrLink Guard int8 model files
+	skipSHA := os.Getenv("GATEHOUSE_ASTRLINK_SKIP_SHA256") == "1"
 	if req.Force || !modelDirReady(paths.ModelDir) {
 		for idx, mf := range astrlinkModelFiles {
 			dst := filepath.Join(paths.ModelDir, mf.Name)
-			if !req.Force && verifyFileSHA256(dst, mf.SHA256) == nil {
+			wantSHA := mf.SHA256
+			if skipSHA {
+				wantSHA = ""
+			}
+			if !req.Force && wantSHA != "" && verifyFileSHA256(dst, wantSHA) == nil {
 				continue
 			}
 			s.astrlink.set(true, "model", fmt.Sprintf("正在下载模型文件 (%d/%d): %s...", idx+1, len(astrlinkModelFiles), mf.Name), "")
 			url := fmt.Sprintf("%s/%s/resolve/%s/int8/%s", req.HFMirror, astrlinkModelRepo, astrlinkModelRev, mf.Name)
-			if err := downloadFileVerified(ctx, url, dst, mf.SHA256, 0o644); err != nil {
+			if err := downloadFileVerified(ctx, httpClient, url, dst, wantSHA, 0o644); err != nil {
 				fail("model", "模型文件下载或校验失败: "+mf.Name, err)
 				return
 			}
@@ -402,37 +413,40 @@ func applyGHMirror(rawURL, ghMirror string) string {
 	return ghMirror + "/" + rawURL
 }
 
-func ensureAstrlinkBinary(ctx context.Context, dst string, spec astrlinkPlatformSpec, version, ghMirror string) error {
-	// 1. Copy if placed beside the gatehouse executable.
-	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
-		for _, cand := range []string{spec.BinName, spec.ReleaseAsset} {
-			p := filepath.Join(exeDir, cand)
-			if fileReady(p) {
-				return copyFileAtomic(p, dst, 0o755)
-			}
-		}
-	}
-
-	// 2. Build from local source checkout if available and Go toolchain exists.
-	if srcDir := findLocalAstrlinkSource(); srcDir != "" {
-		if _, err := exec.LookPath("go"); err == nil {
-			tmp := dst + ".tmp"
-			cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags", "-s -w", "-o", tmp, ".")
-			cmd.Dir = srcDir
-			cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
-			if out, err := cmd.CombinedOutput(); err == nil {
-				if err := os.Chmod(tmp, 0o755); err != nil {
-					_ = os.Remove(tmp)
-					return err
+func ensureAstrlinkBinary(ctx context.Context, client *http.Client, dst string, spec astrlinkPlatformSpec, version, ghMirror string) error {
+	ghBase := strings.TrimRight(os.Getenv("GATEHOUSE_ASTRLINK_GH_BASE"), "/")
+	if ghBase == "" {
+		// 1. Copy if placed beside the gatehouse executable.
+		if exe, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exe)
+			for _, cand := range []string{spec.BinName, spec.ReleaseAsset} {
+				p := filepath.Join(exeDir, cand)
+				if fileReady(p) {
+					return copyFileAtomic(p, dst, 0o755)
 				}
-				return os.Rename(tmp, dst)
-			} else {
-				_ = os.Remove(tmp)
-				// Fall through to GitHub Release download, but keep context if download also fails.
-				_ = out
 			}
 		}
+
+		// 2. Build from local source checkout if available and Go toolchain exists.
+		if srcDir := findLocalAstrlinkSource(); srcDir != "" {
+			if _, err := exec.LookPath("go"); err == nil {
+				tmp := dst + ".tmp"
+				cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags", "-s -w", "-o", tmp, ".")
+				cmd.Dir = srcDir
+				cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+				if out, err := cmd.CombinedOutput(); err == nil {
+					if err := os.Chmod(tmp, 0o755); err != nil {
+						_ = os.Remove(tmp)
+						return err
+					}
+					return os.Rename(tmp, dst)
+				} else {
+					_ = os.Remove(tmp)
+					_ = out
+				}
+			}
+		}
+		ghBase = "https://github.com/" + astrlinkGHRepo + "/releases"
 	}
 
 	// 3. Download from GitHub Release.
@@ -442,13 +456,13 @@ func ensureAstrlinkBinary(ctx context.Context, dst string, spec astrlinkPlatform
 		if !strings.HasPrefix(ver, "v") {
 			ver = "v" + ver
 		}
-		urls = append(urls, fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", astrlinkGHRepo, ver, spec.ReleaseAsset))
+		urls = append(urls, fmt.Sprintf("%s/download/%s/%s", ghBase, ver, spec.ReleaseAsset))
 	}
-	urls = append(urls, fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", astrlinkGHRepo, spec.ReleaseAsset))
+	urls = append(urls, fmt.Sprintf("%s/latest/download/%s", ghBase, spec.ReleaseAsset))
 
 	var lastErr error
 	for _, u := range urls {
-		if err := downloadFileVerified(ctx, applyGHMirror(u, ghMirror), dst, "", 0o755); err == nil {
+		if err := downloadFileVerified(ctx, client, applyGHMirror(u, ghMirror), dst, "", 0o755); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -474,13 +488,17 @@ func findLocalAstrlinkSource() string {
 	return ""
 }
 
-func ensureAstrlinkORT(ctx context.Context, dst string, spec astrlinkPlatformSpec, ghMirror string) error {
-	rawURL := fmt.Sprintf("https://github.com/microsoft/onnxruntime/releases/download/v%s/%s", astrlinkORTVersion, spec.ORTArchive)
+func ensureAstrlinkORT(ctx context.Context, client *http.Client, dst string, spec astrlinkPlatformSpec, ghMirror string) error {
+	ortBase := strings.TrimRight(os.Getenv("GATEHOUSE_ASTRLINK_ORT_BASE"), "/")
+	if ortBase == "" {
+		ortBase = "https://github.com/microsoft/onnxruntime/releases/download"
+	}
+	rawURL := fmt.Sprintf("%s/v%s/%s", ortBase, astrlinkORTVersion, spec.ORTArchive)
 	url := applyGHMirror(rawURL, ghMirror)
 
 	tmpArchive := dst + ".archive.tmp"
 	defer os.Remove(tmpArchive)
-	if err := downloadFileVerified(ctx, url, tmpArchive, "", 0o644); err != nil {
+	if err := downloadFileVerified(ctx, client, url, tmpArchive, "", 0o644); err != nil {
 		return err
 	}
 	if strings.HasSuffix(spec.ORTArchive, ".zip") {
@@ -542,15 +560,13 @@ func extractORTFromZip(archivePath, targetBase, dst string) error {
 	return fmt.Errorf("archive does not contain %s", targetBase)
 }
 
-var astrlinkHTTPClient = &http.Client{Timeout: 5 * time.Minute}
-
-func downloadFileVerified(ctx context.Context, url, dst, wantSHA string, mode os.FileMode) error {
+func downloadFileVerified(ctx context.Context, client *http.Client, url, dst, wantSHA string, mode os.FileMode) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("User-Agent", "precinct-gatehouse-installer/1.0")
-	resp, err := astrlinkHTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}

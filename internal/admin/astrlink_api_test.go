@@ -134,7 +134,7 @@ func TestDownloadAndExtractHelpers(t *testing.T) {
 
 	dir := t.TempDir()
 	tgzPath := filepath.Join(dir, "ort.tgz")
-	if err := downloadFileVerified(context.Background(), srv.URL, tgzPath, wantSHA, 0o644); err != nil {
+	if err := downloadFileVerified(context.Background(), srv.Client(), srv.URL, tgzPath, wantSHA, 0o644); err != nil {
 		t.Fatalf("downloadFileVerified: %v", err)
 	}
 	libPath := filepath.Join(dir, "libonnxruntime.so.1.27.0")
