@@ -127,14 +127,34 @@ func TestG16VaultPersist(t *testing.T) {
 	rep.Check("审计与网关日志不含明文", !strings.Contains(audit, g16Phone) && !strings.Contains(audit, g16Term) && !strings.Contains(logs, g16Phone) && !strings.Contains(logs, g16Term),
 		"审计 %d 字节，日志 %d 字节", len(audit), len(logs))
 
-	// 4. TTL: an idle bucket expires on disk too
+	// 4. a session in use within vault_ttl keeps its stored mappings, even
+	// though stored activity updates are throttled (ttl 2s: at most every
+	// 0.5s). Requests at 0s and 0.4s leave the stored time at 0s; at 2.2s the
+	// session is only 1.8s idle and must not be expired on disk.
 	short := fmt.Sprintf(g16Config, cloud.URL, true, "2s")
+	g = startGatewayIn(t, dir, "config.yaml", short, nil)
+	sessL := map[string]string{"X-Gatehouse-Session": "g16-live"}
+	t0 := time.Now()
+	g.Chat(t, g.Token, first, sessL)
+	time.Sleep(time.Until(t0.Add(400 * time.Millisecond)))
+	g.Chat(t, g.Token, first, sessL)
+	time.Sleep(time.Until(t0.Add(2200 * time.Millisecond)))
+	g.Chat(t, g.Token, first, sessL)
+	g.Stop()
+	g = startGatewayIn(t, dir, "config.yaml", short, nil)
+	r = g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": msgs("user", echo)}, sessL)
+	rep.Check("TTL 内持续使用的会话：活动时间节流写盘不会让磁盘对照提前过期，重启后仍回填", r.Status == 200 && strings.Contains(r.Content(), g16Phone) && strings.Contains(r.Content(), g16Term),
+		"请求于 0 s、0.4 s、2.2 s（vault_ttl 2 s），重启后客户端收到：%q", r.Content())
+	g.Stop()
+
+	// 5. TTL: an idle bucket expires on disk too (after vault_ttl plus the
+	// stored-activity throttle, 2s + 0.5s here)
 	g = startGatewayIn(t, dir, "config.yaml", short, nil)
 	sessT := map[string]string{"X-Gatehouse-Session": "g16-ttl"}
 	g.Chat(t, g.Token, first, sessT)
 	before := g16Count(t, dir, `SELECT COUNT(*) FROM vault_entries`)
 	g.Stop()
-	time.Sleep(2500 * time.Millisecond)
+	time.Sleep(3200 * time.Millisecond)
 	g = startGatewayIn(t, dir, "config.yaml", short, nil)
 	r = g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": msgs("user", echo)}, sessT)
 	after := g16Count(t, dir, `SELECT COUNT(*) FROM vault_entries`)
@@ -142,7 +162,7 @@ func TestG16VaultPersist(t *testing.T) {
 		"过期前 vault_entries=%d，过期后=%d；客户端收到：%q", before, after, r.Content())
 	g.Stop()
 
-	// 5. control: without vault_persist the restart loses the mapping
+	// 6. control: without vault_persist the restart loses the mapping
 	cloud2 := startFake(t, "cloud")
 	off := fmt.Sprintf(g16Config, cloud2.URL, false, "24h")
 	g = startGateway(t, off, nil)

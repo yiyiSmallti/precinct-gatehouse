@@ -96,7 +96,7 @@ func (v *Vault) sweepLocked(now time.Time) {
 	}
 	v.lastGC = now
 	if v.store != nil && v.sweeping.CompareAndSwap(false, true) {
-		cutoff := now.Add(-v.ttl)
+		cutoff := now.Add(-diskTTL(v.ttl))
 		go func() {
 			defer v.sweeping.Store(false)
 			if err := v.store.Sweep(cutoff); err != nil {
@@ -147,7 +147,7 @@ func (v *Vault) BucketWithTTL(key string, ttl time.Duration) *Bucket {
 	b.seen = now
 	if v.store != nil && now.Sub(b.stored) >= touchEvery(ttl) {
 		b.stored = now
-		if err := v.store.Touch(b.id, now, ttl); err != nil {
+		if err := v.store.Touch(b.id, now, diskTTL(ttl)); err != nil {
 			v.warn("vault touch failed", err)
 		}
 	}
@@ -158,6 +158,16 @@ func (v *Vault) BucketWithTTL(key string, ttl time.Duration) *Bucket {
 // bucket in use is never swept as idle by another process.
 func touchEvery(ttl time.Duration) time.Duration {
 	return min(time.Minute, ttl/4)
+}
+
+// diskTTL is the idle time after which stored mappings expire. The stored
+// activity time lags the real last use by up to touchEvery(ttl), so expiring
+// on disk at plain ttl could delete the mappings of a bucket that is still
+// live in memory (a process holding a bucket seen within ttl would then keep
+// using mappings that a restart or the other handoff process can no longer
+// restore).
+func diskTTL(ttl time.Duration) time.Duration {
+	return ttl + touchEvery(ttl)
 }
 
 // warn logs a store failure. Store errors never carry values (they are bound
