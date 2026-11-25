@@ -299,7 +299,13 @@ func freePort(t *testing.T) string {
 // startGateway writes config (with {{LISTEN}} and {{DIR}} substituted) and starts serve.
 func startGateway(t *testing.T, cfg string, files map[string]string) *Gateway {
 	t.Helper()
-	dir := t.TempDir()
+	return startGatewayIn(t, t.TempDir(), "config.yaml", cfg, files)
+}
+
+// startGatewayIn starts serve with <dir>/<cfgName> on a fresh port, reusing
+// whatever dir already holds (gatehouse.db, user.key, local.token).
+func startGatewayIn(t *testing.T, dir, cfgName, cfg string, files map[string]string) *Gateway {
+	t.Helper()
 	addr := freePort(t)
 	cfg = strings.ReplaceAll(cfg, "{{LISTEN}}", addr)
 	cfg = strings.ReplaceAll(cfg, "{{DIR}}", filepath.ToSlash(dir))
@@ -308,11 +314,11 @@ func startGateway(t *testing.T, cfg string, files map[string]string) *Gateway {
 	for name, content := range files {
 		os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, cfgName), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	g := &Gateway{Dir: dir, URL: "http://" + addr + "/v1", log: &bytes.Buffer{}}
-	g.cmd = exec.Command(gatehouse, "serve", "--config", filepath.Join(dir, "config.yaml"))
+	g.cmd = exec.Command(gatehouse, "serve", "--config", filepath.Join(dir, cfgName))
 	g.cmd.Stdout, g.cmd.Stderr = g.log, g.log
 	if err := g.cmd.Start(); err != nil {
 		t.Fatal(err)

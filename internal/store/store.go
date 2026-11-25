@@ -1,5 +1,5 @@
 // Package store opens the local SQLite database (pure Go, no cgo) that holds
-// issued tokens and usage records.
+// issued tokens, usage records and the encrypted redaction vault.
 package store
 
 import (
@@ -103,6 +103,24 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at);
+-- redaction vault (redaction.vault_persist): bucket is a keyed hash of the
+-- user+session key, value is AES-256-GCM ciphertext; no plaintext is stored
+CREATE TABLE IF NOT EXISTS vault_buckets (
+  bucket  TEXT PRIMARY KEY,
+  seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS vault_buckets_seen ON vault_buckets(seen_at);
+CREATE TABLE IF NOT EXISTS vault_entries (
+  bucket      TEXT NOT NULL,
+  placeholder TEXT NOT NULL,
+  value       BLOB NOT NULL,
+  PRIMARY KEY (bucket, placeholder)
+);
+-- an entry always has a bucket row, so the TTL sweep reaches it even if the
+-- writer's activity update failed
+CREATE TRIGGER IF NOT EXISTS vault_entries_bucket AFTER INSERT ON vault_entries BEGIN
+  INSERT OR IGNORE INTO vault_buckets(bucket, seen_at) VALUES (NEW.bucket, CAST(strftime('%s','now') AS INTEGER) * 1000);
+END;
 `
 
 // Open opens (and migrates) <dataDir>/gatehouse.db.

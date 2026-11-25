@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -52,7 +53,8 @@ type Server struct {
 	UserKey    []byte
 	Version    string
 	Missing    []string // required detectors that are unavailable
-	PolicyDown bool     // org mode: the policy plugin did not start
+	PolicyDown bool     // org mode: the policy plugin was not running at start
+	Plugins    *plugin.Host
 	closers    []func()
 	otlp       *meter.OTLP
 }
@@ -143,35 +145,44 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 	s.closers = append(s.closers, host.Close)
 	sink := audit.NewForwarder(fileSink, log)
 	s.closers = append(s.closers, func() { sink.Close(5 * time.Second) })
-	sinks, failedSinks := host.StartKind(cfg, sdk.KindAuditSink, log)
+	s.Plugins = host
+	// every enabled plugin is supervised (restarted with backoff when its
+	// process exits); the adapters below look up its current process per call
+	sinks, disabledSinks := host.StartKind(cfg, sdk.KindAuditSink, log)
 	for _, as := range sinks {
-		sink.Add(as.Name, as.Impl.(sdk.AuditSink))
+		sink.Add(as.Name, plugin.AuditSink(as))
 	}
-	if len(failedSinks) > 0 {
-		log.Warn("audit sink plugins unavailable; records stay in the local audit file", "plugins", failedSinks)
+	if len(disabledSinks) > 0 {
+		log.Warn("audit sink plugins disabled; records stay in the local audit file", "plugins", disabledSinks)
 	}
 	provPlugins, _ := host.StartKind(cfg, sdk.KindProvider, log)
 	var hooks []pipeline.Hook
-	hookPlugins, failedHooks := host.StartKind(cfg, sdk.KindHooks, log)
+	hookPlugins, disabledHooks := host.StartKind(cfg, sdk.KindHooks, log)
 	for _, hp := range hookPlugins {
-		hooks = append(hooks, pipeline.Hook{Name: hp.Name, Impl: hp.Impl.(sdk.Hooks), Exited: hp.Exited})
+		hooks = append(hooks, pipeline.Hook{Name: hp.Name, Current: func() (sdk.Hooks, bool) {
+			raw, ok := hp.Impl()
+			if !ok {
+				return nil, false
+			}
+			return raw.(sdk.Hooks), true
+		}})
 	}
-	for _, n := range failedHooks {
-		// a hook that did not start refuses requests rather than being skipped
-		hooks = append(hooks, pipeline.Hook{Name: n, Exited: func() bool { return true }})
+	for _, n := range disabledHooks {
+		// a disabled hook refuses requests rather than being skipped
+		hooks = append(hooks, pipeline.Hook{Name: n, Current: func() (sdk.Hooks, bool) { return nil, false }})
 	}
 	var resolver *policy.Resolver
 	if cfg.Mode == "org" {
-		pols, failed := host.StartKind(cfg, sdk.KindAuthPolicy, log)
+		pols, disabled := host.StartKind(cfg, sdk.KindAuthPolicy, log)
 		switch {
 		case len(pols) == 1:
 			resolver = policy.New(cfg, pols[0].Name, pols[0])
-		case len(failed) == 1:
-			resolver = policy.New(cfg, failed[0], nil)
-			s.PolicyDown = true
+		case len(disabled) == 1:
+			resolver = policy.New(cfg, disabled[0], nil)
 		default:
 			return nil, fmt.Errorf("org mode needs exactly one auth_policy plugin")
 		}
+		s.PolicyDown = !resolver.Available()
 	}
 	detectors, missing := host.StartDetectors(cfg, log)
 	s.Missing = missing
@@ -180,6 +191,16 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		return nil, err
 	}
 	s.UserKey = userKey
+	// one vault for the process: snapshots built on reload share it
+	vault := redact.NewVault(cfg.Redaction.VaultTTL.D(24 * time.Hour))
+	if cfg.Redaction.VaultPersistOn() {
+		vs, err := redact.NewSQLVaultStore(db, userKey)
+		if err != nil {
+			return nil, fmt.Errorf("redaction.vault_persist: %w", err)
+		}
+		vault.SetStore(vs, log)
+		log.Info("redaction vault persisted (AES-256-GCM) in gatehouse.db")
+	}
 
 	hub := tiered.NewHub(cfg.DataDir, log)
 	s.Tiered = hub
@@ -228,9 +249,7 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		if err != nil {
 			return nil, fmt.Errorf("redaction: %w", err)
 		}
-		if prev != nil && prev.Redactor != nil {
-			red.Vault = prev.Redactor.Vault
-		}
+		red.Vault = vault
 		rt := route.New(nextCfg, reg)
 		rt.Prepare = func(text, target, dataClass string) (string, error) {
 			// the classifier sees the last user message: redact it like any other outbound text
@@ -379,6 +398,10 @@ func (s *Server) ShutdownHandoff(ctx context.Context) {
 }
 
 func (s *Server) shutdownInternal(ctx context.Context, skipTieredSave bool) {
+	if s.Plugins != nil {
+		// keep running plugins for the drain, but restart none of them
+		s.Plugins.StopRestarts()
+	}
 	if s.HTTP != nil {
 		_ = s.HTTP.Shutdown(ctx)
 	}
@@ -656,11 +679,10 @@ func computeMissingDetectors(required []string, running []redact.ExternalDetecto
 	if len(required) == 0 {
 		return nil
 	}
+	// a configured detector is supervised: while it restarts its Detect calls
+	// fail (fail-closed) and /healthz reports it, so it is not "missing" here
 	active := make(map[string]bool, len(running))
 	for _, d := range running {
-		if ex, ok := d.(interface{ Exited() bool }); ok && ex.Exited() {
-			continue
-		}
 		active[d.Name()] = true
 	}
 	seen := make(map[string]bool, len(required))
@@ -690,11 +712,32 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	} else {
 		missing = s.Missing
 	}
+	missing = slices.Clone(missing)
 	status := "ok"
+	var plugins []plugin.Status
+	if s.Plugins != nil {
+		plugins = s.Plugins.Status()
+	}
+	required := map[string]bool{}
+	for _, d := range snap.Cfg.Redaction.Detectors {
+		required[d] = true
+	}
+	for _, ps := range plugins {
+		if ps.State == plugin.StateRunning {
+			continue
+		}
+		status = "degraded"
+		if ps.Kind == sdk.KindDetector && required[ps.Name] && !slices.Contains(missing, ps.Name) {
+			missing = append(missing, ps.Name)
+		}
+	}
 	if len(missing) > 0 {
 		status = "degraded"
 	}
-	out := map[string]any{"status": status, "version": s.Version, "mode": snap.Cfg.Mode, "config_version": snap.Version, "detectors_unavailable": missing}
+	if plugins == nil {
+		plugins = []plugin.Status{}
+	}
+	out := map[string]any{"status": status, "version": s.Version, "mode": snap.Cfg.Mode, "config_version": snap.Version, "detectors_unavailable": missing, "plugins": plugins}
 	if pol := s.Pipeline.Policy; pol != nil {
 		out["policy"] = map[string]any{"plugin": pol.Name(), "available": pol.Available()}
 		if !pol.Available() {

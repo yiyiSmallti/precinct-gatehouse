@@ -5,8 +5,8 @@
 //
 // Placeholders are {{KIND_xxxxxxxx}} where the hash is an HMAC of the
 // normalised value under a per-user key, so the same value always gets the
-// same placeholder for the same user, across turns. The mapping lives only in
-// the in-memory Vault.
+// same placeholder for the same user, across turns. The mapping lives in the
+// in-memory Vault and, with redaction.vault_persist, encrypted in gatehouse.db.
 package redact
 
 import (

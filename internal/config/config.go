@@ -328,6 +328,7 @@ type Redaction struct {
 	FailClosed      *bool             `yaml:"fail_closed,omitempty" json:"fail_closed,omitempty"`           // default true
 	StripFields     []string          `yaml:"strip_fields,omitempty" json:"strip_fields,omitempty"`         // extra top-level request fields removed before anything else (dsh_session_log always is)
 	VaultTTL        Duration          `yaml:"vault_ttl,omitempty" json:"vault_ttl,omitempty"`               // default 24h of inactivity
+	VaultPersist    *bool             `yaml:"vault_persist,omitempty" json:"vault_persist,omitempty"`       // default false: also keep placeholder mappings AES-256-GCM encrypted in <data_dir>/gatehouse.db
 }
 
 // Meter configures usage metering.
@@ -1008,6 +1009,10 @@ func (c *Config) hasPlugin(name, kind string) bool {
 // FailClosedOn reports whether redaction fails closed (default true).
 func (r Redaction) FailClosedOn() bool { return r.FailClosed == nil || *r.FailClosed }
 
+// VaultPersistOn reports whether placeholder mappings are also persisted
+// (encrypted) on disk. Off by default: it puts sensitive values at rest.
+func (r Redaction) VaultPersistOn() bool { return r.VaultPersist != nil && *r.VaultPersist }
+
 // Provider returns the provider by name.
 func (c *Config) Provider(name string) *Provider {
 	for i := range c.Providers {
@@ -1072,6 +1077,9 @@ func RestartRequiredDiff(old, next *Config) []string {
 	}
 	if !reflect.DeepEqual(old.Plugins, next.Plugins) {
 		out = append(out, "plugins")
+	}
+	if old.Redaction.VaultPersistOn() != next.Redaction.VaultPersistOn() {
+		out = append(out, "redaction.vault_persist")
 	}
 	if old.Audit.Dir != next.Audit.Dir {
 		out = append(out, "audit.dir")

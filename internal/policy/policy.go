@@ -52,7 +52,7 @@ func (e *Error) Error() string { return e.Msg }
 // Resolver calls the AuthPolicy plugin with a short-lived cache.
 type Resolver struct {
 	name    string
-	plug    *plugin.Started // nil when the plugin is disabled or failed to start
+	plug    *plugin.Started // nil when the plugin is disabled; supervised (restarted) otherwise
 	timeout time.Duration
 	maxAge  time.Duration
 
@@ -75,7 +75,8 @@ func New(cfg *config.Config, name string, plug *plugin.Started) *Resolver {
 	}
 }
 
-// Available reports whether the policy plugin is running.
+// Available reports whether the policy plugin is running. It is false while
+// the plugin restarts after a crash.
 func (r *Resolver) Available() bool { return r.plug != nil && !r.plug.Exited() }
 
 // Name is the policy plugin's configured name.
@@ -98,7 +99,12 @@ func (r *Resolver) Resolve(ctx context.Context, tok string, meta *sdk.RequestMet
 
 	cctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	gc, err := r.plug.Impl.(sdk.AuthPolicy).Resolve(cctx, tok, meta)
+	raw, ok := r.plug.Impl()
+	if !ok {
+		// exited after the check above
+		return nil, &Error{Status: http.StatusServiceUnavailable, Code: "policy_unavailable", Msg: fmt.Sprintf("policy plugin %s is not running; org mode refuses requests (fail-closed)", r.name)}
+	}
+	gc, err := raw.(sdk.AuthPolicy).Resolve(cctx, tok, meta)
 	if err != nil {
 		st, _ := status.FromError(err)
 		switch st.Code() {
