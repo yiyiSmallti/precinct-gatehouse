@@ -191,8 +191,9 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 		return nil, err
 	}
 	s.UserKey = userKey
-	// one vault for the process: snapshots built on reload share it
+	// one vault and one detector result cache for the process: snapshots built on reload share them
 	vault := redact.NewVault(cfg.Redaction.VaultTTL.D(24 * time.Hour))
+	detectCache := redact.NewDetectCache(redact.DefaultDetectCacheEntries)
 	if cfg.Redaction.VaultPersistOn() {
 		vs, err := redact.NewSQLVaultStore(db, userKey)
 		if err != nil {
@@ -250,12 +251,15 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 			return nil, fmt.Errorf("redaction: %w", err)
 		}
 		red.Vault = vault
+		red.Cache = detectCache
 		rt := route.New(nextCfg, reg)
-		rt.Prepare = func(text, target, dataClass string) (string, error) {
+		rt.Prepare = func(ctx context.Context, text, target, dataClass string) (string, error) {
 			// the classifier sees the last user message: redact it like any other outbound text
 			mode := red.Mode(target, dataClass)
 			req := oai.Object{"messages": []any{map[string]any{"role": "user", "content": text}}}
-			if _, err := red.Apply(context.Background(), req, mode, userKey, "classifier"); err != nil {
+			// ctx carries the request's redaction scope: a detector that fails
+			// here is not waited for again when the request itself is redacted
+			if _, err := red.Apply(ctx, req, mode, userKey, "classifier"); err != nil {
 				return "", err
 			}
 			return oai.Text(oai.Messages(req)[0]), nil
@@ -738,6 +742,10 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 		plugins = []plugin.Status{}
 	}
 	out := map[string]any{"status": status, "version": s.Version, "mode": snap.Cfg.Mode, "config_version": snap.Version, "detectors_unavailable": missing, "plugins": plugins}
+	if snap.Redactor != nil && snap.Redactor.Cache != nil {
+		hits, misses, entries := snap.Redactor.Cache.Stats()
+		out["detect_cache"] = map[string]any{"hits": hits, "misses": misses, "entries": entries}
+	}
 	if pol := s.Pipeline.Policy; pol != nil {
 		out["policy"] = map[string]any{"plugin": pol.Name(), "available": pol.Available()}
 		if !pol.Available() {

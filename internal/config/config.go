@@ -329,6 +329,28 @@ type Redaction struct {
 	StripFields     []string          `yaml:"strip_fields,omitempty" json:"strip_fields,omitempty"`         // extra top-level request fields removed before anything else (dsh_session_log always is)
 	VaultTTL        Duration          `yaml:"vault_ttl,omitempty" json:"vault_ttl,omitempty"`               // default 24h of inactivity
 	VaultPersist    *bool             `yaml:"vault_persist,omitempty" json:"vault_persist,omitempty"`       // default false: also keep placeholder mappings AES-256-GCM encrypted in <data_dir>/gatehouse.db
+	// Sources tunes findings per detector plugin (key: plugin name). Rules
+	// and the dictionary are not configurable here.
+	Sources map[string]RedactionSource `yaml:"sources,omitempty" json:"sources,omitempty"`
+}
+
+// RedactionSource tunes one detector plugin. Model-based detectors (NER) give
+// probabilistic findings; these settings keep them from acting like rules.
+type RedactionSource struct {
+	// MinConfidence drops findings scored below the threshold of their
+	// category (lower-case kind); "default" applies to other categories.
+	// Unset: every finding counts.
+	MinConfidence map[string]float64 `yaml:"min_confidence,omitempty" json:"min_confidence,omitempty"`
+	// MaxAction caps the action of this source's findings (audit|warn|mask|block):
+	// with mask, a warn/block target or a category set to block still only
+	// masks them; with audit they are only counted (a shadow run).
+	MaxAction string `yaml:"max_action,omitempty" json:"max_action,omitempty"`
+	// Timeout bounds one Detect call (default 5s).
+	Timeout Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	// OnError: fail_closed (default; redaction.fail_closed decides) or
+	// rules_only: on an error, a timeout or while the plugin is down, the
+	// request goes on with the other detectors and records an alert.
+	OnError string `yaml:"on_error,omitempty" json:"on_error,omitempty"`
 }
 
 // Meter configures usage metering.
@@ -921,6 +943,10 @@ func (c *Config) Validate() []string {
 		default:
 			add("plugins.%s.kind: must be detector, auth_policy, audit_sink, provider or hooks", pl.Name)
 		}
+		if pl.Kind == "detector" && (pl.Name == "rules" || pl.Name == "dictionary") {
+			// findings carry the detector name as their source; these two are the built-in detectors'
+			add("plugins.%s: name is reserved for the built-in detector", pl.Name)
+		}
 		if plugins[pl.Name] {
 			add("plugins.%s: duplicate name", pl.Name)
 		}
@@ -932,6 +958,32 @@ func (c *Config) Validate() []string {
 	for _, d := range c.Redaction.Detectors {
 		if !c.hasPlugin(d, "detector") {
 			add("redaction.detectors: %q is not declared under plugins with kind detector", d)
+		}
+	}
+	for name, src := range c.Redaction.Sources {
+		where := "redaction.sources." + name
+		if !c.hasPlugin(name, "detector") {
+			add("%s: %q is not declared under plugins with kind detector", where, name)
+		}
+		for cat, v := range src.MinConfidence {
+			// written so NaN (YAML .nan) fails too: every comparison with it is false,
+			// so it would silently drop every scored finding
+			if !(v >= 0 && v <= 1) {
+				add("%s.min_confidence.%s: must be between 0 and 1", where, cat)
+			}
+		}
+		switch src.MaxAction {
+		case "", "audit", "warn", "mask", "block":
+		default:
+			add("%s.max_action: must be one of audit, warn, mask, block", where)
+		}
+		if src.Timeout < 0 {
+			add("%s.timeout: must not be negative", where)
+		}
+		switch src.OnError {
+		case "", "fail_closed", "rules_only":
+		default:
+			add("%s.on_error: must be fail_closed or rules_only", where)
 		}
 	}
 	if c.Meter.OTLP != nil && c.Meter.OTLP.Endpoint == "" {

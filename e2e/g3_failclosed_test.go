@@ -56,7 +56,8 @@ func TestG3FailClosed(t *testing.T) {
 		exec.Command("pkill", "-KILL", "-P", pid, "-f", "fakedetector").Run()
 		time.Sleep(300 * time.Millisecond)
 		n := len(cloud.Requests())
-		r = g.Chat(t, g.Token, body, nil)
+		// a text the detector has not seen: its result cache would answer for the one above
+		r = g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": msgs("user", "请提醒张三后天开会")}, nil)
 		rep.Check("运行中插件进程被杀 → 503", r.Status == 503 && r.ErrCode() == "redaction_unavailable" && len(cloud.Requests()) == n,
 			"status=%d code=%s，外部新增请求 %d", r.Status, r.ErrCode(), len(cloud.Requests())-n)
 	}

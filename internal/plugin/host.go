@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os/exec"
 	"sync"
 	"time"
@@ -20,9 +21,6 @@ import (
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
 	sdk "github.com/yiyiSmallti/precinct-gatehouse/plugin"
 )
-
-// DetectTimeout bounds one Detect call.
-const DetectTimeout = 5 * time.Second
 
 // Restart backoff of a plugin whose process exited: it doubles from
 // RestartBackoffMin up to RestartBackoffMax and starts over once the plugin
@@ -371,14 +369,14 @@ func (d *detector) Name() string { return d.s.Name }
 func (d *detector) Exited() bool { return d.s.Exited() }
 
 // Detect calls the plugin and converts code point offsets to byte offsets.
-// A plugin whose process is not running is an error (the engine fails closed).
+// A plugin whose process is not running is an error (the engine fails closed
+// or, with on_error: rules_only, goes on without it). The engine sets the
+// deadline (redaction.sources.<name>.timeout).
 func (d *detector) Detect(ctx context.Context, text string) ([]redact.Finding, error) {
 	raw, ok := d.s.Impl()
 	if !ok {
 		return nil, fmt.Errorf("plugin process not running")
 	}
-	ctx, cancel := context.WithTimeout(ctx, DetectTimeout)
-	defer cancel()
 	fs, err := raw.(sdk.Detector).Detect(ctx, text, "", nil)
 	if err != nil {
 		return nil, err
@@ -394,7 +392,23 @@ func (d *detector) Detect(ctx context.Context, text string) ([]redact.Finding, e
 		if f.Start < 0 || f.End > len(idx)-1 || f.Start >= f.End || f.Kind == "" {
 			continue
 		}
-		out = append(out, redact.Finding{Kind: f.Kind, Start: idx[f.Start], End: idx[f.End], Source: d.s.Name})
+		out = append(out, redact.Finding{Kind: f.Kind, Start: idx[f.Start], End: idx[f.End], Source: d.s.Name, Confidence: score(f.Confidence)})
 	}
 	return out, nil
+}
+
+// score keeps a plugin's confidence within [0, 1]. A non-finite score
+// becomes 0 (unscored): min_confidence never drops it, so it is still acted
+// on, and NaN/Inf would make the audit record fail to encode.
+func score(c float32) float32 {
+	f := float64(c)
+	switch {
+	case math.IsNaN(f) || math.IsInf(f, 0):
+		return 0
+	case c < 0:
+		return 0
+	case c > 1:
+		return 1
+	}
+	return c
 }
