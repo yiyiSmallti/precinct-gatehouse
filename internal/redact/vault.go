@@ -20,6 +20,12 @@ type Vault struct {
 	mu      sync.Mutex
 	buckets map[string]*Bucket
 	lastGC  time.Time
+	// lag is the largest touchEvery interval used since start: how far a
+	// stored activity time may trail a bucket's real last use. Disk expiry
+	// adds it to the ttl. It never shrinks, so after a hot reload to a shorter
+	// vault_ttl, timestamps throttled at the old, longer interval are still
+	// allowed for.
+	lag time.Duration
 
 	store    VaultStore // nil: memory only
 	log      *slog.Logger
@@ -62,7 +68,7 @@ type Bucket struct {
 
 // NewVault creates a vault.
 func NewVault(ttl time.Duration) *Vault {
-	return &Vault{ttl: ttl, buckets: map[string]*Bucket{}}
+	return &Vault{ttl: ttl, lag: touchEvery(ttl), buckets: map[string]*Bucket{}}
 }
 
 // SetStore attaches a persistent store. Call before the vault is used.
@@ -83,6 +89,7 @@ func (v *Vault) SetTTL(ttl time.Duration) {
 	now := time.Now()
 	v.mu.Lock()
 	v.ttl = ttl
+	v.lag = max(v.lag, touchEvery(ttl))
 	v.sweepLocked(now)
 	v.mu.Unlock()
 }
@@ -101,7 +108,7 @@ func (v *Vault) sweepLocked(now time.Time) {
 	}
 	v.lastGC = now
 	if v.store != nil && v.sweeping.CompareAndSwap(false, true) {
-		cutoff := now.Add(-diskTTL(v.ttl))
+		cutoff := now.Add(-(v.ttl + v.lag))
 		go func() {
 			defer v.sweeping.Store(false)
 			if err := v.store.Sweep(cutoff); err != nil {
@@ -123,6 +130,8 @@ func (v *Vault) BucketWithTTL(key string, ttl time.Duration) *Bucket {
 	if ttl <= 0 {
 		ttl = v.ttl
 	}
+	v.lag = max(v.lag, touchEvery(ttl))
+	diskTTL := ttl + v.lag
 	if now.Sub(v.lastGC) > time.Minute {
 		v.sweepLocked(now)
 	}
@@ -152,7 +161,7 @@ func (v *Vault) BucketWithTTL(key string, ttl time.Duration) *Bucket {
 	b.seen = now
 	if v.store != nil && now.Sub(b.stored) >= touchEvery(ttl) {
 		b.stored = now
-		if err := v.store.Touch(b.id, now, diskTTL(ttl)); err != nil {
+		if err := v.store.Touch(b.id, now, diskTTL); err != nil {
 			v.warn("vault touch failed", err)
 		}
 	}
@@ -161,18 +170,13 @@ func (v *Vault) BucketWithTTL(key string, ttl time.Duration) *Bucket {
 
 // touchEvery throttles stored activity updates; it stays well below ttl so a
 // bucket in use is never swept as idle by another process.
+//
+// Stored mappings expire after ttl + lag (see Vault.lag), not plain ttl: the
+// stored activity time trails the real last use by up to the throttle, so
+// expiring at ttl could delete the mappings of a bucket still live in memory,
+// which a restart or the other handoff process could then no longer restore.
 func touchEvery(ttl time.Duration) time.Duration {
 	return min(time.Minute, ttl/4)
-}
-
-// diskTTL is the idle time after which stored mappings expire. The stored
-// activity time lags the real last use by up to touchEvery(ttl), so expiring
-// on disk at plain ttl could delete the mappings of a bucket that is still
-// live in memory (a process holding a bucket seen within ttl would then keep
-// using mappings that a restart or the other handoff process can no longer
-// restore).
-func diskTTL(ttl time.Duration) time.Duration {
-	return ttl + touchEvery(ttl)
 }
 
 // warn logs a store failure. Store errors never carry values (they are bound

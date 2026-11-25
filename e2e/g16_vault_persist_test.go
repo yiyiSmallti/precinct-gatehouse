@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -145,6 +146,45 @@ func TestG16VaultPersist(t *testing.T) {
 	r = g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": msgs("user", echo)}, sessL)
 	rep.Check("TTL 内持续使用的会话：活动时间节流写盘不会让磁盘对照提前过期，重启后仍回填", r.Status == 200 && strings.Contains(r.Content(), g16Phone) && strings.Contains(r.Content(), g16Term),
 		"请求于 0 s、0.4 s、2.2 s（vault_ttl 2 s），重启后客户端收到：%q", r.Content())
+	g.Stop()
+
+	// 4b. hot reload to a shorter vault_ttl: stored activity throttled at the
+	// old interval (20s ttl: every 5s) may trail by up to 5s, which the new
+	// 2s ttl's own 0.5s interval does not allow for. Requests at 0s and 3s
+	// leave the stored time at 0s; reloading to 2s at 3.5s keeps the bucket in
+	// memory, and its stored mappings must survive the reload's sweep.
+	long := fmt.Sprintf(g16Config, cloud.URL, true, "20s")
+	g = startGatewayIn(t, dir, "config.yaml", long, nil)
+	sessR := map[string]string{"X-Gatehouse-Session": "g16-reload"}
+	t0 = time.Now()
+	g.Chat(t, g.Token, first, sessR)
+	time.Sleep(time.Until(t0.Add(3 * time.Second)))
+	g.Chat(t, g.Token, first, sessR)
+	time.Sleep(time.Until(t0.Add(3500 * time.Millisecond)))
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cur, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, bytes.Replace(cur, []byte("vault_ttl: 20s"), []byte("vault_ttl: 2s"), 1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g.cmd.Process.Signal(syscall.SIGHUP)
+	reloaded := false
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if strings.Contains(g.log.String(), "config reloaded") {
+			reloaded = true
+			break
+		}
+	}
+	reloadAt := time.Since(t0)
+	g.Chat(t, g.Token, first, sessR)
+	lastAt := time.Since(t0)
+	g.Stop()
+	g = startGatewayIn(t, dir, "config.yaml", short, nil)
+	r = g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": msgs("user", echo)}, sessR)
+	rep.Check("热重载把 vault_ttl 改短：按旧间隔节流的活动时间不会让仍在使用的会话在磁盘上被清掉，重启后仍回填", reloaded && r.Status == 200 && strings.Contains(r.Content(), g16Phone) && strings.Contains(r.Content(), g16Term),
+		"请求于 0 s、3 s；%.1f s 时重载为 2 s（reloaded=%v），%.1f s 再请求；重启后客户端收到：%q", reloadAt.Seconds(), reloaded, lastAt.Seconds(), r.Content())
 	g.Stop()
 
 	// 5. TTL: an idle bucket expires on disk too (after vault_ttl plus the
