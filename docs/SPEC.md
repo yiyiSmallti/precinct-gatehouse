@@ -164,7 +164,7 @@ redaction:
 #### 首期之后补充实现的能力
 
 - **持久化 `sk-` API Key 与次数限额**：基于内存滑窗/计数器的并发、RPM、每日 RPD 限流（重启后每日计数从 `request_log` 恢复）；新增 `gatehouse apikey` CLI。
-- **多入口协议适配**：支持 Anthropic Messages（`POST /v1/messages`、`POST /v1/messages/count_tokens`）与 OpenAI Responses（`POST /v1/responses`），含流式/非流式、`thinking` 与 `tool_calls` 互转。
+- **多入口协议适配**：支持 Anthropic Messages（`POST /v1/messages`、`POST /v1/messages/count_tokens`）与 OpenAI Responses（`POST /v1/responses`），含流式/非流式、`thinking` 与 `tool_calls` 互转。Responses 入口在多轮回传时，把输入中的 `reasoning` 项（优先取 `content[]` 的 `reasoning_text`，否则取 `summary[]` 文本；`encrypted_content` 不透明，忽略）写成紧随其后的 assistant 消息（`role: assistant` 消息或合并后的 `function_call` 等工具调用）的 `reasoning_content`，连续多项按序直接拼接；`reasoning` 之后若先出现 user/system/tool 消息或 `compaction`，则丢弃，不计入 `X-Gatehouse-Dropped-Items`。行为与 Anthropic 入口的 `thinking` 块一致：网关只负责回传，是否渲染由上游模板决定。上游 usage 含 `completion_tokens_details.reasoning_tokens` 时透传到 `output_tokens_details.reasoning_tokens`，否则为 `0`。
 - **路由与请求增强**：支持 `max_body_mb` 配置（`0` 为不限）、移除 `ght1.` 令牌 `MaxTokens` 整请求串行锁、支持 `model_aliases` 别名映射、provider 级 `system_prompt` 拼接与 `extra_body` 合并、`cached_tokens` 与 `ttft_ms` 统计。
 - **内嵌 Web 控制面板与管理 API**：`admin.listen`，提供 PBKDF2 密码哈希、Cookie 会话、`X-Gatehouse-Admin` CSRF 校验与密码修改。
 - **配置热重载与全量在线配置管理**：基于快照句柄的原子切换（`internal/live`，在途请求绑定进入时快照不受影响），支持渠道/路由与别名/脱敏/常规参数分节保存（带 `base_hash` 乐观锁冲突检测）、原始 YAML 编辑与语法校验、外部文件监听与 `SIGHUP` 自动重载、`<data_dir>/config-history/` 最多 30 份历史备份与逐行 Diff 回滚、`db:<name>` 上游密钥数据库存储、`providers/test` 连通探测及 `/admin/api/flow` 门禁流统计；其中 `listen`、`mode`、`data_dir`、`admin.*`、`meter.*`、`audit.*`、`org.*`、`plugins.*` 等启动基础设施字段修改后返回 `restart_required` 提示需重启生效，且 Web 写回 YAML 会剥离手写注释。

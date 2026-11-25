@@ -360,6 +360,116 @@ func TestG8Compat(t *testing.T) {
 			seqOK && hasReasonEv && hasMsgEv && hasFuncEv,
 		"count=%d seqOK=%v reason=%v msg=%v fn=%v", len(rEvNames), seqOK, hasReasonEv, hasMsgEv, hasFuncEv)
 
+	// Responses reasoning items → reasoning_content of the next assistant message
+	lastUpMsgs := func() []map[string]any {
+		rs := fake.ChatRequests()
+		raw, _ := rs[len(rs)-1]["messages"].([]any)
+		out := make([]map[string]any, 0, len(raw))
+		for _, m := range raw {
+			mo, _ := m.(map[string]any)
+			out = append(out, mo)
+		}
+		return out
+	}
+	// role:tool_call_id/reasoning_content per message, e.g. "assistant[思考A]" "tool:call_a"
+	msgShape := func(ms []map[string]any) []string {
+		var s []string
+		for _, m := range ms {
+			switch m["role"] {
+			case "assistant":
+				s = append(s, fmt.Sprintf("assistant[%v]", m["reasoning_content"]))
+			case "tool":
+				s = append(s, fmt.Sprintf("tool:%v", m["tool_call_id"]))
+			default:
+				s = append(s, fmt.Sprint(m["role"]))
+			}
+		}
+		return s
+	}
+	reasoningTokens := func(body map[string]any) any {
+		u, _ := body["usage"].(map[string]any)
+		otd, _ := u["output_tokens_details"].(map[string]any)
+		return otd["reasoning_tokens"]
+	}
+	rReason := postJSON(t, g.URL+"/responses", oaiHdr, map[string]any{
+		"model": "gpt-5",
+		"tools": []any{map[string]any{"type": "function", "name": "echo", "parameters": map[string]any{"type": "object"}}},
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "多轮工具 #think"},
+			map[string]any{"type": "reasoning", "id": "rs_a", "encrypted_content": "opaque", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "思考A"},
+			}},
+			map[string]any{"type": "function_call", "call_id": "call_a", "name": "echo", "arguments": `{"echo":"a"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_a", "output": "out-a"},
+			map[string]any{"type": "reasoning", "id": "rs_b1", "summary": []any{}, "content": []any{
+				map[string]any{"type": "reasoning_text", "text": "思考B1"},
+			}},
+			map[string]any{"type": "reasoning", "id": "rs_b2", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "思考B2"},
+			}},
+			map[string]any{"type": "function_call", "call_id": "call_b", "name": "echo", "arguments": `{"echo":"b"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_b", "output": "out-b"},
+		},
+	})
+	reasonShape := strings.Join(msgShape(lastUpMsgs()), " ")
+	rep.Check("Responses 非流式 reasoning 项 → 后续 assistant 的 reasoning_content（多项按序拼接，工具消息顺序不变）+ reasoning_tokens 透传",
+		rReason.Status == 200 && strings.HasSuffix(reasonShape,
+			"user assistant[思考A] tool:call_a assistant[思考B1思考B2] tool:call_b") &&
+			fmt.Sprint(reasoningTokens(rReason.Body)) == "3",
+		"status=%d shape=%s reasoning_tokens=%v", rReason.Status, reasonShape, reasoningTokens(rReason.Body))
+
+	rReasonOrphan := postJSON(t, g.URL+"/responses", oaiHdr, map[string]any{
+		"model": "gpt-5",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "第一问"},
+			map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "孤立思考"}}},
+			map[string]any{"type": "message", "role": "user", "content": "第二问"},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "答"}}},
+		},
+	})
+	orphanMsgs := lastUpMsgs()
+	orphanJSON, _ := json.Marshal(orphanMsgs)
+	orphanLeak := strings.Contains(string(orphanJSON), "孤立思考")
+	rep.Check("Responses reasoning 后直接跟 user 消息 → 丢弃，不挂到后续 assistant",
+		rReasonOrphan.Status == 200 && !orphanLeak && rReasonOrphan.Header.Get("X-Gatehouse-Dropped-Items") == "",
+		"status=%d shape=%v leak=%v dropped_items=%q", rReasonOrphan.Status, msgShape(orphanMsgs), orphanLeak, rReasonOrphan.Header.Get("X-Gatehouse-Dropped-Items"))
+
+	// streaming round trip: the gateway's own streamed output, sent back as input
+	var streamedOutput []any
+	for _, ev := range rEvs {
+		if ev.Event == "response.completed" {
+			resp, _ := ev.Data["response"].(map[string]any)
+			streamedOutput, _ = resp["output"].([]any)
+		}
+	}
+	var streamedCallID string
+	for _, it := range streamedOutput {
+		if im, _ := it.(map[string]any); im["type"] == "function_call" {
+			streamedCallID, _ = im["call_id"].(string)
+		}
+	}
+	rtInput := []any{map[string]any{"type": "message", "role": "user", "content": "流式 #think"}}
+	rtInput = append(rtInput, streamedOutput...)
+	rtInput = append(rtInput, map[string]any{"type": "function_call_output", "call_id": streamedCallID, "output": "ok"})
+	rReasonStream := postJSON(t, g.URL+"/responses", oaiHdr, map[string]any{
+		"model":  "gpt-5",
+		"stream": true,
+		"tools":  []any{map[string]any{"type": "function", "name": "echo", "parameters": map[string]any{"type": "object"}}},
+		"input":  rtInput,
+	})
+	var rtCompleted map[string]any
+	for _, ev := range parseSSE(rReasonStream.Raw) {
+		if ev.Event == "response.completed" {
+			rtCompleted, _ = ev.Data["response"].(map[string]any)
+		}
+	}
+	rtShape := msgShape(lastUpMsgs())
+	rep.Check("Responses 流式往返：网关输出的 reasoning 项原样回传 → 上游 assistant 带回 reasoning_content + reasoning_tokens 透传",
+		rReasonStream.Status == 200 && streamedCallID != "" &&
+			strings.Join(rtShape, " ") == "system user assistant[思考...] tool:"+streamedCallID &&
+			fmt.Sprint(reasoningTokens(rtCompleted)) == "3",
+		"status=%d shape=%v reasoning_tokens=%v", rReasonStream.Status, rtShape, reasoningTokens(rtCompleted))
+
 	// previous_response_id -> 400
 	rPrev := postJSON(t, g.URL+"/responses", oaiHdr, map[string]any{
 		"model":                "gpt-5",
