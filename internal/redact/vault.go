@@ -53,6 +53,11 @@ type Bucket struct {
 	// unsaved holds placeholders whose last store write failed; the next Put
 	// of them writes again instead of trusting the in-memory copy.
 	unsaved map[string]bool
+	// wmu serializes Put, so each memory update and its store write land in
+	// the same order: placeholders are shared by normalized variants of a
+	// value (email casing), and an older write must not reach the store after
+	// a newer one. Readers only take mu.
+	wmu sync.Mutex
 }
 
 // NewVault creates a vault.
@@ -182,6 +187,8 @@ func (v *Vault) warn(msg string, err error) {
 // changed, or an earlier write of it failed. A failed write never fails the
 // request (the mapping is in memory); it is retried on the next Put.
 func (b *Bucket) Put(placeholder, value string) {
+	b.wmu.Lock()
+	defer b.wmu.Unlock()
 	b.mu.Lock()
 	old, ok := b.m[placeholder]
 	b.m[placeholder] = value
@@ -223,8 +230,13 @@ func (b *Bucket) Get(placeholder string) (string, bool) {
 		return "", false
 	}
 	if ok {
+		// a Put may have stored a newer value while the store was read
 		b.mu.Lock()
-		b.m[placeholder] = v
+		if cur, have := b.m[placeholder]; have {
+			v = cur
+		} else {
+			b.m[placeholder] = v
+		}
 		b.mu.Unlock()
 	}
 	return v, ok
