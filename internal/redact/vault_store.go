@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -77,6 +78,14 @@ func (s *SQLVaultStore) Touch(id string, now time.Time, ttl time.Duration) (rese
 		AND EXISTS (SELECT 1 FROM vault_buckets WHERE bucket=? AND seen_at < ?)`, id, id, cutoff); err != nil {
 		return reset, err
 	}
+	// Entries without a bucket row are orphans of an expired bucket (an
+	// update of an existing entry does not fire the insert trigger); creating
+	// the row below must not make them restorable again. A concurrent insert
+	// creates its row in the same statement, so it is never matched here.
+	if _, err := s.db.Exec(`DELETE FROM vault_entries WHERE bucket=?
+		AND NOT EXISTS (SELECT 1 FROM vault_buckets WHERE bucket=?)`, id, id); err != nil {
+		return reset, err
+	}
 	_, err = s.db.Exec(`INSERT INTO vault_buckets(bucket, seen_at) VALUES(?, ?)
 		ON CONFLICT(bucket) DO UPDATE SET seen_at=max(seen_at, excluded.seen_at)`, id, now.UnixMilli())
 	return reset, err
@@ -123,15 +132,40 @@ func (s *SQLVaultStore) Count(id string) (int, error) {
 	return n, err
 }
 
-// Sweep implements VaultStore. A bucket touched between the two statements
-// keeps its row; its entries were idle beyond the TTL and Touch would have
-// dropped them as well.
-func (s *SQLVaultStore) Sweep(cutoff time.Time) error {
-	c := cutoff.UnixMilli()
-	if _, err := s.db.Exec(`DELETE FROM vault_entries WHERE bucket IN (SELECT bucket FROM vault_buckets WHERE seen_at < ?)`, c); err != nil {
+// Sweep implements VaultStore. Entries and bucket rows are deleted in one
+// write transaction: with separate statements, a Put landing in between
+// would keep its entry while its bucket row went, leaving an orphan that no
+// later sweep (which finds entries through their bucket) could reach. The
+// transaction takes the write lock up front (BEGIN IMMEDIATE) and only
+// writes, so it cannot fail with SQLITE_BUSY_SNAPSHOT; it waits for the other
+// handoff process under the busy timeout like any other write. Orphans left
+// by earlier versions or failed statements are deleted as well.
+func (s *SQLVaultStore) Sweep(cutoff time.Time) (err error) {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
 		return err
 	}
-	_, err := s.db.Exec(`DELETE FROM vault_buckets WHERE seen_at < ?`, c)
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		}
+	}()
+	c := cutoff.UnixMilli()
+	if _, err = conn.ExecContext(ctx, `DELETE FROM vault_entries WHERE bucket IN (SELECT bucket FROM vault_buckets WHERE seen_at < ?)`, c); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `DELETE FROM vault_buckets WHERE seen_at < ?`, c); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `DELETE FROM vault_entries WHERE NOT EXISTS (SELECT 1 FROM vault_buckets b WHERE b.bucket = vault_entries.bucket)`); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `COMMIT`)
 	return err
 }
 

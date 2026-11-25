@@ -226,6 +226,22 @@ func TestG16VaultPersist(t *testing.T) {
 		"过期前 vault_entries=%d，过期后=%d；客户端收到：%q", before, after, r.Content())
 	g.Stop()
 
+	// 5b. an entry whose bucket row is gone (left by a Put racing a sweep)
+	// is deleted by the next sweep instead of staying on disk for good
+	g16Exec(t, dir, `INSERT INTO vault_entries(bucket, placeholder, value) VALUES('g16-orphan', '{{PHONE_orphan00}}', x'00')`)
+	g16Exec(t, dir, `DELETE FROM vault_buckets WHERE bucket='g16-orphan'`)
+	orphanBefore := g16Count(t, dir, `SELECT COUNT(*) FROM vault_entries WHERE bucket='g16-orphan'`)
+	g = startGatewayIn(t, dir, "config.yaml", short, nil)
+	g.Chat(t, g.Token, first, map[string]string{"X-Gatehouse-Session": "g16-sweep"}) // the first bucket access sweeps
+	orphanAfter := -1
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if orphanAfter = g16Count(t, dir, `SELECT COUNT(*) FROM vault_entries WHERE bucket='g16-orphan'`); orphanAfter == 0 {
+			break
+		}
+	}
+	rep.Check("没有桶记录的孤儿对照被下一次清扫删除", orphanBefore == 1 && orphanAfter == 0, "清扫前 %d 条，清扫后 %d 条", orphanBefore, orphanAfter)
+	g.Stop()
+
 	// 6. control: without vault_persist the restart loses the mapping
 	cloud2 := startFake(t, "cloud")
 	off := fmt.Sprintf(g16Config, cloud2.URL, false, "24h")
@@ -246,6 +262,18 @@ func TestG16VaultPersist(t *testing.T) {
 }
 
 var g16VaultErr = regexp.MustCompile(`vault (write|read|touch|sweep) failed|database is locked|SQLITE_BUSY`)
+
+func g16Exec(t *testing.T, dir, q string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "gatehouse.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(q); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func g16Count(t *testing.T, dir, q string) int {
 	t.Helper()
