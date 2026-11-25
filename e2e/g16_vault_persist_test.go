@@ -187,6 +187,30 @@ func TestG16VaultPersist(t *testing.T) {
 		"请求于 0 s、3 s；%.1f s 时重载为 2 s（reloaded=%v），%.1f s 再请求；重启后客户端收到：%q", reloadAt.Seconds(), reloaded, lastAt.Seconds(), r.Content())
 	g.Stop()
 
+	// 4c. a live bucket whose stored copy was expired behind its back is
+	// repaired: process A (vault_ttl 4s) holds a session; process B on the
+	// same database (vault_ttl 2s, as with a handoff between differing
+	// configs) sweeps A's stored mappings at 3s. A's next request (3.5s) finds
+	// its stored bucket reset and writes its mappings back, so a restart still
+	// restores them. Failed activity updates take the same repair path.
+	mid := fmt.Sprintf(g16Config, cloud.URL, true, "4s")
+	g = startGatewayIn(t, dir, "config.yaml", mid, nil)
+	gb := startGatewayIn(t, dir, "config-b.yaml", short, nil)
+	sessA := map[string]string{"X-Gatehouse-Session": "g16-repair"}
+	t0 = time.Now()
+	g.Chat(t, g.Token, first, sessA)
+	time.Sleep(time.Until(t0.Add(3 * time.Second)))
+	gb.Chat(t, gb.Token, first, map[string]string{"X-Gatehouse-Session": "g16-repair-b"})
+	time.Sleep(time.Until(t0.Add(3500 * time.Millisecond)))
+	g.Chat(t, g.Token, first, sessA)
+	g.Stop()
+	gb.Stop()
+	g = startGatewayIn(t, dir, "config.yaml", mid, nil)
+	r = g.Chat(t, g.Token, map[string]any{"model": "cloud/strong", "messages": msgs("user", echo)}, sessA)
+	rep.Check("存储上的桶在会话仍活跃时被清掉（另一进程用更短的 vault_ttl 清扫）：下一次活动更新时整桶重新落盘，重启后仍回填", r.Status == 200 && strings.Contains(r.Content(), g16Phone) && strings.Contains(r.Content(), g16Term),
+		"A（4 s）请求于 0 s、3.5 s，B（2 s）于 3 s 清扫；重启后客户端收到：%q", r.Content())
+	g.Stop()
+
 	// 5. TTL: an idle bucket expires on disk too (after vault_ttl plus the
 	// stored-activity throttle, 2s + 0.5s here)
 	g = startGatewayIn(t, dir, "config.yaml", short, nil)

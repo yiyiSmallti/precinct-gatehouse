@@ -59,15 +59,27 @@ func (s *SQLVaultStore) BucketID(key string) string {
 // Touch implements VaultStore. Each statement runs on its own (autocommit):
 // a read-then-write transaction would fail with SQLITE_BUSY_SNAPSHOT when the
 // other process of an FD handoff commits in between, and each statement here
-// is correct on its own whatever the other process does around it.
-func (s *SQLVaultStore) Touch(id string, now time.Time, ttl time.Duration) error {
-	if _, err := s.db.Exec(`DELETE FROM vault_entries WHERE bucket=?
-		AND EXISTS (SELECT 1 FROM vault_buckets WHERE bucket=? AND seen_at < ?)`, id, id, now.Add(-ttl).UnixMilli()); err != nil {
-		return err
+// is correct on its own whatever the other process does around it. reset is
+// conservative: a bucket the other process creates right after the first
+// statement is reported as reset, which only costs a redundant re-persist.
+func (s *SQLVaultStore) Touch(id string, now time.Time, ttl time.Duration) (reset bool, err error) {
+	cutoff := now.Add(-ttl).UnixMilli()
+	var seen int64
+	switch err := s.db.QueryRow(`SELECT seen_at FROM vault_buckets WHERE bucket=?`, id).Scan(&seen); {
+	case errors.Is(err, sql.ErrNoRows):
+		reset = true
+	case err != nil:
+		return false, err
+	default:
+		reset = seen < cutoff
 	}
-	_, err := s.db.Exec(`INSERT INTO vault_buckets(bucket, seen_at) VALUES(?, ?)
+	if _, err := s.db.Exec(`DELETE FROM vault_entries WHERE bucket=?
+		AND EXISTS (SELECT 1 FROM vault_buckets WHERE bucket=? AND seen_at < ?)`, id, id, cutoff); err != nil {
+		return reset, err
+	}
+	_, err = s.db.Exec(`INSERT INTO vault_buckets(bucket, seen_at) VALUES(?, ?)
 		ON CONFLICT(bucket) DO UPDATE SET seen_at=max(seen_at, excluded.seen_at)`, id, now.UnixMilli())
-	return err
+	return reset, err
 }
 
 // Put implements VaultStore.

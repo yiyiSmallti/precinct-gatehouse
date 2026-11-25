@@ -39,7 +39,9 @@ type VaultStore interface {
 	BucketID(key string) string
 	// Touch marks a bucket active at now. A bucket whose stored activity is
 	// older than ttl is emptied first: it expired while no process held it.
-	Touch(id string, now time.Time, ttl time.Duration) error
+	// reset reports that the stored bucket was missing or expired, i.e. it
+	// may hold none of the mappings a live in-memory bucket has.
+	Touch(id string, now time.Time, ttl time.Duration) (reset bool, err error)
 	Put(id, placeholder, value string) error
 	Get(id, placeholder string) (string, bool, error)
 	Count(id string) (int, error)
@@ -160,12 +162,40 @@ func (v *Vault) BucketWithTTL(key string, ttl time.Duration) *Bucket {
 	defer b.mu.Unlock()
 	b.seen = now
 	if v.store != nil && now.Sub(b.stored) >= touchEvery(ttl) {
-		b.stored = now
-		if err := v.store.Touch(b.id, now, diskTTL); err != nil {
+		reset, err := v.store.Touch(b.id, now, diskTTL)
+		if err != nil {
+			// b.stored stays old, so the next request retries at once
 			v.warn("vault touch failed", err)
+		} else {
+			b.stored = now
+		}
+		if reset {
+			b.repersistLocked()
 		}
 	}
 	return b
+}
+
+// repersistLocked writes every in-memory mapping back to the store after
+// Touch found the stored bucket missing or expired while this bucket was
+// still live in memory: stored activity updates may have failed for longer
+// than the disk TTL, or another process expired it with a shorter TTL.
+// Without this, those mappings would stay memory-only, since later Puts of
+// the same values skip the store. b.mu must be held for writing; Put updates
+// memory under it before writing, so no older value can land after these.
+func (b *Bucket) repersistLocked() {
+	s := b.store()
+	for ph, val := range b.m {
+		if err := s.Put(b.id, ph, val); err != nil {
+			if b.unsaved == nil {
+				b.unsaved = map[string]bool{}
+			}
+			b.unsaved[ph] = true
+			b.vault.warn("vault write failed", err)
+			continue
+		}
+		delete(b.unsaved, ph)
+	}
 }
 
 // touchEvery throttles stored activity updates; it stays well below ttl so a
