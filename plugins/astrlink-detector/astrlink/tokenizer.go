@@ -416,8 +416,15 @@ type change struct {
 // tokenizers' Precompiled normalizer, and aligns each output rune to the
 // original code point range (offset base `base`) the way NormalizedString
 // does.
+//
+// One deliberate difference: runes the charsmap deletes before any output
+// rune (control characters at the start) have no previous entry to carry the
+// removal, and HF drops them, shifting every later offset left. The gateway
+// masks the original text by these offsets, so a shift would leave the end
+// of an entity unmasked; they are counted in lead instead.
 func (p *precompiled) normalize(in []rune, base int) ([]rune, []span) {
 	var tr []change
+	lead := 0 // original runes deleted before the first output rune
 	replace := func(oldN int, repl string) {
 		newN := 0
 		for _, r := range repl {
@@ -432,6 +439,8 @@ func (p *precompiled) normalize(in []rune, base int) ([]rune, []span) {
 		case d < 0:
 			if len(tr) > 0 {
 				tr[len(tr)-1].cs += d
+			} else {
+				lead -= d
 			}
 		}
 	}
@@ -455,7 +464,7 @@ func (p *precompiled) normalize(in []rune, base int) ([]rune, []span) {
 	}
 	out := make([]rune, 0, len(tr))
 	al := make([]span, 0, len(tr))
-	o := 0 // original rune cursor
+	o := lead // original rune cursor
 	for _, c := range tr {
 		var a span
 		if c.cs > 0 {
@@ -467,8 +476,6 @@ func (p *precompiled) normalize(in []rune, base int) ([]rune, []span) {
 			a = span{base + o, base + o + 1}
 			o += 1 - c.cs
 		}
-		// a removal at the very start has no previous rune to carry it, which
-		// shifts HF's alignment too; keep the shifted ranges inside the input
 		a.s, a.e = min(a.s, base+len(in)), min(a.e, base+len(in))
 		out = append(out, c.r)
 		al = append(al, a)

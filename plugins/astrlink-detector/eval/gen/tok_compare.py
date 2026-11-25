@@ -5,6 +5,13 @@ Inputs: every text of data/*.jsonl (request segments included) plus the
 edge cases below. Reports the number of texts whose ids or offsets differ and
 prints the first few differences.
 
+One difference is intended: characters the charsmap deletes at the very start
+of a text (control characters) are dropped by HF without advancing its offsets,
+so every later offset points that many characters too early. The Go tokenizer
+counts them, because the gateway masks the original text by these offsets.
+Such texts count as `shifted_as_intended` when the ids match and every Go
+offset is the HF offset moved right by the number of deleted leading characters.
+
 Usage: python3 tok_compare.py <tokenizer.json> <tokdump-binary> [data_dir]
 Needs: pip install tokenizers (tested with 0.22.2).
 """
@@ -21,8 +28,18 @@ EDGE = [
     "emoji 👍🏽 family 👨‍👩‍👧 flag 🇨🇳", "<s>x</s> <mask> y <pad><unk>", "tab\t\tafter 9\t\tdigits",
     "中文标点，。！？「」『』…—", "ＡＢＣ１２３", "Ǆ ǅ ǆ ﬀ ﬃ", "　　全角空格开头", "x y z\u0085w",
     "日本語のテキストとカタカナ", "한국어 텍스트", "Ελληνικά και русский", "عربى", "ab" * 300, "1 2 3 4 5 6 7 8 9 0",
-    "▁already▁meta", "a\u0000b", "﻿bom", "\x7f\x01ctrl",
+    "▁already▁meta", "a\u0000b", "﻿bom", "\x7f\x01ctrl", "\x01\x01\x01Emily Carter",
 ]
+
+
+def deleted_lead(tok, text):
+    """Number of leading characters the normalizer deletes."""
+    n = 0
+    for ch in text:
+        if tok.normalizer.normalize_str(ch) != "":
+            break
+        n += 1
+    return n
 
 
 def main():
@@ -40,13 +57,17 @@ def main():
     payload = "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in items).encode()
     got = subprocess.run([bin_, "-tokenizer", tj], input=payload, capture_output=True, check=True).stdout.decode()
     got = {d["id"]: d for d in map(json.loads, got.splitlines())}
-    bad, ntok = 0, 0
+    bad, shifted, ntok = 0, 0, 0
     for x in items:
         e = tok.encode(x["text"])
         ids, offs = e.ids[1:-1], [list(o) for o in e.offsets[1:-1]]
         ntok += len(ids)
         g = got[x["id"]]
         if g["ids"] != ids or g["offsets"] != offs:
+            lead = deleted_lead(tok, x["text"])
+            if lead and g["ids"] == ids and g["offsets"] == [[a + lead, b + lead] for a, b in offs]:
+                shifted += 1
+                continue
             bad += 1
             if bad <= 8:
                 print("DIFF", x["id"], repr(x["text"][:80]))
@@ -56,7 +77,7 @@ def main():
                     if a is None or b is None or a[:2] != b:
                         print("   at", k, "hf", a, "go", b)
                         break
-    print(f"texts={len(items)} tokens={ntok} mismatched_texts={bad}")
+    print(f"texts={len(items)} tokens={ntok} mismatched_texts={bad} shifted_as_intended={shifted}")
     sys.exit(1 if bad else 0)
 
 

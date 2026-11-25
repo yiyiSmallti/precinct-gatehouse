@@ -88,6 +88,12 @@ func TestG19AstrLink(t *testing.T) {
 	rep.Check("代码块里的标识符原样保留", strings.Contains(sent, "AccountService") && strings.Contains(sent, "func (s *"), "")
 	rep.Check("响应回填原文", strings.Contains(r.Content(), "王建国") && strings.Contains(r.Content(), "Emily Carter"), "客户端收到：%s", r.Content())
 
+	// control characters the tokenizer deletes at the start must not shift the masked range
+	r, _ = chat(msgs("user", "\x01\x01\x01请联系 Emily Carter 确认合同"))
+	sent = g18Last(cloud)
+	rep.Check("开头有被删除的控制字符时，人名仍完整脱敏", r.Status == 200 && !strings.Contains(sent, "Carter") && !strings.Contains(sent, "ter 确认") && strings.Contains(sent, "{{PERSON_"),
+		"status=%d，外部收到：%s", r.Status, sent)
+
 	// 2. a clean coding request goes out unchanged
 	clean := "Why does `go vet` complain about this?\n```go\nfmt.Printf(\"%d\", name)\n```\nThe Jenkins job runs on Kubernetes and logs to Grafana."
 	r, el = chat(msgs("user", clean))

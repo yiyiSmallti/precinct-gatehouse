@@ -175,6 +175,11 @@ func (d *Detector) detectRunes(ctx context.Context, runes []rune, base int) ([]S
 	if len(toks) == 0 {
 		return nil, nil
 	}
+	// tokenizing a long text takes a while; a caller that has given up
+	// should not keep the inference slot for the passes below
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	content := d.Opts.Window - 2
 	step := content - d.Opts.Overlap
 	var starts []int
@@ -184,19 +189,20 @@ func (d *Detector) detectRunes(ctx context.Context, runes []rune, base int) ([]S
 			break
 		}
 	}
-	// each token is decoded from the window where it sits farthest from an edge
+	// each token is decoded from the window where it sits farthest from an
+	// edge (the earlier window on a tie). Walking each window's own tokens
+	// keeps this linear: a token lies in at most content/step windows.
 	owner := make([]int, len(toks))
-	for t := range toks {
-		bestW, bestD := 0, -1
-		for w, s := range starts {
-			if t < s || t >= s+content {
-				continue
-			}
-			if dd := min(t-s, s+content-1-t); dd > bestD {
-				bestW, bestD = w, dd
+	bestD := make([]int, len(toks))
+	for t := range bestD {
+		bestD[t] = -1
+	}
+	for w, s := range starts {
+		for t := s; t < min(s+content, len(toks)); t++ {
+			if dd := min(t-s, s+content-1-t); dd > bestD[t] {
+				owner[t], bestD[t] = w, dd
 			}
 		}
-		owner[t] = bestW
 	}
 	dist := make([][]float32, len(toks)) // softmax per token
 	nl := d.Model.NumLabels
