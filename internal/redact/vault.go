@@ -50,6 +50,9 @@ type Bucket struct {
 	id     string // stored bucket id when the vault is persistent
 	stored time.Time
 	vault  *Vault
+	// unsaved holds placeholders whose last store write failed; the next Put
+	// of them writes again instead of trusting the in-memory copy.
+	unsaved map[string]bool
 }
 
 // NewVault creates a vault.
@@ -165,16 +168,32 @@ func (v *Vault) warn(msg string, err error) {
 	}
 }
 
-// Put stores a mapping, writing it through to the store when it is new.
+// Put stores a mapping, writing it through to the store when it is new,
+// changed, or an earlier write of it failed. A failed write never fails the
+// request (the mapping is in memory); it is retried on the next Put.
 func (b *Bucket) Put(placeholder, value string) {
 	b.mu.Lock()
 	old, ok := b.m[placeholder]
 	b.m[placeholder] = value
+	retry := b.unsaved[placeholder]
 	b.mu.Unlock()
-	if s := b.store(); s != nil && (!ok || old != value) {
-		if err := s.Put(b.id, placeholder, value); err != nil {
-			b.vault.warn("vault write failed", err)
+	s := b.store()
+	if s == nil || (ok && old == value && !retry) {
+		return
+	}
+	err := s.Put(b.id, placeholder, value)
+	b.mu.Lock()
+	if err != nil {
+		if b.unsaved == nil {
+			b.unsaved = map[string]bool{}
 		}
+		b.unsaved[placeholder] = true
+	} else if b.m[placeholder] == value {
+		delete(b.unsaved, placeholder)
+	}
+	b.mu.Unlock()
+	if err != nil {
+		b.vault.warn("vault write failed", err)
 	}
 }
 
