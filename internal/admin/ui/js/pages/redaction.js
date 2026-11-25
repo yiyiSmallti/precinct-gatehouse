@@ -53,6 +53,11 @@ function computePreviewMatrix(modeByTarget = {}) {
 
 export function renderRedaction(container) {
   let rtInfo = null;
+  let astrlink = null;
+  let astrlinkMaxAction = 'audit';
+  let astrlinkHFMirror = 'https://hf-mirror.com';
+  let astrlinkGHMirror = '';
+  let astrlinkPollTimer = null;
   let tryTarget = 'external';
   let tryClass = 'internal';
   let tryText = '工单号 #8821：联系人李四，手机 13812345678，备用密钥 sk-proj-998877665544332211，内网接口 http://core-db.corp.local/api';
@@ -62,13 +67,47 @@ export function renderRedaction(container) {
   const root = el('div');
   container.appendChild(root);
 
+  const stopAstrlinkPoll = () => {
+    if (astrlinkPollTimer) {
+      clearTimeout(astrlinkPollTimer);
+      astrlinkPollTimer = null;
+    }
+  };
+
+  const scheduleAstrlinkPoll = () => {
+    stopAstrlinkPoll();
+    if (!container.isConnected || !astrlink?.installing) return;
+    astrlinkPollTimer = setTimeout(async () => {
+      if (!container.isConnected) return;
+      try {
+        const prevInstalling = astrlink?.installing;
+        astrlink = await api.astrlinkStatus();
+        if (prevInstalling && !astrlink.installing) {
+          if (astrlink.error) {
+            toast(`安装失败: ${astrlink.error}`, 'err');
+          } else {
+            toast('AstrLink NER 检测器安装并配置完成，重启网关后生效', 'ok');
+            await store.loadConfig?.();
+            rtInfo = await api.redaction().catch(() => rtInfo);
+          }
+        }
+      } catch {
+        // ignore transient poll error
+      }
+      paint();
+      scheduleAstrlinkPoll();
+    }, 1500);
+  };
+
   const load = async () => {
-    try {
-      rtInfo = await api.redaction();
-    } catch {
-      rtInfo = null;
+    const [rRes, aRes] = await Promise.allSettled([api.redaction(), api.astrlinkStatus()]);
+    rtInfo = rRes.status === 'fulfilled' ? rRes.value : null;
+    astrlink = aRes.status === 'fulfilled' ? aRes.value : null;
+    if (astrlink?.max_action) {
+      astrlinkMaxAction = astrlink.max_action;
     }
     paint();
+    scheduleAstrlinkPoll();
   };
 
   const paintTryBox = (host) => {
@@ -506,9 +545,122 @@ export function renderRedaction(container) {
       )
       : null;
 
+    // 0. AstrLink Guard NER One-Click Installer
+    const renderAstrlinkSheet = () => {
+      if (!astrlink) return null;
+      const busy = Boolean(astrlink.installing);
+      let statusPill = el('span', { className: 'pill' }, '未安装');
+      if (busy) {
+        statusPill = el('span', { className: 'pill pill-brass' }, '安装中...');
+      } else if (astrlink.error) {
+        statusPill = el('span', { className: 'pill pill-err' }, '安装失败');
+      } else if (astrlink.running) {
+        statusPill = el('span', { className: 'pill pill-ok' }, '运行中');
+      } else if (astrlink.restart_required) {
+        statusPill = el('span', { className: 'pill pill-brass' }, '已配置 · 需重启生效');
+      } else if (astrlink.binary_ready && astrlink.ort_ready && astrlink.model_ready) {
+        statusPill = el('span', { className: 'pill' }, '文件就绪 · 未启用');
+      }
+
+      const readyChip = (label, ok) =>
+        el('span', { className: `pill ${ok ? 'pill-ok' : ''}` }, `${ok ? '✓' : '○'} ${label}`);
+
+      const runInstall = async () => {
+        try {
+          astrlink = await api.astrlinkInstall({
+            max_action: astrlinkMaxAction,
+            hf_mirror: astrlinkHFMirror,
+            gh_mirror: astrlinkGHMirror,
+          });
+          paint();
+          scheduleAstrlinkPoll();
+        } catch (err) {
+          toast(err?.message || '触发安装失败', 'err');
+        }
+      };
+
+      const btnLabel = busy
+        ? '安装配置中...'
+        : (astrlink.configured ? '更新配置 / 补齐依赖' : '一键安装并配置');
+
+      return el('section', { className: 'sheet' },
+        el('div', { className: 'sheet-head' },
+          el('div', { className: 'sheet-title-group' },
+            el('h3', { className: 'sheet-title' }, 'NER 智能检测器（AstrLink Guard）'),
+            el('p', { className: 'sheet-sub' }, '本地 int8 语义识别中英文人名、地址、账号与上下文密钥，与内置规则引擎互补')
+          ),
+          statusPill
+        ),
+        el('div', { className: 'sheet-body', style: { display: 'flex', flexDirection: 'column', gap: '12px' } },
+          el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' } },
+            readyChip('插件程序', astrlink.binary_ready),
+            readyChip('ONNX Runtime 1.27', astrlink.ort_ready),
+            readyChip('AstrLink int8 模型', astrlink.model_ready),
+            el('span', { className: 'muted mono', style: { fontSize: '12px' } }, astrlink.platform || '')
+          ),
+          busy && astrlink.message
+            ? el('div', { className: 'pill pill-brass', style: { alignSelf: 'flex-start' } }, astrlink.message)
+            : null,
+          astrlink.error
+            ? el('div', { className: 'pill pill-err', style: { alignSelf: 'flex-start', whiteSpace: 'normal' } }, `${astrlink.message || '安装异常'}: ${astrlink.error}`)
+            : null,
+          astrlink.restart_required && !busy
+            ? el('div', { className: 'muted', style: { fontSize: '12px' } }, '插件与模型已就绪并写入 config.yaml，重启 Gatehouse 进程后即可启用 NER 检测。')
+            : null,
+          el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '12px', alignItems: 'center', justifyContent: 'space-between' } },
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+              el('span', { className: 'field-label', style: { margin: 0 } }, '上限动作'),
+              createSegmented({
+                ariaLabel: 'NER 上限动作',
+                value: astrlinkMaxAction,
+                options: [
+                  { value: 'audit', label: '影子审计 audit' },
+                  { value: 'mask', label: '脱敏掩码 mask', tone: 'mask' },
+                ],
+                onChange: (v) => {
+                  astrlinkMaxAction = v;
+                  paint();
+                },
+              })
+            ),
+            el('button', {
+              type: 'button',
+              className: 'btn btn-primary',
+              disabled: busy || !astrlink.supported,
+              onClick: runInstall,
+            }, btnLabel)
+          ),
+          el('details', { style: { fontSize: '12px' } },
+            el('summary', { className: 'muted', style: { cursor: 'pointer' } }, '下载镜像设置（国内服务器推荐保留默认 hf-mirror）'),
+            el('div', { className: 'field-row', style: { marginTop: '10px' } },
+              el('div', { className: 'field' },
+                el('label', { className: 'field-label' }, 'HuggingFace 镜像地址'),
+                el('input', {
+                  className: 'input mono',
+                  value: astrlinkHFMirror,
+                  placeholder: 'https://hf-mirror.com',
+                  onChange: (e) => { astrlinkHFMirror = e.target.value.trim(); },
+                })
+              ),
+              el('div', { className: 'field' },
+                el('label', { className: 'field-label' }, 'GitHub 下载代理前缀（可选）'),
+                el('input', {
+                  className: 'input mono',
+                  value: astrlinkGHMirror,
+                  placeholder: '例如 https://ghfast.top/（留空直连）',
+                  onChange: (e) => { astrlinkGHMirror = e.target.value.trim(); },
+                })
+              )
+            )
+          )
+        )
+      );
+    };
+
     root.appendChild(
       el('div', { className: 'split-redaction' },
         el('div', { style: { display: 'flex', flexDirection: 'column', gap: '18px' } },
+          renderAstrlinkSheet(),
           targetSheet,
           categoriesSheet,
           listsSheet,

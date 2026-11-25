@@ -101,6 +101,8 @@ export const api = {
   channels: () => request('GET', '/admin/api/channels'),
   redaction: () => request('GET', '/admin/api/redaction'),
   redactionTry: (data) => request('POST', '/admin/api/redaction/try', data),
+  astrlinkStatus: () => request('GET', '/admin/api/redaction/astrlink'),
+  astrlinkInstall: (data) => request('POST', '/admin/api/redaction/astrlink/install', data),
 
   getConfig: (opts) => request('GET', '/admin/api/config', undefined, opts),
   putSections: (baseHash, sections) =>

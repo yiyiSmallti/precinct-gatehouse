@@ -46,11 +46,12 @@ type Deps struct {
 
 // Server serves the /admin/ Web UI and /admin/api/* JSON API.
 type Server struct {
-	deps  Deps
-	auth  *authStore
-	setup setupState
-	ui    fs.FS
-	mux   *http.ServeMux
+	deps     Deps
+	auth     *authStore
+	setup    setupState
+	astrlink astrlinkState
+	ui       fs.FS
+	mux      *http.ServeMux
 }
 
 // New constructs an admin HTTP handler.
@@ -111,6 +112,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/api/channels", s.guard(s.channels))
 	s.mux.HandleFunc("GET /admin/api/redaction", s.guard(s.redactionInfo))
 	s.mux.HandleFunc("POST /admin/api/redaction/try", s.guard(s.redactionTry))
+	s.mux.HandleFunc("GET /admin/api/redaction/astrlink", s.guard(s.getAstrlinkStatus))
+	s.mux.HandleFunc("POST /admin/api/redaction/astrlink/install", s.guard(s.installAstrlink))
 	s.mux.HandleFunc("GET /admin/api/config", s.guard(s.getConfig))
 	s.mux.HandleFunc("PUT /admin/api/config/sections", s.guard(s.putConfigSections))
 	s.mux.HandleFunc("PUT /admin/api/config/sections/{section}", s.guard(s.putConfigSection))

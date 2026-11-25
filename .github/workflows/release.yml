@@ -167,7 +167,11 @@ jobs:
 
           TARBALL_NAME="gatehouse_${VERSION}_linux_amd64.tar.gz"
           tar -C dist/stage -czf "dist/${TARBALL_NAME}" "${TAR_FILES[@]}"
-          (cd dist && sha256sum "${TARBALL_NAME}" > SHA256SUMS)
+
+          (cd plugins/astrlink-detector && CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "../../dist/astrlink-detector-linux-amd64" .)
+          chmod 0755 dist/astrlink-detector-linux-amd64
+
+          (cd dist && sha256sum "${TARBALL_NAME}" astrlink-detector-linux-amd64 > SHA256SUMS)
 
           {
             echo "binary_sha256=${BINARY_SHA256}"
@@ -197,6 +201,7 @@ jobs:
           set -euo pipefail
           ASSETS=(
             "dist/${TARBALL_NAME}"
+            "dist/astrlink-detector-linux-amd64"
             "dist/SHA256SUMS"
             "dist/stage/RELEASE_META"
           )
