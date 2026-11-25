@@ -142,8 +142,14 @@ func TestG17PluginRestart(t *testing.T) {
 	local := startFake(t, "local")
 	cloud := startFake(t, "cloud")
 	g := startGateway(t, fmt.Sprintf(g17Config, local.URL, cloud.URL), nil)
-	body := map[string]any{"model": "cloud/strong", "messages": msgs("user", "请提醒张三明天开会")}
-	chat := func() Response { return g.Chat(t, g.Token, body, nil) }
+	// a new text each time: the detector result cache would otherwise answer
+	// for text it has seen, and the request would not need the plugin at all
+	seq := 0
+	chat := func() Response {
+		seq++
+		body := map[string]any{"model": "cloud/strong", "messages": msgs("user", fmt.Sprintf("请提醒张三明天开会（第 %d 次）", seq))}
+		return g.Chat(t, g.Token, body, nil)
+	}
 	masked := func(r Response) bool {
 		reqs := cloud.ChatRequests()
 		if r.Status != 200 || len(reqs) == 0 {

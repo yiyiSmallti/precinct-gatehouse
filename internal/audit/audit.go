@@ -68,6 +68,11 @@ type Sample struct {
 	Kind   string `json:"kind"`
 	Length int    `json:"length"`
 	Action string `json:"action"`
+	// Source is the detector (rules, dictionary or a plugin name) and
+	// Confidence its score, when it gives one: they let a shadow run of a
+	// model-based detector be judged from the audit log.
+	Source     string  `json:"source,omitempty"`
+	Confidence float32 `json:"confidence,omitempty"`
 }
 
 // Sink receives audit records.

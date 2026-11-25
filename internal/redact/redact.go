@@ -49,13 +49,24 @@ type Finding struct {
 	Start  int // byte offsets
 	End    int
 	Source string // rules | dictionary | <plugin name>
+	// Confidence is the plugin's score; 0 means unscored (rules, dictionary,
+	// or a plugin that reports none), which min_confidence never drops.
+	Confidence float32
 }
 
-// ExternalDetector is a detector plugin. Offsets are byte offsets after conversion.
+// ExternalDetector is a detector plugin. Offsets are byte offsets after
+// conversion. The engine bounds each call with the source's timeout.
 type ExternalDetector interface {
 	Name() string
 	Detect(ctx context.Context, text string) ([]Finding, error)
 }
+
+// DefaultDetectTimeout bounds one Detect call unless redaction.sources.<name>.timeout is set.
+const DefaultDetectTimeout = 5 * time.Second
+
+// OnErrorRulesOnly is the redaction.sources.<name>.on_error value that lets a
+// request go on without that detector.
+const OnErrorRulesOnly = "rules_only"
 
 // Engine holds the configured detectors.
 type Engine struct {
@@ -67,6 +78,9 @@ type Engine struct {
 	missing  []string // required detectors that are declared but unavailable
 	vaultTTL time.Duration
 	Vault    *Vault
+	// Cache holds detector plugin results; callers that rebuild the engine on
+	// reload pass the previous one on, like Vault.
+	Cache *DetectCache
 }
 
 // New builds the engine. `external` are the running detector plugins and
@@ -74,7 +88,7 @@ type Engine struct {
 func New(cfg config.Redaction, external []ExternalDetector, missing []string) (*Engine, error) {
 	vaultTTL := cfg.VaultTTL.D(24 * time.Hour)
 	e := &Engine{cfg: cfg, rules: rules.New(cfg.InternalDomains), never: map[string]bool{}, external: external, missing: missing,
-		vaultTTL: vaultTTL, Vault: NewVault(vaultTTL)}
+		vaultTTL: vaultTTL, Vault: NewVault(vaultTTL), Cache: NewDetectCache(DefaultDetectCacheEntries)}
 	var terms []string
 	for _, t := range cfg.Terms {
 		if t = strings.TrimSpace(t); t != "" {
@@ -134,7 +148,7 @@ func (e *Engine) Mode(target, dataClass string) string {
 	return m
 }
 
-// Action returns what to do with a finding of `kind` under `mode`.
+// action returns what to do with a finding of `kind` under `mode`.
 func (e *Engine) action(kind, mode string) string {
 	switch mode {
 	case ModeAudit:
@@ -149,6 +163,33 @@ func (e *Engine) action(kind, mode string) string {
 		a = "mask"
 	}
 	return a
+}
+
+// findingAction is action for f, capped by its source's max_action: a
+// model-based detector's findings can be kept from blocking a request.
+func (e *Engine) findingAction(f Finding, mode string) string {
+	a := e.action(f.Kind, mode)
+	if c := e.cfg.Sources[f.Source].MaxAction; c != "" && a != "keep" && actionRank[a] > actionRank[c] {
+		a = c
+	}
+	return a
+}
+
+// confident reports whether f meets its source's min_confidence. Unscored
+// findings always do.
+func (e *Engine) confident(f Finding) bool {
+	mc := e.cfg.Sources[f.Source].MinConfidence
+	if len(mc) == 0 || f.Confidence == 0 {
+		return true
+	}
+	min, ok := mc[strings.ToLower(f.Kind)]
+	if !ok {
+		if min, ok = mc["default"]; !ok {
+			return true
+		}
+	}
+	// compare in float32, the plugin's precision: a 0.9 score must meet a 0.9 threshold
+	return f.Confidence >= float32(min)
 }
 
 // actionRank orders actions for overlapping findings.
@@ -168,23 +209,25 @@ func (e *Error) Error() string { return e.Msg }
 // every detector over a multi-megabyte image stalled requests for minutes.
 const inlineImageMin = 1024
 
-// DetectText runs every detector on one string. The findings are sorted by
-// start (longer first) and may overlap.
-func (e *Engine) DetectText(ctx context.Context, text string) ([]Finding, error) {
-	fs, _, err := e.detect(ctx, text)
-	return fs, err
+// detectRun is the detector state of one request: a source that failed
+// under on_error: rules_only is skipped for the rest of the request, so a
+// request with many texts waits for its timeout once, not once per text.
+type detectRun struct {
+	degraded map[string]bool
+	alerts   []string
 }
 
-// detect is DetectText that also reports whether it skipped an inline base64
-// image. Detectors run on the text between such images, with offsets mapped
-// back to text.
-func (e *Engine) detect(ctx context.Context, text string) ([]Finding, bool, error) {
+// detect runs every detector on one string and reports whether it skipped an
+// inline base64 image. Detectors run on the text between such images, with
+// offsets mapped back to text. The findings are sorted by start (longer
+// first) and may overlap.
+func (e *Engine) detect(ctx context.Context, text string, run *detectRun) ([]Finding, bool, error) {
 	if text == "" {
 		return nil, false, nil
 	}
 	spans := oai.DataImageSpans(text, inlineImageMin, true)
 	if len(spans) == 0 {
-		fs, err := e.detectSegment(ctx, text)
+		fs, err := e.detectSegment(ctx, text, run)
 		return fs, false, err
 	}
 	var out []Finding
@@ -195,7 +238,7 @@ func (e *Engine) detect(ctx context.Context, text string) ([]Finding, bool, erro
 			end = spans[i][0]
 		}
 		if end > last {
-			fs, err := e.detectSegment(ctx, text[last:end])
+			fs, err := e.detectSegment(ctx, text[last:end], run)
 			if err != nil {
 				return nil, true, err
 			}
@@ -212,7 +255,7 @@ func (e *Engine) detect(ctx context.Context, text string) ([]Finding, bool, erro
 	return out, true, nil
 }
 
-func (e *Engine) detectSegment(ctx context.Context, text string) ([]Finding, error) {
+func (e *Engine) detectSegment(ctx context.Context, text string, run *detectRun) ([]Finding, error) {
 	var all []Finding
 	for _, f := range e.rules.Detect(text) {
 		all = append(all, Finding{Kind: f.Kind, Start: f.Start, End: f.End, Source: "rules"})
@@ -239,11 +282,24 @@ func (e *Engine) detectSegment(ctx context.Context, text string) ([]Finding, err
 		}
 	}
 	for _, d := range e.external {
-		fs, err := d.Detect(ctx, text)
-		if err != nil {
-			return nil, fmt.Errorf("detector %s: %w", d.Name(), err)
+		name := d.Name()
+		if run.degraded[name] {
+			continue
 		}
-		all = append(all, fs...)
+		fs, err := e.detectExternal(ctx, d, text)
+		if err != nil {
+			if e.cfg.Sources[name].OnError == OnErrorRulesOnly {
+				run.degraded[name] = true
+				run.alerts = append(run.alerts, fmt.Sprintf("detector %s: %v; continued without it (on_error: rules_only)", name, err))
+				continue
+			}
+			return nil, fmt.Errorf("detector %s: %w", name, err)
+		}
+		for _, f := range fs {
+			if e.confident(f) {
+				all = append(all, f)
+			}
+		}
 	}
 	// Findings may overlap; Apply decides per overlapping cluster so that a
 	// blocking finding is never dropped and masking covers the union.
@@ -267,6 +323,28 @@ func (e *Engine) detectSegment(ctx context.Context, text string) ([]Finding, err
 	return out, nil
 }
 
+// detectExternal calls one detector plugin, through the result cache.
+func (e *Engine) detectExternal(ctx context.Context, d ExternalDetector, text string) ([]Finding, error) {
+	name := d.Name()
+	var key [32]byte
+	if e.Cache != nil {
+		key = e.Cache.key(name, text)
+		if fs, ok := e.Cache.get(key); ok {
+			return fs, nil
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, e.cfg.Sources[name].Timeout.D(DefaultDetectTimeout))
+	defer cancel()
+	fs, err := d.Detect(ctx, text)
+	if err != nil {
+		return nil, err
+	}
+	if e.Cache != nil {
+		e.Cache.put(key, fs)
+	}
+	return fs, nil
+}
+
 // Result is the outcome of Apply.
 type Result struct {
 	Mode    string
@@ -282,13 +360,23 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 	if mode == ModeOff {
 		return res, nil
 	}
-	if len(e.missing) > 0 {
-		msg := fmt.Sprintf("required detector unavailable: %s", strings.Join(e.missing, ", "))
+	var hard []string
+	for _, m := range e.missing {
+		if e.cfg.Sources[m].OnError == OnErrorRulesOnly {
+			res.Report.Alerts = append(res.Report.Alerts, fmt.Sprintf("required detector unavailable: %s; continued without it (on_error: rules_only)", m))
+		} else {
+			hard = append(hard, m)
+		}
+	}
+	if len(hard) > 0 {
+		msg := fmt.Sprintf("required detector unavailable: %s", strings.Join(hard, ", "))
 		if mode != ModeAudit && e.cfg.FailClosedOn() {
 			return res, &Error{Status: http.StatusServiceUnavailable, Code: "redaction_unavailable", Msg: msg + "; request not sent (fail-closed)"}
 		}
 		res.Report.Alerts = append(res.Report.Alerts, msg)
 	}
+	run := &detectRun{degraded: map[string]bool{}}
+	defer func() { res.Report.Alerts = append(res.Report.Alerts, run.alerts...) }()
 	bucket := e.Vault.BucketWithTTL(vaultKey, e.vaultTTL)
 	masked := map[string]string{} // value -> placeholder, for thinking text
 	var blocked []string
@@ -297,7 +385,7 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 	// synthetic "key: " context prefix); masks reaching into it are clipped.
 	inlineImage := false
 	processKeep := func(text string, keep int) (string, error) {
-		fs, skipped, err := e.detect(ctx, text)
+		fs, skipped, err := e.detect(ctx, text, run)
 		inlineImage = inlineImage || skipped
 		if err != nil {
 			if mode == ModeAudit || !e.cfg.FailClosedOn() {
@@ -324,7 +412,7 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 				if fs[i].End > end {
 					end = fs[i].End
 				}
-				if act := e.action(fs[i].Kind, mode); act != "keep" {
+				if act := e.findingAction(fs[i], mode); act != "keep" {
 					hits = append(hits, hit{fs[i], act})
 				}
 			}
@@ -341,7 +429,7 @@ func (e *Engine) Apply(ctx context.Context, req oai.Object, mode string, userKey
 				v := text[h.f.Start:h.f.End]
 				res.Report.Counts[strings.ToLower(h.f.Kind)]++
 				if len(res.Report.Samples) < 50 {
-					res.Report.Samples = append(res.Report.Samples, audit.Sample{Kind: h.f.Kind, Length: utf8.RuneCountInString(v), Action: act})
+					res.Report.Samples = append(res.Report.Samples, audit.Sample{Kind: h.f.Kind, Length: utf8.RuneCountInString(v), Action: act, Source: h.f.Source, Confidence: h.f.Confidence})
 				}
 				if h.act == "block" {
 					blocked = append(blocked, fmt.Sprintf("%s(%d)", strings.ToLower(h.f.Kind), utf8.RuneCountInString(v)))

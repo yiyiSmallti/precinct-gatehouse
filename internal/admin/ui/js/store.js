@@ -76,8 +76,9 @@ export const store = {
         fail_closed: r.fail_closed,
         strip_fields: r.strip_fields || [],
         vault_ttl: r.vault_ttl || '',
-        // not edited on the page (restart-only); kept so saving the section does not drop it
+        // not edited on the page; kept so saving the section does not drop them
         vault_persist: r.vault_persist,
+        sources: r.sources,
       });
     }
     if (sec === 'general') {

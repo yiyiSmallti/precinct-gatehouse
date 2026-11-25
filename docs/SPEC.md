@@ -51,7 +51,12 @@ e2e/                       假提供方、假策略插件、报告模板
 - **占位符格式**：`{{<KIND>_<8 位哈希>}}`，哈希 = `HMAC(user_key, normalized_value)` 截断；`user_key` 由租户与用户 ID 派生，`personal` 模式为本机随机密钥。
 - **Vault 存储**：内存 map（key: `tenant + user + session`），TTL 跟随会话标签，默认 24 h 无活动清除；`redaction.vault_persist: true` 时同时加密写入 SQLite，重启和 FD 热切换之后仍能回填（见 3.7）。
 - **回填范围**：按占位符正则扫描，容忍花括号内空白与大小写；覆盖 `choices[].message.content`、`tool_calls[].function.arguments`（JSON 字符串内替换后校验仍为合法 JSON）与 `thinking` 字段。
-- **增量检测**：多轮请求对历史消息复用上次检测结果（按消息哈希缓存），仅扫描新增消息。
+- **增量检测**：检测器插件的结果按（插件名, 文本）的加盐哈希缓存在进程内（LRU，至多 65,536 段文本），多轮请求重发的历史消息不再调用插件，只扫描新增文本；规则与词典本身很快，不缓存。缓存只存类别、偏移与置信度，不存文本；`min_confidence`、`never_mask` 与动作在取出缓存后才应用，所以热重载这些设置无需清缓存；调用失败不缓存。热重载生成的新快照沿用同一缓存，`/healthz` 的 `detect_cache{hits, misses, entries}` 报告命中情况。
+- **按来源调整（`redaction.sources.<检测器插件名>`）**：模型类检测器（NER）给的是概率判断，不能像格式确定的规则那样直接拦截，所以可以按插件单独设置：
+  - `min_confidence`：按类别（小写 kind）的置信度阈值，`default` 作用于其他类别；低于阈值的结果丢弃。置信度为 0 视为插件未打分，不受阈值影响。比较按插件给出的 float32 精度进行，置信度恰好等于阈值时保留。
+  - `max_action`：该来源结果的动作上限（`audit | warn | mask | block`）。如设为 `mask`，目标模式为 `warn/block` 或类别配置为 `block` 时，该来源的结果最多也只脱敏；与规则结果重叠时仍取较强动作，所以规则命中的密钥照样拦截。设为 `audit` 即影子运行：只计数、写审计样本，原样发出，同时规则照常脱敏。
+  - `timeout`：单次 `Detect` 的超时，默认 5 s。
+  - `on_error`：`fail_closed`（默认，按 `redaction.fail_closed` 处理，即返回 `503`）或 `rules_only`：插件出错、超时、进程不在（含自动重启窗口）或被禁用时，请求继续用规则与词典脱敏，并在审计 `alerts` 记一条告警；同一请求中该插件第一次失败后，剩余文本不再调用它，整请求最多等一次超时。代价是退化期间只有规则能识别的类别会被处理（如人名会原样发出）。
 
 ### 3.3 插件接口 v1（gRPC，go-plugin 形态）
 
@@ -141,13 +146,13 @@ redaction:
 
 | 扩展点 | RPC | 宿主行为 |
 | --- | --- | --- |
-| **Detector**<br>(`detector.proto`) | `Detect(text, lang, hints) → findings{kind, start, end, confidence}`（偏移为 Unicode 码点，`end` 不含） | `redaction.detectors` 列出必需检测器：禁用时，或启动失败、进程退出后自动重启完成前，需要脱敏（`mask/warn/block`）的请求返回 `503`，`audit` 模式仅记告警 |
+| **Detector**<br>(`detector.proto`) | `Detect(text, lang, hints) → findings{kind, start, end, confidence}`（偏移为 Unicode 码点，`end` 不含） | `redaction.detectors` 列出必需检测器：禁用时，或启动失败、进程退出后自动重启完成前，需要脱敏（`mask/warn/block`）的请求返回 `503`，`audit` 模式仅记告警；`redaction.sources.<名字>.on_error: rules_only` 时改为继续发送并告警（见 3.2）。宿主保留 `confidence`，单次调用超时由 `redaction.sources.<名字>.timeout` 决定（默认 5 s） |
 | **AuthPolicy**<br>(`policy.proto`) | `Resolve(token, request_meta{model, route_group, client_ip, request_id, source}) → GatewayContext` | 仅 `org` 模式使用且必须恰好一个。字段与 Cloister `gateway-context.schema.json` 一一对应（`expires_at` 改为 `expires_at_unix`，预算用 `has_*` 区分 `0` 与不限）。gRPC `UNAUTHENTICATED` → `401 invalid_token`，`PERMISSION_DENIED` → `403 policy_denied`，其余错误、超时（`org.policy_timeout`，默认 3 s）或进程不在（含自动重启窗口）→ `503 policy_unavailable`。上下文按 `(令牌, 请求模型, 路由组)` 缓存，至多 `org.policy_cache`（默认 5 s）且不超过 `expires_at`；插件进程不在时不用缓存（fail-closed） |
 | **AuditSink**<br>(`audit.proto`) | `Write(records_json[]) → accepted` | 每条审计记录先写本地 JSONL 文件（内置始终开启），再入队异步批量发往各 AuditSink 插件（每批至多 200 条）；失败指数退避重试，队列上限 10,000 条，溢出丢最旧并告警。记录以 `request_id` 唯一去重 |
 | **Provider**<br>(`provider.proto`) | `Chat(model, body) → stream {status, content_type, data}` | `providers[].plugin: <名字>` 代替 `base_url`。首条消息带状态码与类型；JSON 一次返回，SSE 分多条。插件不在或 gRPC 失败按可重试上游错误处理（触发故障转移），错误信息仅记状态码 |
 | **Hooks**<br>(`hooks.proto`) | `OnRequest(ctx, body) → body'`<br>`OnResponse(ctx, body, status)` | `OnRequest` 在策略之后、路由之前按序执行，可改写请求但不可改 `model`、`stream`、`tools`（违规返回 `500 hook_invalid`）；插件不在或报错返回 `503`。`OnResponse` 只读，在缓冲响应回填后异步调用。钩子在脱敏前运行、可见明文，仅安装可信钩子 |
 
-**审计记录字段**（JSONL 与 AuditSink 共用格式）：`time, request_id, token_id, token_name, tenant, user, department, on_behalf_of, instance_id, workspace_id, policy_version, source, requested_model, data_class, group, rule, rule_reason, effort, attempts[{model,status,error}], model, target, redaction{mode, counts, masked, warned, blocked, restored, samples[{kind,length,action}], alerts}, status, error, prompt_tokens, completion_tokens, latency_ms`（`org` 模式相关字段仅在 `org` 模式出现）。
+**审计记录字段**（JSONL 与 AuditSink 共用格式）：`time, request_id, token_id, token_name, tenant, user, department, on_behalf_of, instance_id, workspace_id, policy_version, source, requested_model, data_class, group, rule, rule_reason, effort, attempts[{model,status,error}], model, target, redaction{mode, counts, masked, warned, blocked, restored, samples[{kind,length,action,source,confidence}], alerts}, status, error, prompt_tokens, completion_tokens, latency_ms`（`org` 模式相关字段仅在 `org` 模式出现）。
 
 #### 3.6.1 `org` 模式约束
 
@@ -184,7 +189,7 @@ redaction:
 
 #### 尚未实现或受限项
 
-- 多轮增量检测缓存、NER 模块（M5）、插件包（`.tgz` + `gatehouse` 字段）安装命令。
+- NER 检测器插件本身（M5；核心侧的增量检测缓存、按来源阈值/动作上限/超时退化已实现，验收见 `e2e/g18_ner_core_test.go`），`Detect` 的 `hints` 尚未传消息角色；插件包（`.tgz` + `gatehouse` 字段）安装命令。
 - Gemini 原生协议互转；OpenAI Responses 的 `previous_response_id` 有状态续聊（返回 `400 previous_response_not_supported`）；Responses 中 `web_search`、`custom` 等非 `function` 内置工具会被丢弃并在 `X-Gatehouse-Dropped-Tools` 响应头中列出。
 - `org` 模式暂不使用 `byo_api` 与策略下发的 `redaction` 段（脱敏仍按本机配置）；`budget.period` 仅透传不解释；`sk-` API Key 仅限 `personal` 模式使用。
 - 外部目标含图请求归类为 `image`，默认动作同其他类别（`mask` 模式下视为 `warn`，原样发出并告警），可配置 `image: block`。
