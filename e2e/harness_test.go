@@ -217,6 +217,9 @@ func (f *FakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 		"total_tokens":          promptTok + compTok,
 		"prompt_tokens_details": map[string]any{"cached_tokens": promptTok / 2},
 	}
+	if strings.Contains(user, "#think") {
+		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": 3}
+	}
 	if stream, _ := req["stream"].(bool); stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		if strings.Contains(user, "#truncate") {

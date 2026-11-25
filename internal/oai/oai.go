@@ -234,7 +234,10 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	CachedTokens     int `json:"cached_tokens,omitempty"`
-	TotalTokens      int `json:"total_tokens"`
+	// ReasoningTokens is completion_tokens_details.reasoning_tokens, when the
+	// provider reports it; it is part of CompletionTokens.
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	TotalTokens     int `json:"total_tokens"`
 }
 
 // UsageOf reads resp["usage"].
@@ -246,6 +249,9 @@ func UsageOf(resp Object) (Usage, bool) {
 	us := Usage{PromptTokens: Int(u, "prompt_tokens"), CompletionTokens: Int(u, "completion_tokens"), TotalTokens: Int(u, "total_tokens")}
 	if ptd, ok := u["prompt_tokens_details"].(map[string]any); ok {
 		us.CachedTokens = Int(ptd, "cached_tokens")
+	}
+	if ctd, ok := u["completion_tokens_details"].(map[string]any); ok {
+		us.ReasoningTokens = Int(ctd, "reasoning_tokens")
 	}
 	if us.TotalTokens == 0 {
 		us.TotalTokens = us.PromptTokens + us.CompletionTokens

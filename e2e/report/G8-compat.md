@@ -17,9 +17,12 @@
 | Responses 非流式 + instructions→system + 别名 gpt-* + 丢弃非函数工具头 + cached_tokens | ✅ | status=200 model=gpt-5 dropped="web_search" cached=14 |
 | Responses function_call / function_call_output 转换 | ✅ | status=200 asst=true tool=true |
 | Responses 流式事件顺序（reasoning + message + function_call + sequence_number） | ✅ | count=22 seqOK=true reason=true msg=true fn=true |
+| Responses 非流式 reasoning 项 → 后续 assistant 的 reasoning_content（多项按序拼接，工具消息顺序不变）+ reasoning_tokens 透传 | ✅ | status=200 shape=system user assistant[思考A] tool:call_a assistant[思考B1思考B2] tool:call_b reasoning_tokens=3 |
+| Responses reasoning 后直接跟 user 消息 → 丢弃，不挂到后续 assistant | ✅ | status=200 shape=[system user user assistant[<nil>]] leak=false dropped_items="" |
+| Responses 流式往返：网关输出的 reasoning 项原样回传 → 上游 assistant 带回 reasoning_content + reasoning_tokens 透传 | ✅ | status=200 shape=[system user assistant[思考...] tool:call_1] reasoning_tokens=3 |
 | Responses previous_response_id → 400 | ✅ | status=400 code=previous_response_not_supported |
 | compat 协议受 RPM 限额约束（第 2 次 429 rate_limit_error） | ✅ | s1=200 s2=429 err=map[message:rate limit (1 rpm) exceeded for key; retry after 60s type:rate_limit_error] |
-| request_log 记录了 messages/responses 协议及 cached_tokens | ✅ | messages=5 responses=3 cached_sum=136 |
+| request_log 记录了 messages/responses 协议及 cached_tokens | ✅ | messages=5 responses=6 cached_sum=214 |
 
 Anthropic 流式事件序列：`message_start → content_block_start → content_block_delta → content_block_delta → content_block_stop → content_block_start → content_block_delta → content_block_delta → content_block_stop → content_block_start → content_block_delta → content_block_delta → content_block_stop → message_delta → message_stop`
 

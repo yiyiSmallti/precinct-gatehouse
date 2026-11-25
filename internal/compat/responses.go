@@ -54,6 +54,22 @@ func DecodeResponses(body []byte) (oai.Object, ResponsesMeta, error) {
 			toolImages = nil
 		}
 	}
+	// Reasoning items precede the assistant message or tool calls they led
+	// to. Their text is held here and sent as that assistant message's
+	// reasoning_content, as the Anthropic adapter does with thinking blocks;
+	// the upstream chat template decides which of it to render. Reasoning
+	// followed by anything other than an assistant message is dropped.
+	var pendingReasoning []string
+	attachReasoning := func(msg map[string]any) {
+		if len(pendingReasoning) == 0 {
+			return
+		}
+		// items are joined with "": the adapter splits one upstream
+		// reasoning_content into several items only where text or tool
+		// calls interleave, so this restores it unchanged
+		msg["reasoning_content"] = oai.Str(msg, "reasoning_content") + strings.Join(pendingReasoning, "")
+		pendingReasoning = nil
+	}
 	var extraTools []any
 	switch inp := in["input"].(type) {
 	case string:
@@ -75,7 +91,13 @@ func DecodeResponses(body []byte) (oai.Object, ResponsesMeta, error) {
 					role = "system"
 				}
 				content := convertResponseInputContent(item["content"])
-				msgs = append(msgs, map[string]any{"role": role, "content": content})
+				msg := map[string]any{"role": role, "content": content}
+				if role == "assistant" {
+					attachReasoning(msg)
+				} else {
+					pendingReasoning = nil
+				}
+				msgs = append(msgs, msg)
 			case typ == "function_call" || typ == "custom_tool_call" || typ == "local_shell_call" || typ == "shell_call":
 				flushToolImages()
 				callID := oai.Str(item, "call_id")
@@ -101,15 +123,19 @@ func DecodeResponses(body []byte) (oai.Object, ResponsesMeta, error) {
 					if prev, ok := msgs[len(msgs)-1].(map[string]any); ok && oai.Str(prev, "role") == "assistant" {
 						prevTCs, _ := prev["tool_calls"].([]any)
 						prev["tool_calls"] = append(prevTCs, tc)
+						attachReasoning(prev)
 						continue
 					}
 				}
-				msgs = append(msgs, map[string]any{
+				msg := map[string]any{
 					"role":       "assistant",
 					"content":    nil,
 					"tool_calls": []any{tc},
-				})
+				}
+				attachReasoning(msg)
+				msgs = append(msgs, msg)
 			case typ == "function_call_output" || typ == "custom_tool_call_output" || typ == "local_shell_call_output" || typ == "shell_call_output":
+				pendingReasoning = nil
 				callID := oai.Str(item, "call_id")
 				if callID == "" {
 					callID = oai.Str(item, "id")
@@ -134,8 +160,11 @@ func DecodeResponses(body []byte) (oai.Object, ResponsesMeta, error) {
 					extraTools = append(extraTools, ts...)
 				}
 			case typ == "reasoning":
-				// dropped
+				if txt := reasoningText(item); txt != "" {
+					pendingReasoning = append(pendingReasoning, txt)
+				}
 			case typ == "compaction":
+				pendingReasoning = nil
 				// a compacted history: keep it when it has readable text
 				if txt := compactionText(item); txt != "" {
 					flushToolImages()
@@ -258,6 +287,29 @@ func DecodeResponses(body []byte) (oai.Object, ResponsesMeta, error) {
 }
 
 const compactionPrefix = "[Summary of the earlier conversation]\n"
+
+// reasoningText returns the readable text of a reasoning item: its raw
+// reasoning_text content when present, else its summary. encrypted_content is
+// opaque and ignored.
+func reasoningText(item map[string]any) string {
+	collect := func(key, typ, sep string) string {
+		parts, _ := item[key].([]any)
+		var texts []string
+		for _, p := range parts {
+			if m, ok := p.(map[string]any); ok && oai.Str(m, "type") == typ {
+				if t := oai.Str(m, "text"); t != "" {
+					texts = append(texts, t)
+				}
+			}
+		}
+		return strings.Join(texts, sep)
+	}
+	if txt := collect("content", "reasoning_text", ""); txt != "" {
+		return txt
+	}
+	// summary parts are separate paragraphs
+	return collect("summary", "summary_text", "\n\n")
+}
 
 // compactionText returns the readable summary of a compaction item, if any;
 // encrypted_content is opaque and ignored.
@@ -614,7 +666,7 @@ func responsesUsage(u oai.Usage) map[string]any {
 		},
 		"output_tokens": u.CompletionTokens,
 		"output_tokens_details": map[string]any{
-			"reasoning_tokens": 0,
+			"reasoning_tokens": u.ReasoningTokens,
 		},
 		"total_tokens": u.TotalTokens,
 	}
