@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,12 +11,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/api"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/config"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/keys"
+	"github.com/yiyiSmallti/precinct-gatehouse/internal/limit"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/live"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/provider"
 	"github.com/yiyiSmallti/precinct-gatehouse/internal/redact"
@@ -937,5 +941,213 @@ func TestAdminSessionIdleTimeoutAndBackgroundPoll(t *testing.T) {
 	srvNoIdle.ServeHTTP(r2, req2)
 	if r2.Code != http.StatusOK {
 		t.Fatalf("expected 200 with negative idle timeout, got %d", r2.Code)
+	}
+}
+
+func TestBrandingEndpointsAndKeySecretAPI(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+	if err := SetPassword(db, "admin", "password-123"); err != nil {
+		t.Fatalf("SetPassword: %v", err)
+	}
+
+	ks := keys.NewStore(db)
+	defer ks.Close()
+	// Create one legacy key before SetSecretKey, then enable encryption.
+	_, legacyKey, err := ks.Create(keys.CreateOpts{Name: "legacy"})
+	if err != nil {
+		t.Fatalf("Create legacy: %v", err)
+	}
+	ks.SetSecretKey([]byte("test-user-key-32-bytes-0123456789"))
+
+	srv := New(Deps{DB: db, Keys: ks, Limiter: limit.New(db)})
+
+	// 1. Public branding works without authentication and returns defaults.
+	pubReq, _ := http.NewRequest(http.MethodGet, "/admin/api/branding", nil)
+	pubRec := httptest.NewRecorder()
+	srv.ServeHTTP(pubRec, pubReq)
+	if pubRec.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/branding status=%d body=%s", pubRec.Code, pubRec.Body.String())
+	}
+	var pubMap map[string]any
+	if err := json.Unmarshal(pubRec.Body.Bytes(), &pubMap); err != nil {
+		t.Fatal(err)
+	}
+	if pubMap["has_logo"] != false || pubMap["display_name"] != "" {
+		t.Fatalf("unexpected default branding: %v", pubMap)
+	}
+
+	// Default logo endpoint returns 404 when no custom logo is uploaded.
+	logo404Req, _ := http.NewRequest(http.MethodGet, "/admin/api/branding/logo", nil)
+	logo404Rec := httptest.NewRecorder()
+	srv.ServeHTTP(logo404Rec, logo404Req)
+	if logo404Rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 before logo upload, got %d", logo404Rec.Code)
+	}
+
+	// Protected branding settings endpoint requires auth.
+	unauthReq, _ := http.NewRequest(http.MethodGet, "/admin/api/branding/settings", nil)
+	unauthRec := httptest.NewRecorder()
+	srv.ServeHTTP(unauthRec, unauthReq)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated branding settings, got %d", unauthRec.Code)
+	}
+
+	// Login to get session cookie.
+	loginReq, _ := http.NewRequest(http.MethodPost, "/admin/api/login", bytes.NewReader([]byte(`{"username":"admin","password":"password-123"}`)))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	srv.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("login failed: %d", loginRec.Code)
+	}
+	var tok string
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == cookieName {
+			tok = c.Value
+		}
+	}
+
+	doAuth := func(method, path string, body any, csrf bool) *httptest.ResponseRecorder {
+		var rdr *bytes.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			rdr = bytes.NewReader(b)
+		} else {
+			rdr = bytes.NewReader(nil)
+		}
+		req, _ := http.NewRequest(method, path, rdr)
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if csrf {
+			req.Header.Set("X-Gatehouse-Admin", "1")
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 2. Partial settings update & validation.
+	if r := doAuth(http.MethodPut, "/admin/api/branding/settings", map[string]any{"display_name": "ACME"}, false); r.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without CSRF header, got %d", r.Code)
+	}
+	if r := doAuth(http.MethodPut, "/admin/api/branding/settings", map[string]any{"public_url": "ftp://bad.example.com"}, true); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid public_url scheme, got %d", r.Code)
+	}
+	if r := doAuth(http.MethodPut, "/admin/api/branding/settings", map[string]any{"display_name": "Acme AI Gateway"}, true); r.Code != http.StatusOK {
+		t.Fatalf("put display_name status=%d body=%s", r.Code, r.Body.String())
+	}
+	rTpl := doAuth(http.MethodPut, "/admin/api/branding/settings", map[string]any{
+		"public_url":    "https://llm.acme.internal/",
+		"dist_template": "KEY={{API_KEY}} URL={{BASE_URL}}",
+	}, true)
+	if rTpl.Code != http.StatusOK {
+		t.Fatalf("put template status=%d body=%s", rTpl.Code, rTpl.Body.String())
+	}
+	var stResp map[string]any
+	_ = json.Unmarshal(rTpl.Body.Bytes(), &stResp)
+	if stResp["display_name"] != "Acme AI Gateway" || stResp["public_url"] != "https://llm.acme.internal" || stResp["dist_template"] != "KEY={{API_KEY}} URL={{BASE_URL}}" {
+		t.Fatalf("unexpected settings after partial updates: %v", stResp)
+	}
+
+	// Public endpoint exposes display_name only (not public_url or dist_template).
+	pubRec2 := httptest.NewRecorder()
+	srv.ServeHTTP(pubRec2, pubReq)
+	var pubMap2 map[string]any
+	_ = json.Unmarshal(pubRec2.Body.Bytes(), &pubMap2)
+	if pubMap2["display_name"] != "Acme AI Gateway" {
+		t.Fatalf("expected public display_name updated, got %v", pubMap2)
+	}
+	if _, hasURL := pubMap2["public_url"]; hasURL {
+		t.Fatalf("public endpoint must not expose public_url: %v", pubMap2)
+	}
+
+	// 3. Logo upload validation (reject non-image & active SVG; accept valid PNG).
+	badText := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("not an image"))
+	if r := doAuth(http.MethodPut, "/admin/api/branding/logo", map[string]any{"data_url": badText}, true); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for fake PNG payload, got %d", r.Code)
+	}
+	badSVG := "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString([]byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`))
+	if r := doAuth(http.MethodPut, "/admin/api/branding/logo", map[string]any{"data_url": badSVG}, true); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for SVG with script, got %d", r.Code)
+	}
+
+	// Valid 1x1 PNG.
+	pngBytes, _ := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+	goodPNG := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
+	upRec := doAuth(http.MethodPut, "/admin/api/branding/logo", map[string]any{"data_url": goodPNG}, true)
+	if upRec.Code != http.StatusOK {
+		t.Fatalf("upload PNG status=%d body=%s", upRec.Code, upRec.Body.String())
+	}
+	var upBody map[string]any
+	_ = json.Unmarshal(upRec.Body.Bytes(), &upBody)
+	logoURL, _ := upBody["logo_url"].(string)
+	if upBody["has_logo"] != true || !strings.HasPrefix(logoURL, "/admin/api/branding/logo?v=") {
+		t.Fatalf("unexpected upload response: %v", upBody)
+	}
+
+	// Fetch public logo without auth.
+	getLogoReq, _ := http.NewRequest(http.MethodGet, logoURL, nil)
+	getLogoRec := httptest.NewRecorder()
+	srv.ServeHTTP(getLogoRec, getLogoReq)
+	if getLogoRec.Code != http.StatusOK || !bytes.Equal(getLogoRec.Body.Bytes(), pngBytes) {
+		t.Fatalf("GET logo status=%d len=%d", getLogoRec.Code, getLogoRec.Body.Len())
+	}
+	if getLogoRec.Header().Get("X-Content-Type-Options") != "nosniff" || getLogoRec.Header().Get("Content-Security-Policy") == "" {
+		t.Fatalf("missing security headers on logo response: %v", getLogoRec.Header())
+	}
+
+	// Delete logo reverts to 404.
+	if r := doAuth(http.MethodDelete, "/admin/api/branding/logo", nil, true); r.Code != http.StatusOK {
+		t.Fatalf("delete logo status=%d", r.Code)
+	}
+	getLogoRec2 := httptest.NewRecorder()
+	srv.ServeHTTP(getLogoRec2, logo404Req)
+	if getLogoRec2.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after delete logo, got %d", getLogoRec2.Code)
+	}
+
+	// 4. Key secret retrieval endpoint.
+	createRec := doAuth(http.MethodPost, "/admin/api/keys", map[string]any{"name": "dist-key"}, true)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create key status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var createdPayload struct {
+		Key    string   `json:"key"`
+		APIKey keys.Key `json:"api_key"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &createdPayload); err != nil {
+		t.Fatal(err)
+	}
+
+	secRec := doAuth(http.MethodGet, "/admin/api/keys/"+createdPayload.APIKey.ID+"/secret", nil, false)
+	if secRec.Code != http.StatusOK {
+		t.Fatalf("getKeySecret status=%d body=%s", secRec.Code, secRec.Body.String())
+	}
+	var secBody map[string]any
+	_ = json.Unmarshal(secRec.Body.Bytes(), &secBody)
+	if secBody["has_secret"] != true || secBody["key"] != createdPayload.Key {
+		t.Fatalf("unexpected key secret response: %v (want %q)", secBody, createdPayload.Key)
+	}
+
+	legRec := doAuth(http.MethodGet, "/admin/api/keys/"+legacyKey.ID+"/secret", nil, false)
+	if legRec.Code != http.StatusOK {
+		t.Fatalf("getKeySecret legacy status=%d", legRec.Code)
+	}
+	var legBody map[string]any
+	_ = json.Unmarshal(legRec.Body.Bytes(), &legBody)
+	if legBody["has_secret"] != false || legBody["key"] != "" {
+		t.Fatalf("expected empty secret for legacy key, got %v", legBody)
+	}
+
+	missRec := doAuth(http.MethodGet, "/admin/api/keys/key_does_not_exist/secret", nil, false)
+	if missRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown key id, got %d", missRec.Code)
 	}
 }

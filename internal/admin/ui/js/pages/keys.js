@@ -15,6 +15,8 @@ import {
   toast,
 } from '/admin/js/ui.js';
 import { store } from '/admin/js/store.js';
+import { branding } from '/admin/js/branding.js';
+import { copyToClipboard, renderDistributionTemplate } from '/admin/js/template.js';
 
 function meterRow(label, used, limit) {
   const u = Number(used || 0);
@@ -110,6 +112,12 @@ function quotaMeter(label, used, limit) {
   );
 }
 
+const sessionSecrets = new Map();
+
+export function clearKeySecretCache() {
+  sessionSecrets.clear();
+}
+
 function effectiveRaw() {
   const base = store.server?.raw || {};
   const routing = store.getSection('routing') || {};
@@ -120,6 +128,77 @@ function effectiveRaw() {
     routing_groups: routing.routing_groups ?? base.routing_groups ?? {},
     model_aliases: store.getSection('aliases') || base.model_aliases || [],
   };
+}
+
+function showRenderedTemplateModal(keyInfo, text) {
+  openModal({
+    title: `配置模板 / ${keyInfo?.name || ''}`,
+    wide: true,
+    body: el('div', { style: { display: 'flex', flexDirection: 'column', gap: '12px' } },
+      el('p', { className: 'muted', style: { margin: 0, fontSize: '13px' } }, '请复制下方配置并发送给使用方：'),
+      el('pre', { className: 'try-pre', style: { maxHeight: '420px' } }, text)
+    ),
+    footer: [
+      el('button', {
+        type: 'button',
+        className: 'btn btn-primary',
+        onClick: async () => {
+          const ok = await copyToClipboard(text);
+          if (ok) {
+            toast('配置模板已复制到剪贴板', 'ok');
+            closeModal();
+          } else {
+            toast('浏览器禁止自动复制，请手动全选文本框内容复制', 'warn');
+          }
+        },
+      }, icon('copy', 14), '复制配置模板'),
+      el('button', { type: 'button', className: 'btn', onClick: closeModal }, '关闭'),
+    ],
+  });
+}
+
+async function copyKeyConfig(keyObj, triggerBtn = null, knownPlain = '') {
+  if (triggerBtn) triggerBtn.disabled = true;
+  try {
+    await branding.ensureSettingsLoaded().catch(() => {});
+    let plainKey = knownPlain || (keyObj?.id ? sessionSecrets.get(keyObj.id) || '' : '');
+    let isPlaceholder = false;
+    if (!plainKey && keyObj?.id && keyObj?.has_secret) {
+      try {
+        const res = await api.getKeySecret(keyObj.id);
+        if (res?.has_secret && res.key) {
+          plainKey = res.key;
+          sessionSecrets.set(keyObj.id, plainKey);
+        }
+      } catch (e) {
+        if (e.status !== 401) {
+          toast(`读取密钥明文失败，已回退占位符: ${e.message}`, 'warn');
+        }
+      }
+    }
+    if (!plainKey) {
+      isPlaceholder = true;
+    }
+
+    const text = renderDistributionTemplate({
+      key: keyObj,
+      plainKey,
+      brandingState: branding.state,
+      rawConfig: effectiveRaw(),
+    });
+    const copied = await copyToClipboard(text);
+    if (copied) {
+      if (isPlaceholder) {
+        toast('已复制配置模板（该旧密钥未保存明文，请手动替换占位符或轮换密钥后复制）', 'warn', 5000);
+      } else {
+        toast(`已复制 “${keyObj?.name || '密钥'}” 的配置模板`, 'ok');
+      }
+    } else {
+      showRenderedTemplateModal(keyObj, text);
+    }
+  } finally {
+    if (triggerBtn) triggerBtn.disabled = false;
+  }
 }
 
 export function modelAndGroupSuggestions(rawOverride = null) {
@@ -176,6 +255,9 @@ export function normalizeKeyScopes(models, groups, raw = {}) {
 }
 
 function showSecretModal(plainKey, keyInfo) {
+  if (keyInfo?.id && plainKey) {
+    sessionSecrets.set(keyInfo.id, plainKey);
+  }
   openModal({
     title: '访问密钥已签发',
     body: el('div', { style: { display: 'flex', flexDirection: 'column', gap: '12px' } },
@@ -195,14 +277,15 @@ function showSecretModal(plainKey, keyInfo) {
         type: 'button',
         className: 'btn',
         onClick: async () => {
-          try {
-            await navigator.clipboard.writeText(plainKey);
-            toast('已复制到剪贴板', 'ok');
-          } catch {
-            toast('请手动选中并复制密钥文本', 'warn');
-          }
+          const ok = await copyToClipboard(plainKey);
+          toast(ok ? '已复制到剪贴板' : '请手动选中并复制密钥文本', ok ? 'ok' : 'warn');
         },
       }, icon('copy', 14), '复制密钥'),
+      el('button', {
+        type: 'button',
+        className: 'btn',
+        onClick: (e) => copyKeyConfig(keyInfo, e.currentTarget, plainKey),
+      }, icon('brand', 14), '复制配置模板'),
       el('button', {
         type: 'button',
         className: 'btn btn-primary',
@@ -220,7 +303,7 @@ function toDateInputValue(sec) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-export function renderKeys(container) {
+export function renderKeys(container, ctx = {}) {
   let search = '';
   let keysList = [];
 
@@ -437,6 +520,9 @@ export function renderKeys(container) {
         el('span', { className: 'muted num', style: { fontSize: '13px' } }, `共 ${filtered.length} / ${keysList.length} 个密钥`)
       ),
       el('div', { className: 'section-bar-right' },
+        ctx?.navigate
+          ? el('button', { type: 'button', className: 'btn', onClick: () => ctx.navigate('branding') }, icon('brand', 14), '配置模板')
+          : null,
         el('button', { type: 'button', className: 'btn', onClick: load }, icon('refresh', 14), '刷新'),
         el('button', { type: 'button', className: 'btn btn-primary', onClick: () => openKeyDrawer(null) }, icon('plus', 14), '签发新密钥')
       )
@@ -511,6 +597,12 @@ export function renderKeys(container) {
                   ),
                   el('td', { className: 'td-right' },
                     el('div', { style: { display: 'inline-flex', gap: '6px' } },
+                      el('button', {
+                        type: 'button',
+                        className: 'btn btn-sm',
+                        title: '一键复制该密钥的分发配置模板',
+                        onClick: (e) => copyKeyConfig(k, e.currentTarget),
+                      }, icon('copy', 13), '复制配置'),
                       el('button', { type: 'button', className: 'btn btn-sm', onClick: () => openKeyDrawer(k) }, '编辑'),
                       el('button', {
                         type: 'button',
@@ -544,6 +636,7 @@ export function renderKeys(container) {
                           if (!ok) return;
                           try {
                             await api.deleteKey(k.id);
+                            sessionSecrets.delete(k.id);
                             toast('密钥已删除', 'ok');
                             load();
                           } catch (e) {

@@ -159,6 +159,10 @@ func Open(dataDir string) (*sql.DB, error) {
 			return nil, fmt.Errorf("migrate %s: %w", path, err)
 		}
 	}
+	if err := ensureColumn(db, "api_keys", "key_enc", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
 	if hadQuotaTable == 0 {
 		// key_token_usage is the durable ledger behind token quotas; request_log
 		// is pruned, so seed the ledger once from whatever history is left.

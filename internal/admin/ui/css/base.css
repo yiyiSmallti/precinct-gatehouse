@@ -96,6 +96,7 @@ a {
   width: 34px;
   height: 34px;
   border-radius: 9px;
+  object-fit: cover;
   flex-shrink: 0;
   display: block;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.06);
@@ -431,6 +432,7 @@ a {
   width: 40px;
   height: 40px;
   border-radius: 11px;
+  object-fit: cover;
 }
 
 .login-hero-art {
@@ -439,6 +441,7 @@ a {
   width: min(300px, 62%);
   aspect-ratio: 1;
   border-radius: 28%;
+  object-fit: cover;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.06);
   align-self: center;
 }

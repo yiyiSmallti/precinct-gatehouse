@@ -802,6 +802,9 @@ func openKeyStore(cfg *config.Config) (*keys.Store, func(), error) {
 		return nil, nil, err
 	}
 	ks := keys.NewStore(db)
+	if uk, err := api.LoadOrCreateUserKey(cfg.DataDir); err == nil {
+		ks.SetSecretKey(uk)
+	}
 	return ks, func() {
 		ks.Close()
 		db.Close()

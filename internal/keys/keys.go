@@ -3,9 +3,12 @@
 package keys
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -66,6 +69,7 @@ type Key struct {
 	Limits
 	Note       string `json:"note"`
 	LastUsedAt int64  `json:"last_used_at"`
+	HasSecret  bool   `json:"has_secret"`
 }
 
 // CreateOpts configures a new API key.
@@ -114,6 +118,7 @@ type Store struct {
 	cache               map[string]cacheEntry
 	dataVer             int64
 	localGen            uint64
+	encKey              []byte
 	testAfterLookupScan func()
 
 	touchMu   sync.Mutex
@@ -164,6 +169,85 @@ func (s *Store) clearCache() {
 	s.cacheMu.Unlock()
 }
 
+// SetSecretKey configures the symmetric key used to encrypt newly created or
+// rotated plaintext API keys in SQLite so the admin console can copy full
+// distribution templates. Passing nil/empty disables secret persistence.
+func (s *Store) SetSecretKey(rawKey []byte) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if len(rawKey) == 0 {
+		s.encKey = nil
+	} else {
+		h := sha256.New()
+		h.Write([]byte("gatehouse:apikey:v1:"))
+		h.Write(rawKey)
+		s.encKey = h.Sum(nil)
+	}
+	clear(s.cache)
+	s.localGen++
+}
+
+func (s *Store) secretKey() []byte {
+	s.cacheMu.RLock()
+	k := s.encKey
+	s.cacheMu.RUnlock()
+	return k
+}
+
+func (s *Store) encryptSecret(keyID, plain string) (string, error) {
+	encKey := s.secretKey()
+	if len(encKey) == 0 || plain == "" {
+		return "", nil
+	}
+	block, err := aes.NewCipher(encKey)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	aad := []byte("apikey:" + keyID)
+	sealed := gcm.Seal(nonce, nonce, []byte(plain), aad)
+	return "v1:" + base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+func (s *Store) decryptSecret(keyID, encoded string) (string, bool) {
+	encKey := s.secretKey()
+	if len(encKey) == 0 || encoded == "" {
+		return "", false
+	}
+	b64, ok := strings.CutPrefix(encoded, "v1:")
+	if !ok {
+		return "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", false
+	}
+	block, err := aes.NewCipher(encKey)
+	if err != nil {
+		return "", false
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", false
+	}
+	if len(raw) < gcm.NonceSize() {
+		return "", false
+	}
+	nonce, ciphertext := raw[:gcm.NonceSize()], raw[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, ciphertext, []byte("apikey:"+keyID))
+	if err != nil {
+		return "", false
+	}
+	return string(plain), true
+}
+
 // Create generates and stores a new API key, returning the plaintext once.
 func (s *Store) Create(opts CreateOpts) (string, Key, error) {
 	if err := validateCreateOpts(opts); err != nil {
@@ -212,6 +296,10 @@ func (s *Store) insertKey(plain string, opts CreateOpts) (Key, error) {
 	if err != nil {
 		return Key{}, err
 	}
+	enc, err := s.encryptSecret(id, plain)
+	if err != nil {
+		return Key{}, err
+	}
 	now := s.now().Unix()
 	models := nonNilStrings(opts.Models)
 	groups := nonNilStrings(opts.Groups)
@@ -234,12 +322,13 @@ func (s *Store) insertKey(plain string, opts CreateOpts) (Key, error) {
 			TokensMonthly: opts.TokensMonthly,
 			TokensTotal:   opts.TokensTotal,
 		},
-		Note: opts.Note,
+		Note:      opts.Note,
+		HasSecret: enc != "",
 	}
-	_, err = s.db.Exec(`INSERT INTO api_keys(id,name,key_hash,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total)
-		VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?,0,?,?,?)`,
+	_, err = s.db.Exec(`INSERT INTO api_keys(id,name,key_hash,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total,key_enc)
+		VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?,0,?,?,?,?)`,
 		k.ID, k.Name, hashSecret(plain), k.KeyPrefix, k.CreatedAt, k.ExpiresAt, string(mj), string(gj),
-		k.RPM, k.RPD, k.Concurrency, k.Note, k.TokensDaily, k.TokensMonthly, k.TokensTotal)
+		k.RPM, k.RPD, k.Concurrency, k.Note, k.TokensDaily, k.TokensMonthly, k.TokensTotal, enc)
 	if err != nil {
 		return Key{}, err
 	}
@@ -277,10 +366,10 @@ func (s *Store) Lookup(plain string) (Key, error) {
 	if ok && now.Before(ce.expires) {
 		k = ce.key
 	} else {
-		row := s.db.QueryRow(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total
+		row := s.db.QueryRow(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total,key_enc
 			FROM api_keys WHERE key_hash=? AND deleted_at IS NULL`, h)
 		var err error
-		k, err = scanKey(row)
+		k, err = s.scanKey(row)
 		if errors.Is(err, sql.ErrNoRows) {
 			return Key{}, ErrNotFound
 		}
@@ -308,7 +397,7 @@ func (s *Store) Lookup(plain string) (Key, error) {
 
 // List returns all non-deleted API keys ordered newest first.
 func (s *Store) List() ([]Key, error) {
-	rows, err := s.db.Query(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total
+	rows, err := s.db.Query(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total,key_enc
 		FROM api_keys WHERE deleted_at IS NULL ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
@@ -316,7 +405,7 @@ func (s *Store) List() ([]Key, error) {
 	defer rows.Close()
 	out := []Key{}
 	for rows.Next() {
-		k, err := scanKey(rows)
+		k, err := s.scanKey(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -327,9 +416,9 @@ func (s *Store) List() ([]Key, error) {
 
 // Get returns one non-deleted API key by id.
 func (s *Store) Get(id string) (Key, error) {
-	row := s.db.QueryRow(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total
+	row := s.db.QueryRow(`SELECT id,name,key_prefix,created_at,expires_at,enabled,models,groups,rpm,rpd,concurrency,note,last_used_at,tokens_daily,tokens_monthly,tokens_total,key_enc
 		FROM api_keys WHERE id=? AND deleted_at IS NULL`, id)
-	k, err := scanKey(row)
+	k, err := s.scanKey(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Key{}, ErrNotFound
 	}
@@ -436,9 +525,13 @@ func (s *Store) Reset(id string) (string, Key, error) {
 	if err != nil {
 		return "", Key{}, err
 	}
+	enc, err := s.encryptSecret(id, plain)
+	if err != nil {
+		return "", Key{}, err
+	}
 	prefix := plain[:9]
-	res, err := s.db.Exec(`UPDATE api_keys SET key_hash=?, key_prefix=? WHERE id=? AND deleted_at IS NULL`,
-		hashSecret(plain), prefix, id)
+	res, err := s.db.Exec(`UPDATE api_keys SET key_hash=?, key_prefix=?, key_enc=? WHERE id=? AND deleted_at IS NULL`,
+		hashSecret(plain), prefix, enc, id)
 	if err != nil {
 		return "", Key{}, err
 	}
@@ -448,6 +541,24 @@ func (s *Store) Reset(id string) (string, Key, error) {
 	s.clearCache()
 	k, err := s.Get(id)
 	return plain, k, err
+}
+
+// GetSecret decrypts and returns the stored plaintext secret for a key, if
+// available and decryptable with the configured secret key.
+func (s *Store) GetSecret(id string) (string, bool, error) {
+	var keyEnc string
+	err := s.db.QueryRow(`SELECT key_enc FROM api_keys WHERE id=? AND deleted_at IS NULL`, id).Scan(&keyEnc)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, ErrNotFound
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if keyEnc == "" {
+		return "", false, nil
+	}
+	plain, ok := s.decryptSecret(id, keyEnc)
+	return plain, ok, nil
 }
 
 // Delete soft-deletes an API key.
@@ -484,16 +595,17 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-func scanKey(sc scanner) (Key, error) {
+func (s *Store) scanKey(sc scanner) (Key, error) {
 	var k Key
 	var en int
-	var mj, gj string
+	var mj, gj, keyEnc string
 	if err := sc.Scan(&k.ID, &k.Name, &k.KeyPrefix, &k.CreatedAt, &k.ExpiresAt, &en, &mj, &gj,
 		&k.RPM, &k.RPD, &k.Concurrency, &k.Note, &k.LastUsedAt,
-		&k.TokensDaily, &k.TokensMonthly, &k.TokensTotal); err != nil {
+		&k.TokensDaily, &k.TokensMonthly, &k.TokensTotal, &keyEnc); err != nil {
 		return Key{}, err
 	}
 	k.Enabled = en != 0
+	k.HasSecret = keyEnc != "" && len(s.secretKey()) > 0
 	_ = json.Unmarshal([]byte(mj), &k.Models)
 	_ = json.Unmarshal([]byte(gj), &k.Groups)
 	k.Models = nonNilStrings(k.Models)
