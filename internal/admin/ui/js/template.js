@@ -35,7 +35,7 @@ model_provider = "gatehouse"
 model = "{{DEFAULT_MODEL}}"
 
 [model_providers.gatehouse]
-name = "{{DISPLAY_NAME}}"
+name = "Gatehouse"
 base_url = "{{OPENAI_BASE_URL}}"
 wire_api = "responses"
 env_key = "OPENAI_API_KEY"

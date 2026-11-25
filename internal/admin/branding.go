@@ -53,14 +53,6 @@ func getSettingOptional(db *sql.DB, k string) string {
 	return v
 }
 
-func saveOrDeleteSetting(db *sql.DB, k, v string) error {
-	if v == "" {
-		_, err := db.Exec(`DELETE FROM settings WHERE k=?`, k)
-		return err
-	}
-	return setSetting(db, k, v)
-}
-
 func (s *Server) loadPublicBranding() brandingPublic {
 	name := getSettingOptional(s.deps.DB, settingBrandingDisplayName)
 	logoData := getSettingOptional(s.deps.DB, settingBrandingLogoData)
@@ -139,16 +131,14 @@ func (s *Server) putBrandingSettings(w http.ResponseWriter, r *http.Request, _ s
 		return
 	}
 
+	var updates [][2]string
 	if req.DisplayName != nil {
 		name := strings.TrimSpace(*req.DisplayName)
 		if utf8.RuneCountInString(name) > maxDisplayNameRunes {
 			writeJSONError(w, http.StatusBadRequest, "display_name exceeds 80 characters")
 			return
 		}
-		if err := saveOrDeleteSetting(s.deps.DB, settingBrandingDisplayName, name); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+		updates = append(updates, [2]string{settingBrandingDisplayName, name})
 	}
 
 	if req.PublicURL != nil {
@@ -164,10 +154,7 @@ func (s *Server) putBrandingSettings(w http.ResponseWriter, r *http.Request, _ s
 				return
 			}
 		}
-		if err := saveOrDeleteSetting(s.deps.DB, settingBrandingPublicURL, pubURL); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+		updates = append(updates, [2]string{settingBrandingPublicURL, pubURL})
 	}
 
 	if req.DistTemplate != nil {
@@ -179,7 +166,30 @@ func (s *Server) putBrandingSettings(w http.ResponseWriter, r *http.Request, _ s
 			writeJSONError(w, http.StatusBadRequest, "dist_template exceeds 16 KiB limit")
 			return
 		}
-		if err := saveOrDeleteSetting(s.deps.DB, settingBrandingDistTemplate, tpl); err != nil {
+		updates = append(updates, [2]string{settingBrandingDistTemplate, tpl})
+	}
+
+	if len(updates) > 0 {
+		tx, err := s.deps.DB.Begin()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer tx.Rollback()
+		for _, kv := range updates {
+			if kv[1] == "" {
+				if _, err := tx.Exec(`DELETE FROM settings WHERE k=?`, kv[0]); err != nil {
+					writeJSONError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+			} else {
+				if _, err := tx.Exec(`INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, kv[0], kv[1]); err != nil {
+					writeJSONError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+			}
+		}
+		if err := tx.Commit(); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}

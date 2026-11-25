@@ -1056,6 +1056,21 @@ func TestBrandingEndpointsAndKeySecretAPI(t *testing.T) {
 		t.Fatalf("unexpected settings after partial updates: %v", stResp)
 	}
 
+	// Oversized template in combined payload must reject without modifying public_url.
+	oversized := strings.Repeat("x", maxDistTemplateBytes+1)
+	if r := doAuth(http.MethodPut, "/admin/api/branding/settings", map[string]any{
+		"public_url":    "https://should-not-persist.example.com",
+		"dist_template": oversized,
+	}, true); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for oversized dist_template, got %d", r.Code)
+	}
+	getSt := doAuth(http.MethodGet, "/admin/api/branding/settings", nil, false)
+	var stAfter map[string]any
+	_ = json.Unmarshal(getSt.Body.Bytes(), &stAfter)
+	if stAfter["public_url"] != "https://llm.acme.internal" {
+		t.Fatalf("expected public_url unchanged after rejected save, got %v", stAfter)
+	}
+
 	// Public endpoint exposes display_name only (not public_url or dist_template).
 	pubRec2 := httptest.NewRecorder()
 	srv.ServeHTTP(pubRec2, pubReq)

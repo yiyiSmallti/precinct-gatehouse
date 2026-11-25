@@ -206,7 +206,7 @@ async function copyKeyConfig(keyObj, triggerBtn = null, knownPlain = '') {
       key: keyObj,
       plainKey,
       brandingState: branding.state,
-      rawConfig: effectiveRaw(),
+      rawConfig: store.server?.raw || {},
     });
     const copied = await copyToClipboard(text);
     if (copied) {
