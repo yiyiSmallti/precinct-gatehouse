@@ -966,7 +966,9 @@ func (c *Config) Validate() []string {
 			add("%s: %q is not declared under plugins with kind detector", where, name)
 		}
 		for cat, v := range src.MinConfidence {
-			if v < 0 || v > 1 {
+			// written so NaN (YAML .nan) fails too: every comparison with it is false,
+			// so it would silently drop every scored finding
+			if !(v >= 0 && v <= 1) {
 				add("%s.min_confidence.%s: must be between 0 and 1", where, cat)
 			}
 		}

@@ -266,6 +266,13 @@ func TestG18NERCore(t *testing.T) {
 	os.WriteFile(cfgFile, []byte(cfg), 0o600)
 	out, err := exec.Command(gatehouse, "config", "check", "--config", cfgFile).CombinedOutput()
 	rep.Check("检测器插件不能命名为 rules / dictionary（否则其 max_action 会作用到内置规则）", err != nil && strings.Contains(string(out), "plugins.rules: name is reserved"), "%s", g18Problems(string(out)))
+
+	cfg = fmt.Sprintf(g18Config, local.URL, cloud.URL, "      min_confidence: { default: .nan }")
+	cfg = strings.ReplaceAll(strings.ReplaceAll(cfg, "{{LISTEN}}", "127.0.0.1:0"), "{{FAKEDET}}", fakeDetPath)
+	cfg = strings.ReplaceAll(cfg, "{{DIR}}", filepath.ToSlash(dir))
+	os.WriteFile(cfgFile, []byte(cfg), 0o600)
+	out, err = exec.Command(gatehouse, "config", "check", "--config", cfgFile).CombinedOutput()
+	rep.Check("min_confidence 为 NaN 时配置校验拒绝（否则会静默丢弃全部 NER 结果）", err != nil && strings.Contains(string(out), "min_confidence.default: must be between 0 and 1"), "%s", g18Problems(string(out)))
 }
 
 const g18FailoverConfig = `
