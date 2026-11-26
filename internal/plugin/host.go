@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"os/exec"
+	"reflect"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -86,12 +87,69 @@ func (h *Host) StartDetectors(cfg *config.Config, log *slog.Logger) ([]redact.Ex
 	return dets, missing
 }
 
+// SyncDetectors reconciles running detector plugins with cfg.Plugins so
+// detector additions, removals, enable/disable toggles, and config changes
+// take effect on hot reload without restarting the gateway.
+func (h *Host) SyncDetectors(cfg *config.Config, log *slog.Logger) ([]redact.ExternalDetector, []string) {
+	required := map[string]bool{}
+	for _, d := range cfg.Redaction.Detectors {
+		required[d] = true
+	}
+	desired := map[string]config.Plugin{}
+	var order []string
+	var missing []string
+	for _, pc := range cfg.Plugins {
+		if pc.Kind != sdk.KindDetector {
+			continue
+		}
+		if pc.Enabled != nil && !*pc.Enabled {
+			log.Warn("detector plugin disabled", "plugin", pc.Name, "required", required[pc.Name])
+			if required[pc.Name] {
+				missing = append(missing, pc.Name)
+			}
+			continue
+		}
+		desired[pc.Name] = pc
+		order = append(order, pc.Name)
+	}
+
+	h.mu.Lock()
+	var existingDetectors []*Started
+	for _, p := range h.plugins {
+		if p.Kind == sdk.KindDetector {
+			existingDetectors = append(existingDetectors, p)
+		}
+	}
+	h.mu.Unlock()
+
+	kept := map[string]*Started{}
+	for _, p := range existingDetectors {
+		want, ok := desired[p.Name]
+		if ok && reflect.DeepEqual(p.pc, want) {
+			kept[p.Name] = p
+			continue
+		}
+		h.stopPlugin(p)
+	}
+
+	var dets []redact.ExternalDetector
+	for _, name := range order {
+		if p, ok := kept[name]; ok {
+			dets = append(dets, &detector{s: p})
+			continue
+		}
+		dets = append(dets, &detector{s: h.supervise(desired[name], log)})
+	}
+	return dets, missing
+}
+
 // Started is a supervised plugin of any kind.
 type Started struct {
 	Name string
 	Kind string
 	pc   config.Plugin
 	log  *slog.Logger
+	stop chan struct{}
 
 	mu       sync.RWMutex
 	client   *goplugin.Client // nil while restarting
@@ -178,7 +236,7 @@ func (h *Host) StartKind(cfg *config.Config, kind string, log *slog.Logger) (plu
 // supervise starts pc once synchronously, then hands it to a supervisor
 // goroutine that restarts the process whenever it exits.
 func (h *Host) supervise(pc config.Plugin, log *slog.Logger) *Started {
-	s := &Started{Name: pc.Name, Kind: pc.Kind, pc: pc, log: log, state: StateRestarting}
+	s := &Started{Name: pc.Name, Kind: pc.Kind, pc: pc, log: log, stop: make(chan struct{}), state: StateRestarting}
 	raw, c, err := h.launch(pc)
 	if err != nil {
 		s.lastErr = err.Error()
@@ -207,7 +265,7 @@ func (h *Host) run(s *Started) {
 		c, since := s.client, s.since
 		s.mu.RUnlock()
 		if c != nil {
-			if !h.waitExit(c) {
+			if !h.waitExit(c, s.stop) {
 				return
 			}
 			now := time.Now()
@@ -221,7 +279,7 @@ func (h *Host) run(s *Started) {
 			s.log.Warn("plugin process exited; restarting", "plugin", s.Name, "kind", s.Kind,
 				"uptime", now.Sub(since).Round(time.Millisecond).String(), "retry_in", backoff.String())
 		}
-		if !h.sleep(backoff) {
+		if !h.sleep(backoff, s.stop) {
 			return
 		}
 		raw, nc, err := h.launch(s.pc)
@@ -248,7 +306,7 @@ func (h *Host) run(s *Started) {
 }
 
 // waitExit polls until c's process exits (true) or supervision stops (false).
-func (h *Host) waitExit(c *goplugin.Client) bool {
+func (h *Host) waitExit(c *goplugin.Client, stopCh <-chan struct{}) bool {
 	t := time.NewTicker(exitPoll)
 	defer t.Stop()
 	for {
@@ -258,21 +316,50 @@ func (h *Host) waitExit(c *goplugin.Client) bool {
 		select {
 		case <-h.stop:
 			return false
+		case <-stopCh:
+			return false
 		case <-t.C:
 		}
 	}
 }
 
 // sleep waits d unless supervision stops first.
-func (h *Host) sleep(d time.Duration) bool {
+func (h *Host) sleep(d time.Duration, stopCh <-chan struct{}) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-h.stop:
 		return false
+	case <-stopCh:
+		return false
 	case <-t.C:
 		return true
 	}
+}
+
+func (h *Host) stopPlugin(s *Started) {
+	if s.stop != nil {
+		select {
+		case <-s.stop:
+		default:
+			close(s.stop)
+		}
+	}
+	s.mu.Lock()
+	c := s.client
+	s.client, s.impl, s.state = nil, nil, StateStopped
+	s.mu.Unlock()
+	if c != nil {
+		h.discard(c)
+	}
+	h.mu.Lock()
+	for i, p := range h.plugins {
+		if p == s {
+			h.plugins = append(h.plugins[:i], h.plugins[i+1:]...)
+			break
+		}
+	}
+	h.mu.Unlock()
 }
 
 // launch starts one plugin process and dispenses its declared kind. A
