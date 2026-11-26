@@ -160,7 +160,8 @@ redaction:
 			st["ort_ready"] == true &&
 			st["model_ready"] == true &&
 			st["configured"] == true &&
-			st["restart_required"] == true,
+			st["running"] == true &&
+			st["restart_required"] == false,
 		"step=%v err=%v", st["step"], st["error"])
 
 	cfgBytes, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
