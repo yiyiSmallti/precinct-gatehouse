@@ -403,6 +403,11 @@ func (s *Server) applyAstrlinkConfig(paths astrlinkPaths, maxAction string) erro
 	return err
 }
 
+var defaultGHMirrors = []string{
+	"https://gh-proxy.com/",
+	"https://ghfast.top/",
+}
+
 func applyGHMirror(rawURL, ghMirror string) string {
 	if ghMirror == "" {
 		return rawURL
@@ -411,6 +416,47 @@ func applyGHMirror(rawURL, ghMirror string) string {
 		return ghMirror + rawURL
 	}
 	return ghMirror + "/" + rawURL
+}
+
+func ghMirrorCandidates(ghMirror string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	add := func(m string) {
+		m = strings.TrimSpace(m)
+		key := strings.TrimRight(m, "/")
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, m)
+	}
+
+	if strings.TrimSpace(ghMirror) != "" {
+		add(ghMirror)
+	}
+	add("") // direct GitHub first when ghMirror is empty, or fallback when specified mirror fails
+	for _, m := range defaultGHMirrors {
+		add(m)
+	}
+	return out
+}
+
+func downloadGitHubFile(ctx context.Context, client *http.Client, rawURL, ghMirror, dst, wantSHA string, mode os.FileMode) error {
+	if !strings.HasPrefix(rawURL, "https://github.com/") {
+		return downloadFileVerified(ctx, client, applyGHMirror(rawURL, ghMirror), dst, wantSHA, mode)
+	}
+	var lastErr error
+	for _, m := range ghMirrorCandidates(ghMirror) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := downloadFileVerified(ctx, client, applyGHMirror(rawURL, m), dst, wantSHA, mode); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
 
 func ensureAstrlinkBinary(ctx context.Context, client *http.Client, dst string, spec astrlinkPlatformSpec, version, ghMirror string) error {
@@ -462,7 +508,7 @@ func ensureAstrlinkBinary(ctx context.Context, client *http.Client, dst string, 
 
 	var lastErr error
 	for _, u := range urls {
-		if err := downloadFileVerified(ctx, client, applyGHMirror(u, ghMirror), dst, "", 0o755); err == nil {
+		if err := downloadGitHubFile(ctx, client, u, ghMirror, dst, "", 0o755); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -494,11 +540,10 @@ func ensureAstrlinkORT(ctx context.Context, client *http.Client, dst string, spe
 		ortBase = "https://github.com/microsoft/onnxruntime/releases/download"
 	}
 	rawURL := fmt.Sprintf("%s/v%s/%s", ortBase, astrlinkORTVersion, spec.ORTArchive)
-	url := applyGHMirror(rawURL, ghMirror)
 
 	tmpArchive := dst + ".archive.tmp"
 	defer os.Remove(tmpArchive)
-	if err := downloadFileVerified(ctx, client, url, tmpArchive, "", 0o644); err != nil {
+	if err := downloadGitHubFile(ctx, client, rawURL, ghMirror, tmpArchive, "", 0o644); err != nil {
 		return err
 	}
 	if strings.HasSuffix(spec.ORTArchive, ".zip") {
