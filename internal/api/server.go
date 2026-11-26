@@ -245,8 +245,12 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Server, error) 
 			}
 			reg.SetPlugin(pc.Name, plugin.ProviderChat(found, pc.Timeout.D(300*time.Second)))
 		}
-		snapMissing := computeMissingDetectors(nextCfg.Redaction.Detectors, detectors)
-		red, err := redact.New(nextCfg.Redaction, detectors, snapMissing)
+		snapDetectors := detectors
+		if prev != nil {
+			snapDetectors, _ = host.SyncDetectors(nextCfg, log)
+		}
+		snapMissing := computeMissingDetectors(nextCfg.Redaction.Detectors, snapDetectors)
+		red, err := redact.New(nextCfg.Redaction, snapDetectors, snapMissing)
 		if err != nil {
 			return nil, fmt.Errorf("redaction: %w", err)
 		}

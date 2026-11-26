@@ -349,7 +349,7 @@ func (s *Server) runAstrlinkInstall(spec astrlinkPlatformSpec, req astrlinkInsta
 		return
 	}
 
-	s.astrlink.set(false, "done", "安装与配置已完成，重启网关进程后即可生效", "")
+	s.astrlink.set(false, "done", "安装与配置已完成，NER 检测已热加载生效", "")
 }
 
 func (s *Server) applyAstrlinkConfig(paths astrlinkPaths, maxAction string) error {

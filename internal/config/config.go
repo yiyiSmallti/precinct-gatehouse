@@ -1127,7 +1127,7 @@ func RestartRequiredDiff(old, next *Config) []string {
 	if old.Admin.Listen != next.Admin.Listen {
 		out = append(out, "admin.listen")
 	}
-	if !reflect.DeepEqual(old.Plugins, next.Plugins) {
+	if !reflect.DeepEqual(nonDetectorPlugins(old.Plugins), nonDetectorPlugins(next.Plugins)) {
 		out = append(out, "plugins")
 	}
 	if old.Redaction.VaultPersistOn() != next.Redaction.VaultPersistOn() {
@@ -1141,6 +1141,17 @@ func RestartRequiredDiff(old, next *Config) []string {
 	}
 	if !reflect.DeepEqual(old.Org, next.Org) {
 		out = append(out, "org")
+	}
+	return out
+}
+
+func nonDetectorPlugins(plugins []Plugin) []Plugin {
+	var out []Plugin
+	for _, p := range plugins {
+		if p.Kind == "detector" {
+			continue
+		}
+		out = append(out, p)
 	}
 	return out
 }

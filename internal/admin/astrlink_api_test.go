@@ -94,14 +94,14 @@ func TestAstrlinkStatusAndApplyConfig(t *testing.T) {
 		t.Fatalf("max_action = %q, want mask", got)
 	}
 
-	// 3. Status now reports ready + configured + restart_required
+	// 3. Status now reports ready + configured + running (hot-reloaded)
 	rec2 := httptest.NewRecorder()
 	s.getAstrlinkStatus(rec2, req, "admin")
 	var st2 map[string]any
 	if err := json.Unmarshal(rec2.Body.Bytes(), &st2); err != nil {
 		t.Fatal(err)
 	}
-	if st2["binary_ready"] != true || st2["ort_ready"] != true || st2["model_ready"] != true || st2["configured"] != true || st2["restart_required"] != true {
+	if st2["binary_ready"] != true || st2["ort_ready"] != true || st2["model_ready"] != true || st2["configured"] != true || st2["running"] != true || st2["restart_required"] != false {
 		t.Fatalf("unexpected configured status: %+v", st2)
 	}
 }
