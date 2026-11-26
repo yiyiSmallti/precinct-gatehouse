@@ -2,6 +2,7 @@ package admin
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -178,5 +179,43 @@ func TestGHMirrorCandidatesAndFallback(t *testing.T) {
 	}
 	if string(data) != "ok" {
 		t.Fatalf("downloaded = %q, want ok", data)
+	}
+}
+
+func TestPlatformSpecsAndWheelExtraction(t *testing.T) {
+	for plat, spec := range astrlinkPlatforms {
+		if spec.ORTWheelPath == "" {
+			t.Fatalf("platform %s missing ORTWheelPath", plat)
+		}
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("onnxruntime/capi/libonnxruntime.so.1.27.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("wheel-ort-so")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	whlPath := filepath.Join(dir, "ort.whl")
+	if err := os.WriteFile(whlPath, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "libonnxruntime.so.1.27.0")
+	if err := extractORTArchive(whlPath, ".whl", "libonnxruntime.so.1.27.0", dst); err != nil {
+		t.Fatalf("extractORTArchive(whl): %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "wheel-ort-so" {
+		t.Fatalf("extracted = %q, want wheel-ort-so", got)
 	}
 }

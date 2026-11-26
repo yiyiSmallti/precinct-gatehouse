@@ -29,7 +29,7 @@ const (
 	astrlinkPluginName = "astrlink"
 	astrlinkORTVersion = "1.27.0"
 	astrlinkModelRepo  = "QuantumNous/astrlink-guard"
-	astrlinkModelRev   = "92190a3eebcbc0ca53529e22b14fb4df70ec14cf"
+	astrlinkModelRev   = "7216b6a3b897ef903d4b1ba367ae6fb95b0fa5e4"
 	astrlinkGHRepo     = "yiyiSmallti/precinct-gatehouse"
 	astrlinkDefaultHF  = "https://hf-mirror.com"
 )
@@ -38,6 +38,7 @@ type astrlinkPlatformSpec struct {
 	BinName      string
 	ReleaseAsset string
 	ORTArchive   string
+	ORTWheelPath string
 	ORTLibName   string
 }
 
@@ -46,24 +47,28 @@ var astrlinkPlatforms = map[string]astrlinkPlatformSpec{
 		BinName:      "astrlink-detector",
 		ReleaseAsset: "astrlink-detector-linux-amd64",
 		ORTArchive:   "onnxruntime-linux-x64-" + astrlinkORTVersion + ".tgz",
+		ORTWheelPath: "/packages/26/81/24dd9b31b0fb912ee19ca53ac1c9764bfd79d58a2ccef564eb693be831a5/onnxruntime-1.27.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
 		ORTLibName:   "libonnxruntime.so." + astrlinkORTVersion,
 	},
 	"linux/arm64": {
 		BinName:      "astrlink-detector",
 		ReleaseAsset: "astrlink-detector-linux-arm64",
 		ORTArchive:   "onnxruntime-linux-aarch64-" + astrlinkORTVersion + ".tgz",
+		ORTWheelPath: "/packages/84/86/c3b6b17745a1997d784dadc9bd88d713d2e6721139a5a0e885b28cfb79b1/onnxruntime-1.27.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
 		ORTLibName:   "libonnxruntime.so." + astrlinkORTVersion,
 	},
 	"darwin/arm64": {
 		BinName:      "astrlink-detector",
 		ReleaseAsset: "astrlink-detector-darwin-arm64",
 		ORTArchive:   "onnxruntime-osx-arm64-" + astrlinkORTVersion + ".tgz",
+		ORTWheelPath: "/packages/c3/b7/dd3a524ed93a820dff1af902d0412957ab12499953333e9daa01af5bc480/onnxruntime-1.27.0-cp312-cp312-macosx_14_0_arm64.whl",
 		ORTLibName:   "libonnxruntime." + astrlinkORTVersion + ".dylib",
 	},
 	"windows/amd64": {
 		BinName:      "astrlink-detector.exe",
 		ReleaseAsset: "astrlink-detector-windows-amd64.exe",
 		ORTArchive:   "onnxruntime-win-x64-" + astrlinkORTVersion + ".zip",
+		ORTWheelPath: "/packages/4f/88/8ec9db1a4d126bb8b758992beb40d1249df171917d75f44a327eb5f20dda/onnxruntime-1.27.0-cp312-cp312-win_amd64.whl",
 		ORTLibName:   "onnxruntime.dll",
 	},
 }
@@ -441,6 +446,21 @@ func ghMirrorCandidates(ghMirror string) []string {
 	return out
 }
 
+var defaultPyPIBases = []string{
+	"https://pypi.tuna.tsinghua.edu.cn",
+	"https://mirrors.aliyun.com/pypi",
+	"https://files.pythonhosted.org",
+}
+
+type httpStatusError struct {
+	code int
+	url  string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d from %s", e.code, e.url)
+}
+
 func downloadGitHubFile(ctx context.Context, client *http.Client, rawURL, ghMirror, dst, wantSHA string, mode os.FileMode) error {
 	if !strings.HasPrefix(rawURL, "https://github.com/") {
 		return downloadFileVerified(ctx, client, applyGHMirror(rawURL, ghMirror), dst, wantSHA, mode)
@@ -450,10 +470,15 @@ func downloadGitHubFile(ctx context.Context, client *http.Client, rawURL, ghMirr
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := downloadFileVerified(ctx, client, applyGHMirror(rawURL, m), dst, wantSHA, mode); err == nil {
+		err := downloadFileVerified(ctx, client, applyGHMirror(rawURL, m), dst, wantSHA, mode)
+		if err == nil {
 			return nil
-		} else {
-			lastErr = err
+		}
+		lastErr = err
+		var se *httpStatusError
+		if errors.As(err, &se) && se.code == http.StatusNotFound {
+			// Upstream GitHub returned 404; skip remaining mirrors to avoid unnecessary timeouts.
+			return err
 		}
 	}
 	return lastErr
@@ -534,22 +559,51 @@ func findLocalAstrlinkSource() string {
 	return ""
 }
 
+func extractORTArchive(archivePath, archiveName, libName, dst string) error {
+	if strings.HasSuffix(archiveName, ".zip") || strings.HasSuffix(archiveName, ".whl") {
+		return extractORTFromZip(archivePath, libName, dst)
+	}
+	return extractORTFromTarGz(archivePath, libName, dst)
+}
+
 func ensureAstrlinkORT(ctx context.Context, client *http.Client, dst string, spec astrlinkPlatformSpec, ghMirror string) error {
 	ortBase := strings.TrimRight(os.Getenv("GATEHOUSE_ASTRLINK_ORT_BASE"), "/")
-	if ortBase == "" {
-		ortBase = "https://github.com/microsoft/onnxruntime/releases/download"
+	if ortBase != "" {
+		rawURL := fmt.Sprintf("%s/v%s/%s", ortBase, astrlinkORTVersion, spec.ORTArchive)
+		tmpArchive := dst + ".archive.tmp"
+		defer os.Remove(tmpArchive)
+		if err := downloadGitHubFile(ctx, client, rawURL, ghMirror, tmpArchive, "", 0o644); err != nil {
+			return err
+		}
+		return extractORTArchive(tmpArchive, spec.ORTArchive, spec.ORTLibName, dst)
 	}
-	rawURL := fmt.Sprintf("%s/v%s/%s", ortBase, astrlinkORTVersion, spec.ORTArchive)
 
+	rawURL := fmt.Sprintf("https://github.com/microsoft/onnxruntime/releases/download/v%s/%s", astrlinkORTVersion, spec.ORTArchive)
 	tmpArchive := dst + ".archive.tmp"
 	defer os.Remove(tmpArchive)
-	if err := downloadGitHubFile(ctx, client, rawURL, ghMirror, tmpArchive, "", 0o644); err != nil {
-		return err
+	ghErr := downloadGitHubFile(ctx, client, rawURL, ghMirror, tmpArchive, "", 0o644)
+	if ghErr == nil {
+		return extractORTArchive(tmpArchive, spec.ORTArchive, spec.ORTLibName, dst)
 	}
-	if strings.HasSuffix(spec.ORTArchive, ".zip") {
-		return extractORTFromZip(tmpArchive, spec.ORTLibName, dst)
+
+	if spec.ORTWheelPath == "" {
+		return ghErr
 	}
-	return extractORTFromTarGz(tmpArchive, spec.ORTLibName, dst)
+	tmpWheel := dst + ".whl.tmp"
+	defer os.Remove(tmpWheel)
+	lastErr := ghErr
+	for _, base := range defaultPyPIBases {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		wheelURL := strings.TrimRight(base, "/") + spec.ORTWheelPath
+		if err := downloadFileVerified(ctx, client, wheelURL, tmpWheel, "", 0o644); err == nil {
+			return extractORTArchive(tmpWheel, ".whl", spec.ORTLibName, dst)
+		} else {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
 
 func extractORTFromTarGz(archivePath, targetBase, dst string) error {
@@ -617,7 +671,7 @@ func downloadFileVerified(ctx context.Context, client *http.Client, url, dst, wa
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+		return &httpStatusError{code: resp.StatusCode, url: url}
 	}
 	return writeStreamAtomic(resp.Body, dst, wantSHA, mode)
 }
