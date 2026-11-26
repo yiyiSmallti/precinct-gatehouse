@@ -149,3 +149,34 @@ func TestDownloadAndExtractHelpers(t *testing.T) {
 		t.Fatalf("extracted = %q, want %q", got, payload)
 	}
 }
+
+func TestGHMirrorCandidatesAndFallback(t *testing.T) {
+	gotDefault := ghMirrorCandidates("")
+	wantDefault := []string{"", "https://gh-proxy.com/", "https://ghfast.top/"}
+	if !slices.Equal(gotDefault, wantDefault) {
+		t.Fatalf("ghMirrorCandidates(\"\") = %v, want %v", gotDefault, wantDefault)
+	}
+
+	gotCustom := ghMirrorCandidates("https://gh-proxy.com")
+	wantCustom := []string{"https://gh-proxy.com", "", "https://ghfast.top/"}
+	if !slices.Equal(gotCustom, wantCustom) {
+		t.Fatalf("ghMirrorCandidates(custom) = %v, want %v", gotCustom, wantCustom)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	dst := filepath.Join(t.TempDir(), "bin")
+	if err := downloadGitHubFile(context.Background(), srv.Client(), srv.URL+"/asset", "", dst, "", 0o755); err != nil {
+		t.Fatalf("downloadGitHubFile(non-github): %v", err)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "ok" {
+		t.Fatalf("downloaded = %q, want ok", data)
+	}
+}
